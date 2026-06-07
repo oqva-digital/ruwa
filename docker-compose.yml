@@ -1,0 +1,51 @@
+# Local / single-host deployment. Brings up the API on :8080 with a persistent
+# data volume, plus a Postgres for the multi-instance work + integration tests.
+#
+#   cp .env.example .env   # set RUWA_API_TOKEN + RUWA_DB_ENCRYPTION_KEY
+#   docker compose up -d --build
+#
+# The postgres service exists so the upcoming Postgres Store backend can be
+# tested against it:
+#   RUWA_PG_TEST_URL=postgres://ruwa:ruwa@localhost:5432/ruwa
+
+services:
+  ruwa:
+    build: .
+    image: ruwa
+    ports:
+      - "8080:8080"
+    environment:
+      RUWA_BIND: 0.0.0.0:8080
+      RUWA_STORE: /data/ruwa.db
+      # Required: bearer admin token. Set in .env (compose reads it automatically).
+      RUWA_API_TOKEN: ${RUWA_API_TOKEN:?set RUWA_API_TOKEN in .env}
+      # Optional: base64 32-byte key enabling AES-256-GCM encryption at rest.
+      RUWA_DB_ENCRYPTION_KEY: ${RUWA_DB_ENCRYPTION_KEY:-}
+      # Optional: tune logging.
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ruwa-data:/data
+    restart: unless-stopped
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ruwa
+      POSTGRES_PASSWORD: ruwa
+      POSTGRES_DB: ruwa
+    ports:
+      - "5432:5432"
+    volumes:
+      - ruwa-pg:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ruwa"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  ruwa-data:
+  ruwa-pg:

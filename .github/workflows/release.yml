@@ -1,0 +1,106 @@
+name: release
+
+# Build prebuilt, self-contained ruwa binaries (dashboard embedded via the
+# `console` feature) for macOS/Linux/Windows and attach them to a GitHub Release.
+# Trigger by pushing a tag like `v0.1.0`, or run manually (workflow_dispatch).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  # Build the dashboard once; every platform build embeds the same dist.
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build dashboard
+        working-directory: dashboard
+        run: npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+
+  build:
+    needs: dashboard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: ruwa-macos-arm64
+            features: console
+          # Cross-compile the x64 mac binary on the Apple-Silicon runner —
+          # Intel (macos-13) runners queue for a long time.
+          - os: macos-14
+            target: x86_64-apple-darwin
+            asset: ruwa-macos-x64
+            features: console
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: ruwa-linux-x64
+            # Linux native-tls uses OpenSSL; vendor it so the binary is self-contained.
+            features: console,vendored-tls
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: ruwa-windows-x64.exe
+            features: console
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # The dashboard must exist before compiling (build.rs embeds it).
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --features ${{ matrix.features }}
+      - name: Stage binary
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/ruwa"
+          [ -f "$src.exe" ] && src="$src.exe"
+          cp "$src" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect binaries + checksums
+        shell: bash
+        run: |
+          mkdir -p dist
+          find artifacts -type f -name 'ruwa-*' -exec cp {} dist/ \;
+          cd dist && sha256sum ruwa-* > SHA256SUMS && cat SHA256SUMS
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*
+          generate_release_notes: true

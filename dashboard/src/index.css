@@ -1,0 +1,208 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ===== shadcn token layer (GitHub-dark, HSL) ===== */
+:root {
+  color-scheme: light;
+  --background: 0 0% 100%;
+  --foreground: 213 27% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 213 27% 12%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 213 27% 12%;
+  --primary: 213 92% 52%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 213 20% 95%;
+  --secondary-foreground: 213 27% 18%;
+  --muted: 213 20% 95%;
+  --muted-foreground: 213 10% 42%;
+  --accent: 213 20% 95%;
+  --accent-foreground: 213 27% 18%;
+  --destructive: 3 84% 56%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 213 16% 88%;
+  --input: 213 16% 88%;
+  --ring: 213 92% 52%;
+  --radius: 0.5rem;
+
+  --chart-1: 213 92% 52%;
+  --chart-2: 128 49% 42%;
+  --chart-3: 41 73% 42%;
+  --chart-4: 3 84% 56%;
+  --chart-5: 262 60% 55%;
+  --sidebar: 213 24% 97%;
+  --sidebar-foreground: 213 20% 28%;
+  --sidebar-primary: 213 92% 52%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 213 20% 92%;
+  --sidebar-accent-foreground: 213 27% 18%;
+  --sidebar-border: 213 16% 88%;
+  --sidebar-ring: 213 92% 52%;
+
+  /* status palette (fixed semantic map — not theme tokens) */
+  --st-ok: 128 49% 49%;
+  --st-progress: 213 92% 58%;
+  --st-warn: 41 73% 48%;
+  --st-frozen: 25 70% 51%;
+  --st-down: 3 92% 63%;
+  --st-blocked: 0 72% 45%;
+}
+
+.dark {
+  color-scheme: dark;
+  --background: 215 28% 7%;
+  --foreground: 213 31% 92%;
+  --card: 215 21% 11%;
+  --card-foreground: 213 31% 92%;
+  --popover: 215 21% 11%;
+  --popover-foreground: 213 31% 92%;
+  --primary: 213 92% 58%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 213 15% 16%;
+  --secondary-foreground: 213 31% 92%;
+  --muted: 215 14% 18%;
+  --muted-foreground: 212 10% 60%;
+  --accent: 213 15% 18%;
+  --accent-foreground: 213 31% 92%;
+  --destructive: 3 92% 63%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 213 12% 22%;
+  --input: 213 12% 22%;
+  --ring: 213 92% 58%;
+
+  --chart-1: 213 92% 58%;
+  --chart-2: 128 49% 49%;
+  --chart-3: 41 73% 48%;
+  --chart-4: 3 92% 63%;
+  --chart-5: 262 60% 62%;
+  --sidebar: 215 25% 9%;
+  --sidebar-foreground: 213 20% 80%;
+  --sidebar-primary: 213 92% 58%;
+  --sidebar-primary-foreground: 0 0% 100%;
+  --sidebar-accent: 213 15% 16%;
+  --sidebar-accent-foreground: 213 31% 92%;
+  --sidebar-border: 213 12% 20%;
+  --sidebar-ring: 213 92% 58%;
+}
+
+/* Map the HSL tokens into Tailwind v4 / shadcn color utilities. */
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+  --color-sidebar: hsl(var(--sidebar));
+  --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+  --color-sidebar-primary: hsl(var(--sidebar-primary));
+  --color-sidebar-primary-foreground: hsl(var(--sidebar-primary-foreground));
+  --color-sidebar-accent: hsl(var(--sidebar-accent));
+  --color-sidebar-accent-foreground: hsl(var(--sidebar-accent-foreground));
+  --color-sidebar-border: hsl(var(--sidebar-border));
+  --color-sidebar-ring: hsl(var(--sidebar-ring));
+
+  --color-st-ok: hsl(var(--st-ok));
+  --color-st-progress: hsl(var(--st-progress));
+  --color-st-warn: hsl(var(--st-warn));
+  --color-st-frozen: hsl(var(--st-frozen));
+  --color-st-down: hsl(var(--st-down));
+  --color-st-blocked: hsl(var(--st-blocked));
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer utilities {
+  /* Hide the scrollbar but keep scrolling — used by the horizontally
+     scrollable top-bar nav on mobile. */
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+  html, body, #root { height: 100%; }
+  body {
+    margin: 0;
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+/* ===== Bespoke ruwa layer (status visuals shadcn can't express) ===== */
+.mono { font-family: var(--font-mono); font-feature-settings: 'liga' 0; }
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* status badge tints (data-st on a shadcn Badge or a span) */
+[data-st="ok"]       { background: hsl(var(--st-ok) / .15);       color: hsl(var(--st-ok)); }
+[data-st="progress"] { background: hsl(var(--st-progress) / .15); color: hsl(var(--st-progress)); }
+[data-st="warn"]     { background: hsl(var(--st-warn) / .15);     color: hsl(var(--st-warn)); }
+[data-st="frozen"]   { background: hsl(var(--st-frozen) / .16);   color: hsl(var(--st-frozen)); }
+[data-st="down"]     { background: hsl(var(--st-down) / .15);     color: hsl(var(--st-down)); }
+[data-st="blocked"]  { background: hsl(var(--st-blocked) / .9);   color: #fff; }
+[data-st="neutral"]  { background: hsl(var(--muted));             color: hsl(var(--muted-foreground)); }
+
+/* liveness chip */
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.chip .dot { width: 7px; height: 7px; border-radius: 999px; flex: none; }
+.chip-live     { color: hsl(var(--st-ok)); }       .chip-live .dot     { background: hsl(var(--st-ok)); }
+.chip-frozen   { color: hsl(var(--st-frozen)); }    .chip-frozen .dot   { background: hsl(var(--st-frozen)); box-shadow: 0 0 7px hsl(var(--st-frozen) / .7); }
+.chip-down     { color: hsl(var(--st-down)); }      .chip-down .dot     { background: hsl(var(--st-down)); }
+.chip-progress { color: hsl(var(--st-progress)); }  .chip-progress .dot { background: hsl(var(--st-progress)); }
+
+/* the frozen pulse — the signal we want caught across the room */
+@keyframes frozen-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@media (prefers-reduced-motion: no-preference) {
+  .pulse-dot { animation: frozen-pulse 2s ease-in-out infinite; }
+}
+
+/* json block + syntax highlight */
+.json { font-family: var(--font-mono); font-size: 12px; line-height: 1.6; background: hsl(var(--background)); border: 1px solid hsl(var(--border)); border-radius: 6px; padding: 12px 14px; white-space: pre; overflow-x: auto; color: hsl(var(--foreground)); }
+.dark .json { background: hsl(215 28% 5%); }
+.json .k { color: hsl(var(--st-progress)); }
+.json .s { color: hsl(var(--st-ok)); }
+.json .n { color: hsl(var(--st-frozen)); }
+.json .b { color: hsl(var(--chart-5)); }
+
+/* skeleton shimmer */
+.skeleton { background: linear-gradient(90deg, hsl(var(--muted) / 0.5) 25%, hsl(var(--muted)) 50%, hsl(var(--muted) / 0.5) 75%); background-size: 200% 100%; border-radius: 5px; }
+@media (prefers-reduced-motion: no-preference) { .skeleton { animation: shimmer 1.4s ease-in-out infinite; } }
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }

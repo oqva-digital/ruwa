@@ -1,0 +1,15 @@
+/target
+/data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.DS_Store
+.vscode
+.idea
+/data-livetest
+
+# wrangler local state (holds CF oauth token)
+.wrangler/
+.gstack/

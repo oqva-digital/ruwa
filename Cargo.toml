@@ -1,0 +1,102 @@
+[package]
+name = "ruwa"
+version = "0.1.0"
+edition = "2021"
+description = "API-first multi-tenant WhatsApp Web client in Rust (port of whatsmeow)"
+license = "MIT"
+
+[[bin]]
+name = "ruwa"
+path = "src/main.rs"
+
+[features]
+# Embed the built dashboard (dashboard/dist) directly into the binary so a
+# release is a single self-contained file (no RUWA_WEB_DIR on disk). Off by
+# default: normal `cargo run`/tests serve the console from disk via ServeDir.
+# Enabled for prebuilt release binaries (CI builds the dashboard first).
+# Also enable vendored OpenSSL so Linux release builds are self-contained.
+console = []
+vendored-tls = ["native-tls/vendored"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# HTTP API
+axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+hyper = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+prost-types = "0.13"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite_migration = "1.3"
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+# Postgres backend (sync client, to match the sync Store API) — opt-in via
+# RUWA_STORE=postgres://… and exercised by the gated multi-instance test.
+postgres = "0.19"
+r2d2_postgres = "0.18"
+
+# Crypto primitives (we implement Signal & Noise on top of these)
+snow = "0.9"
+curve25519-dalek = { version = "4", features = ["digest", "rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "serde"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+aes-gcm = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["std"] }
+ctr = "0.9"
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+rand_core = "0.6"
+
+# Networking
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
+
+# Per-session proxy egress (SOCKS5 / HTTP CONNECT) for the Noise WebSocket.
+# reqwest covers media via its own socks/http proxy support.
+tokio-socks = "0.5"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+url = "2"
+
+# Utility
+bytes = "1"
+base64 = "0.22"
+hex = "0.4"
+flate2 = "1"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+parking_lot = "0.12"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1

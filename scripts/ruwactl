@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# ruwactl — manage the background ruwa service installed by install.sh.
+# Usage: ruwactl {status|logs|start|stop|restart|token|url}
+set -euo pipefail
+
+CONF_DIR="$HOME/.config/ruwa"
+DATA_DIR="$HOME/.local/share/ruwa"
+ENV_FILE="$CONF_DIR/ruwa.env"
+LOG_FILE="$DATA_DIR/ruwa.log"
+os="$(uname -s)"
+
+get() { [ -f "$ENV_FILE" ] && grep "^$1=" "$ENV_FILE" | cut -d= -f2- || true; }
+url() { local p; p="$(get RUWA_BIND)"; echo "http://${p:-127.0.0.1:8080}"; }
+
+svc() { # svc <action>
+  if [ "$os" = "Darwin" ]; then
+    local plist="$HOME/Library/LaunchAgents/dev.oqva.ruwa.plist"
+    case "$1" in
+      start)   launchctl load "$plist" ;;
+      stop)    launchctl unload "$plist" ;;
+      restart) launchctl unload "$plist" 2>/dev/null || true; launchctl load "$plist" ;;
+      status)  launchctl list | grep -q dev.oqva.ruwa && echo "running" || echo "stopped" ;;
+    esac
+  else
+    case "$1" in
+      start)   systemctl --user start ruwa.service ;;
+      stop)    systemctl --user stop ruwa.service ;;
+      restart) systemctl --user restart ruwa.service ;;
+      status)  systemctl --user is-active ruwa.service ;;
+    esac
+  fi
+}
+
+case "${1:-status}" in
+  status)  svc status; printf 'dashboard: %s\n' "$(url)" ;;
+  start)   svc start ;;
+  stop)    svc stop ;;
+  restart) svc restart ;;
+  logs)    tail -f "$LOG_FILE" ;;
+  token)   get RUWA_API_TOKEN ;;
+  url)     url ;;
+  *) echo "usage: ruwactl {status|logs|start|stop|restart|token|url}" >&2; exit 1 ;;
+esac

@@ -1,0 +1,40 @@
+name: ci
+
+# Gate every PR (and pushes to main) on a green build: the repo's hard rule is
+# "every commit compiles, tests pass, clippy clean", and main auto-deploys.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets -- -D warnings
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: MCP — typecheck/build
+        working-directory: mcp
+        run: npm install && npm run build
+      - name: Dashboard — build
+        working-directory: dashboard
+        run: npm install && npm run build

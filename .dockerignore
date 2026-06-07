@@ -1,0 +1,19 @@
+# Build artifacts + local state — never ship these into the image context.
+target/
+**/node_modules/
+dashboard/dist/
+**/*.db
+**/*.db-wal
+**/*.db-shm
+data/
+
+# VCS + planning/docs not needed for the build.
+.git/
+.gitignore
+.planning/
+*.md
+
+# Editor / OS cruft.
+.vscode/
+.idea/
+.DS_Store
