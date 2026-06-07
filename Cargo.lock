@@ -2156,6 +2156,7 @@ dependencies = [
  "md-5 0.10.6",
  "native-tls",
  "parking_lot",
+ "percent-encoding",
  "postgres",
  "prost",
  "prost-build",

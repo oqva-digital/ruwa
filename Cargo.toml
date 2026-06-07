@@ -75,6 +75,7 @@ url = "2"
 # Utility
 bytes = "1"
 base64 = "0.22"
+percent-encoding = "2"
 hex = "0.4"
 flate2 = "1"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

@@ -5645,6 +5645,7 @@ fn process_inbound_message(
                 mimetype,
                 media_key,
                 caption,
+                file_length,
             } => {
                 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
                 let media_key_b64 = media_key.as_ref().map(|k| B64.encode(k));
@@ -5658,6 +5659,7 @@ fn process_inbound_message(
                         "mimetype": mimetype,
                         "media_key_b64": media_key_b64,
                         "caption": caption,
+                        "file_length": file_length,
                         "enc_type": enc_type,
                     }),
                 )
@@ -5850,12 +5852,28 @@ fn process_inbound_message(
             }
         }
 
-        // Emit event for real chat content only.
+        // Emit event for real chat content only. For downloadable media, attach a
+        // `media` descriptor so webhook/SSE consumers can pull the bytes without
+        // re-deriving anything: mimetype + voice-note flag + declared size, plus a
+        // relative link to this server's GET .../media endpoint (lazy
+        // download+decrypt+cache). The bytes stay out of the event; the consumer
+        // fetches them with its own bearer token. Segments are percent-encoded to
+        // match how the dashboard/MCP call the same route.
+        let media_descriptor =
+            media_webhook_descriptor(&msg_type, &payload, &session_id, &chat_canon, &msg_id);
+        let mut body_obj = serde_json::Map::new();
+        body_obj.insert("type".into(), serde_json::json!(msg_type));
+        body_obj.insert("text".into(), serde_json::json!(body_text));
+        if let Some(m) = media_descriptor {
+            body_obj.insert("media".into(), m);
+        }
+        body_obj.insert("push_name".into(), serde_json::json!(push_name));
+        body_obj.insert("from_me".into(), serde_json::json!(store_from_me));
         let _ = session.events.send(SessionEvent::Message {
             id: msg_id.clone(),
             chat: chat_canon.clone(),
             from: sender_canon.clone(),
-            body: serde_json::json!({"type": msg_type, "text": body_text, "push_name": push_name, "from_me": store_from_me}),
+            body: serde_json::Value::Object(body_obj),
         });
     }
 
@@ -6077,6 +6095,7 @@ fn classify_e2e_message(
             mimetype: img.mimetype,
             media_key: img.media_key,
             caption: img.caption,
+            file_length: img.file_length,
         };
     }
     if let Some(vid) = msg.video_message {
@@ -6087,6 +6106,7 @@ fn classify_e2e_message(
             mimetype: vid.mimetype,
             media_key: vid.media_key,
             caption: vid.caption,
+            file_length: vid.file_length,
         };
     }
     if let Some(aud) = msg.audio_message {
@@ -6104,6 +6124,7 @@ fn classify_e2e_message(
             mimetype: aud.mimetype,
             media_key: aud.media_key,
             caption: None,
+            file_length: aud.file_length,
         };
     }
     if let Some(doc) = msg.document_message {
@@ -6114,6 +6135,7 @@ fn classify_e2e_message(
             mimetype: doc.mimetype,
             media_key: doc.media_key,
             caption: doc.caption,
+            file_length: doc.file_length,
         };
     }
     if let Some(stk) = msg.sticker_message {
@@ -6124,6 +6146,7 @@ fn classify_e2e_message(
             mimetype: stk.mimetype,
             media_key: stk.media_key,
             caption: None,
+            file_length: stk.file_length,
         };
     }
     if let Some(pm) = msg.protocol_message {
@@ -6224,6 +6247,9 @@ enum InboundContent {
         mimetype: Option<String>,
         media_key: Option<Vec<u8>>,
         caption: Option<String>,
+        /// Plaintext byte length the sender declared (`fileLength`). Surfaced
+        /// as `size` in the webhook media descriptor; `None` if absent.
+        file_length: Option<u64>,
     },
     /// HSv2 history sync chunk announcement. The receive path spawns a
     /// background task that downloads the blob, decrypts under the
@@ -6245,6 +6271,46 @@ enum InboundContent {
 /// Map a `MediaType` to the short string we store in `messages.msg_type`
 /// and `payload_json.type`. Matches the strings the API accepts on
 /// outbound `POST /messages/media`.
+/// Percent-encode one path segment (session id / chat JID / message id) for a
+/// relative `/v1/...` URL, mirroring the dashboard/MCP `encodeURIComponent` so
+/// the value round-trips back through axum's `Path` extractor unchanged.
+fn enc_path_seg(s: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+}
+
+/// Build the `media` descriptor attached to an inbound message's webhook/SSE
+/// `body` when the message carries downloadable media. Returns `None` for
+/// non-media types. The `url` is a relative link to this server's
+/// `GET /v1/sessions/:id/messages/:chat/:msgid/media` endpoint (lazy
+/// download+decrypt+cache); `mimetype`/`size` are read from the already-built
+/// `payload` (which mirrors what's persisted to `messages.payload_json`).
+fn media_webhook_descriptor(
+    msg_type: &str,
+    payload: &serde_json::Value,
+    session_id: &str,
+    chat: &str,
+    msg_id: &str,
+) -> Option<serde_json::Value> {
+    match msg_type {
+        "image" | "video" | "audio" | "ptt" | "document" | "sticker" => {
+            let url = format!(
+                "/v1/sessions/{}/messages/{}/{}/media",
+                enc_path_seg(session_id),
+                enc_path_seg(chat),
+                enc_path_seg(msg_id),
+            );
+            Some(serde_json::json!({
+                "mimetype": payload.get("mimetype").cloned().unwrap_or(serde_json::Value::Null),
+                "ptt": msg_type == "ptt",
+                "size": payload.get("file_length").cloned().unwrap_or(serde_json::Value::Null),
+                "url": url,
+            }))
+        }
+        _ => None,
+    }
+}
+
 fn media_kind_str(kind: crate::media::MediaType) -> &'static str {
     use crate::media::MediaType;
     match kind {
@@ -10081,6 +10147,7 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
                             mimetype,
                             media_key,
                             caption,
+                            file_length,
                         } => {
                             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
                             let media_key_b64 = media_key.as_ref().map(|k| B64.encode(k));
@@ -10094,6 +10161,7 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
                                     "mimetype": mimetype,
                                     "media_key_b64": media_key_b64,
                                     "caption": caption,
+                                    "file_length": file_length,
                                     "source": "history_sync",
                                 }),
                             )
@@ -10382,6 +10450,47 @@ impl ParseStatus for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_descriptor_built_for_media_types_only() {
+        // A media payload (as built in process_inbound_message) yields a
+        // descriptor with mimetype, size, ptt flag and a pull URL.
+        let payload = serde_json::json!({
+            "type": "audio",
+            "mimetype": "audio/ogg; codecs=opus",
+            "file_length": 4821u64,
+        });
+        let d = media_webhook_descriptor("ptt", &payload, "sess", "55119@s.whatsapp.net", "3EB0ABC")
+            .expect("ptt is downloadable media");
+        assert_eq!(d["mimetype"], "audio/ogg; codecs=opus");
+        assert_eq!(d["size"], 4821);
+        assert_eq!(d["ptt"], true);
+        // Segments are percent-encoded so the JID round-trips through axum's Path.
+        assert_eq!(
+            d["url"],
+            "/v1/sessions/sess/messages/55119%40s%2Ewhatsapp%2Enet/3EB0ABC/media"
+        );
+
+        // Non-ptt media: ptt=false, still has a URL.
+        let img = serde_json::json!({ "type": "image", "mimetype": "image/jpeg" });
+        let d = media_webhook_descriptor("image", &img, "s", "c@g.us", "M1").unwrap();
+        assert_eq!(d["ptt"], false);
+        assert_eq!(d["size"], serde_json::Value::Null); // file_length absent -> null
+        assert!(d["url"].as_str().unwrap().ends_with("/media"));
+
+        // Text (and other non-media) types get no descriptor.
+        let text = serde_json::json!({ "type": "text", "text": "hi" });
+        assert!(media_webhook_descriptor("text", &text, "s", "c", "m").is_none());
+        assert!(media_webhook_descriptor("reaction", &text, "s", "c", "m").is_none());
+    }
+
+    #[test]
+    fn enc_path_seg_encodes_jid_reserved_chars() {
+        // `@`, `.` and `:` (device JIDs) must be encoded so they survive as a
+        // single path segment.
+        assert_eq!(enc_path_seg("55119:12@s.whatsapp.net"), "55119%3A12%40s%2Ewhatsapp%2Enet");
+        assert_eq!(enc_path_seg("3EB0ABC123"), "3EB0ABC123"); // plain ids untouched
+    }
 
     fn manager() -> SessionManager {
         SessionManager::new(Arc::new(Store::open(":memory:").unwrap()))
