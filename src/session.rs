@@ -2937,40 +2937,30 @@ async fn encrypt_per_device(
 
     // Partition: devices we already have a Signal session for vs ones
     // we need to bootstrap via X3DH.
+    // whatsmeow's encryptionIdentity split (send.go `encryptMessageForDevices`):
+    // each device gets a WIRE jid (the `<to jid>` on the stanza, kept as-is from
+    // usync) and an ENCRYPTION address (the Signal session key). Once the account
+    // has migrated to LID, the primary phone's real ratchet lives under its LID
+    // address and it rejects PN-addressed ciphertext — while not-yet-migrated
+    // companions still decrypt PN, which is exactly why only the phone broke.
+    // `encryption_address` redirects a PN device to its LID session when one
+    // exists (reusing the established ratchet via `resolve_session_address`).
+    let targets: Vec<(String, String)> = device_jids
+        .iter()
+        .map(|d| (d.clone(), encryption_address(store, session_id, d)))
+        .collect();
+
     let mut existing: HashMap<String, SessionRecord> = HashMap::new();
     let mut needs_bundle: Vec<String> = Vec::new();
-    for d in device_jids {
-        let rec = store_load_record(store, session_id, d)?;
-        let has_session = rec.as_ref().map(|r| r.current.is_some()).unwrap_or(false);
-        if !has_session {
-            // ROOT-CAUSE PROBE (device-0 / primary-phone retry-storm). We're about
-            // to re-run X3DH for this device because no session is keyed under `d`
-            // — but the OUTBOUND path, unlike the inbound decrypt path, does NOT
-            // call `resolve_session_address`. So if the established session lives
-            // under the LID<->PN ALTERNATE addressing (which it does for any phone
-            // that's been talking via LID — our own primary OR a recipient's), we
-            // fail to reuse it, re-X3DH against a consumed prekey, and the copy we
-            // send that phone fails MAC → it retry-storms while companions (whose
-            // addressing lines up) decrypt fine. This logs exactly when that gap
-            // bites, for both own and peer devices.
-            let is_own = own_user.map(|u| jid_user(d) == u).unwrap_or(false);
-            let alt_hit = lid_pn_alternates(store, session_id, d).into_iter().find(|a| {
-                matches!(store_load_record(store, session_id, a), Ok(Some(r)) if r.current.is_some())
-            });
-            if let Some(alt) = alt_hit {
-                tracing::warn!(
-                    device = %d,
-                    own = is_own,
-                    alt = %alt,
-                    "send: no session under device addr, but an established session EXISTS under its LID/PN alternate — outbound is re-X3DH'ing instead of reusing it (device-0 retry-storm root cause)",
-                );
-            }
+    for (d, enc) in &targets {
+        if enc != d {
+            tracing::info!(wire = %d, enc = %enc, "send: encrypting device under LID identity (PN->LID reuse)");
         }
-        match rec {
+        match store_load_record(store, session_id, enc)? {
             Some(r) if r.current.is_some() => {
-                existing.insert(d.clone(), r);
+                existing.insert(enc.clone(), r);
             }
-            _ => needs_bundle.push(d.clone()),
+            _ => needs_bundle.push(enc.clone()),
         }
     }
 
@@ -3043,20 +3033,22 @@ async fn encrypt_per_device(
         }
     }
 
-    // Encrypt per-device, advance each chain, persist.
-    let mut out = Vec::with_capacity(device_jids.len());
-    for d in device_jids {
+    // Encrypt per-device, advance each chain, persist under the ENCRYPTION addr
+    // (`enc`); the emitted recipient keeps the original wire jid `d`.
+    let mut out = Vec::with_capacity(targets.len());
+    for (d, enc) in &targets {
         let mut record = existing
-            .remove(d)
-            .or_else(|| bootstrapped.remove(d))
+            .remove(enc)
+            .or_else(|| bootstrapped.remove(enc))
             .ok_or_else(|| {
-                Error::Internal(anyhow::anyhow!("no session for device {d}"))
+                Error::Internal(anyhow::anyhow!("no session for device {enc} (wire {d})"))
             })?;
         let mut state = record.current.take().ok_or_else(|| {
-            Error::Internal(anyhow::anyhow!("session record has no current state for {d}"))
+            Error::Internal(anyhow::anyhow!("session record has no current state for {enc}"))
         })?;
         // Pick the plaintext: our own account's other devices get the
         // DeviceSentMessage copy; the peer's devices get the plain message.
+        // (own-ness keys off the wire/PN user, unaffected by the enc addr.)
         let pt: &[u8] = match own_user {
             Some(u) if jid_user(d) == u => padded_own,
             _ => padded,
@@ -3080,7 +3072,7 @@ async fn encrypt_per_device(
                 .map_err(|e| Error::Internal(anyhow::anyhow!("encrypt: {e}")))?,
         };
         record.current = Some(state);
-        store_save_record(store, session_id, d, &record)?;
+        store_save_record(store, session_id, enc, &record)?;
         out.push(EncryptedRecipient {
             jid: d.clone(),
             ciphertext: cipher.serialized,
@@ -3259,6 +3251,33 @@ fn resolve_session_address(store: &Arc<Store>, session_id: &str, addr: &str) -> 
         }
     }
     addr.to_string()
+}
+
+/// The Signal session address to ENCRYPT a device's copy under (whatsmeow's
+/// `encryptionIdentity`, distinct from the wire `<to jid>`). Once an account has
+/// migrated to LID, a device's real ratchet is keyed under its LID address and
+/// it rejects PN-addressed ciphertext (the primary phone migrates first — which
+/// is why it alone showed "Waiting for this message" while companions still
+/// decrypted PN). For a PN device with a known LID mapping, redirect to the LID
+/// address — but only when an established LID session actually exists there (or a
+/// PN ratchet can be migrated onto it via `resolve_session_address`); otherwise
+/// stay PN so the establish-via-prekey path is unchanged. The wire jid is kept by
+/// the caller; only the session key changes. Mirrors send.go `encryptMessageForDevices`.
+fn encryption_address(store: &Arc<Store>, session_id: &str, d: &str) -> String {
+    if d.ends_with("@s.whatsapp.net") {
+        if let Some(lid_addr) = lid_pn_alternates(store, session_id, d).into_iter().next() {
+            let resolved = resolve_session_address(store, session_id, &lid_addr);
+            let has_lid_session = store_load_record(store, session_id, &resolved)
+                .ok()
+                .flatten()
+                .map(|r| r.current.is_some())
+                .unwrap_or(false);
+            if has_lid_session {
+                return resolved;
+            }
+        }
+    }
+    resolve_session_address(store, session_id, d)
 }
 
 /// Record any LID<->PN correspondences advertised in an inbound message's
@@ -14910,6 +14929,59 @@ mod tests {
         assert_eq!(
             resolve_session_address(&store, &id, "99999999999.1@lid"),
             "99999999999.1@lid"
+        );
+    }
+
+    /// `encryption_address` redirects a PN device to its LID session (whatsmeow's
+    /// encryptionIdentity split) — the fix for the primary phone showing "Waiting
+    /// for this message" because we were encrypting under its stale PN address.
+    #[test]
+    fn encryption_address_redirects_pn_device_to_lid_when_session_exists() {
+        let mgr = manager();
+        let s = mgr.create(Some("enc".into())).unwrap();
+        let id = s.meta.read().id.clone();
+        let store = mgr.store.clone();
+
+        // Account migrated to LID; the device-0 ratchet currently lives under PN.
+        // A *usable* session has a `current` state (an empty SessionRecord is
+        // treated as "no session" by both the partition loop and the redirect).
+        store.lid_pn_put(&id, "64000000000001", "5511990000001", 1).unwrap();
+        let state = crate::crypto::signal::SessionState {
+            session_version: 3,
+            local_identity_pub: [0u8; 32],
+            remote_identity_pub: [0u8; 32],
+            root_key: [0u8; 32],
+            sender_chain: None,
+            sender_ratchet_priv: None,
+            sender_ratchet_pub: None,
+            previous_counter: 0,
+            receiver_chains: Vec::new(),
+            pending_pre_key: None,
+            local_registration_id: 0,
+            remote_registration_id: 0,
+        };
+        let mut rec = crate::crypto::signal::SessionRecord::new();
+        rec.current = Some(state);
+        store_save_record(&store, &id, "5511990000001@s.whatsapp.net", &rec).unwrap();
+
+        // PN device-0 with a known LID + an existing session → encrypt under LID
+        // (the established ratchet is migrated onto the LID address, not re-X3DH'd).
+        assert_eq!(
+            encryption_address(&store, &id, "5511990000001@s.whatsapp.net"),
+            "64000000000001.1@lid"
+        );
+
+        // PN device with a LID mapping but NO session anywhere → stays PN, so the
+        // establish-via-prekey path is unchanged.
+        assert_eq!(
+            encryption_address(&store, &id, "5511000000000@s.whatsapp.net"),
+            "5511000000000@s.whatsapp.net"
+        );
+
+        // An already-LID address is returned unchanged (no redirect logic runs).
+        assert_eq!(
+            encryption_address(&store, &id, "64000000000001.1:7@lid"),
+            "64000000000001.1:7@lid"
         );
     }
 
