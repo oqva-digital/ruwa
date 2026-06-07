@@ -2940,7 +2940,33 @@ async fn encrypt_per_device(
     let mut existing: HashMap<String, SessionRecord> = HashMap::new();
     let mut needs_bundle: Vec<String> = Vec::new();
     for d in device_jids {
-        match store_load_record(store, session_id, d)? {
+        let rec = store_load_record(store, session_id, d)?;
+        let has_session = rec.as_ref().map(|r| r.current.is_some()).unwrap_or(false);
+        if !has_session {
+            // ROOT-CAUSE PROBE (device-0 / primary-phone retry-storm). We're about
+            // to re-run X3DH for this device because no session is keyed under `d`
+            // — but the OUTBOUND path, unlike the inbound decrypt path, does NOT
+            // call `resolve_session_address`. So if the established session lives
+            // under the LID<->PN ALTERNATE addressing (which it does for any phone
+            // that's been talking via LID — our own primary OR a recipient's), we
+            // fail to reuse it, re-X3DH against a consumed prekey, and the copy we
+            // send that phone fails MAC → it retry-storms while companions (whose
+            // addressing lines up) decrypt fine. This logs exactly when that gap
+            // bites, for both own and peer devices.
+            let is_own = own_user.map(|u| jid_user(d) == u).unwrap_or(false);
+            let alt_hit = lid_pn_alternates(store, session_id, d).into_iter().find(|a| {
+                matches!(store_load_record(store, session_id, a), Ok(Some(r)) if r.current.is_some())
+            });
+            if let Some(alt) = alt_hit {
+                tracing::warn!(
+                    device = %d,
+                    own = is_own,
+                    alt = %alt,
+                    "send: no session under device addr, but an established session EXISTS under its LID/PN alternate — outbound is re-X3DH'ing instead of reusing it (device-0 retry-storm root cause)",
+                );
+            }
+        }
+        match rec {
             Some(r) if r.current.is_some() => {
                 existing.insert(d.clone(), r);
             }
@@ -3079,6 +3105,19 @@ fn jid_user(jid: &str) -> &str {
 fn lid_user_part(jid: &str) -> &str {
     let end = jid.find(['.', ':', '@']).unwrap_or(jid.len());
     &jid[..end]
+}
+
+/// Whether a device's user-part belongs to our own account. A retry receipt
+/// from our own primary phone addresses it by LID (e.g. `<lid>.1@lid` → user
+/// `<lid>`), while we know ourselves by PN; we may also know our own LID via the
+/// PN<->LID map. Matching either makes the resend an own-device (DeviceSentMessage)
+/// copy instead of a plain peer copy.
+fn device_user_is_own(
+    dev_user: &str,
+    own_pn_user: Option<&str>,
+    own_lid_user: Option<&str>,
+) -> bool {
+    own_pn_user == Some(dev_user) || own_lid_user == Some(dev_user)
 }
 
 /// The device token of a JID (the `N` in `:N`), or `None` if bare (device 0).
@@ -6768,7 +6807,7 @@ async fn handle_inbound_retry_receipt(
     dispatcher: ConnDispatcher,
     req: RetryRequest,
 ) {
-    let Some((_chat_jid, inner_proto)) = session.recent_send(&req.msg_id) else {
+    let Some((dest_jid, inner_proto)) = session.recent_send(&req.msg_id) else {
         tracing::warn!(
             id = %req.msg_id,
             "retry receipt for an unknown/expired message — cannot resend"
@@ -6799,7 +6838,30 @@ async fn handle_inbound_retry_receipt(
         }
     }
 
-    let padded = pad_message(&inner_proto);
+    // Own-device resends must carry the DeviceSentMessage wrapper, exactly like
+    // the original own-fan-out (`padded_own`). Without it the device decrypts the
+    // resend but can't place it as a message *we* sent → it stays on "Waiting for
+    // this message" and keeps re-requesting. Peer devices get the plain message.
+    // Detect own-ness across both PN and LID addressing (the device JID here is
+    // typically the LID form, e.g. `<lid>.1@lid`).
+    let own_pn_user = session.meta.read().jid.as_deref().map(|j| jid_user(j).to_string());
+    let own_lid_user = own_pn_user
+        .as_deref()
+        .and_then(|pn| store.pn_to_lid(&session_id, pn).ok().flatten());
+    let dev_user = lid_user_part(&device);
+    let is_own_device =
+        device_user_is_own(dev_user, own_pn_user.as_deref(), own_lid_user.as_deref());
+    let padded = if is_own_device {
+        match build_device_sent_message(&inner_proto, &dest_jid) {
+            Some(dsm) => pad_message(&dsm),
+            None => pad_message(&inner_proto),
+        }
+    } else {
+        pad_message(&inner_proto)
+    };
+    if is_own_device {
+        tracing::info!(device = %device, dest = %dest_jid, "retry: wrapping own-device resend in DeviceSentMessage");
+    }
     let recipients = match encrypt_per_device(
         &store,
         &keys,
@@ -10490,6 +10552,34 @@ mod tests {
         // single path segment.
         assert_eq!(enc_path_seg("55119:12@s.whatsapp.net"), "55119%3A12%40s%2Ewhatsapp%2Enet");
         assert_eq!(enc_path_seg("3EB0ABC123"), "3EB0ABC123"); // plain ids untouched
+    }
+
+    #[test]
+    fn device_user_is_own_matches_pn_and_lid() {
+        // Our own primary phone retries from its LID; lid_user_part strips the
+        // `.agent`/`:device`/`@lid` to the bare LID user. (Synthetic ids.)
+        assert_eq!(lid_user_part("1000000000000.1@lid"), "1000000000000");
+        // Matches via the LID form (what a retry receipt carries)…
+        assert!(device_user_is_own(
+            "1000000000000",
+            Some("5500000000000"),
+            Some("1000000000000"),
+        ));
+        // …and via the PN form.
+        assert!(device_user_is_own(
+            "5500000000000",
+            Some("5500000000000"),
+            Some("1000000000000"),
+        ));
+        // A real peer is NOT our own device.
+        assert!(!device_user_is_own(
+            "4400000000000",
+            Some("5500000000000"),
+            Some("1000000000000"),
+        ));
+        // No own-LID known yet: still match on PN, don't false-positive otherwise.
+        assert!(device_user_is_own("5500000000000", Some("5500000000000"), None));
+        assert!(!device_user_is_own("1000000000000", Some("5500000000000"), None));
     }
 
     fn manager() -> SessionManager {
