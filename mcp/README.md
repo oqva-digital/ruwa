@@ -13,6 +13,7 @@ contacts/profile, and wire up event delivery.
 **Instance lifecycle**
 - `create_session` — create a new instance (optional label + proxy)
 - `get_qr` — pairing QR payload to scan in WhatsApp → Linked devices
+- `pair_phone` — 8-char "Link with phone number" code (QR alternative, no scanning)
 - `get_session` — one instance's status / JID / proxy
 - `connect_session` — (re)connect a disconnected session
 - `logout_session` — unlink the device

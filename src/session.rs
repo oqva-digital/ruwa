@@ -9,7 +9,7 @@
 //! `SessionManager` is the multi-tenant registry. It restores sessions from
 //! the store on boot and exposes lookup/create/delete by `SessionId`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::{Mutex as PlMutex, RwLock};
@@ -399,6 +399,9 @@ impl ImportedCreds {
 pub enum SessionEvent {
     Connecting,
     Qr { code: String },
+    /// Phone-number ("Link with phone number") pairing code — the 8-char,
+    /// hyphenated code the user types into their phone. Emitted by `pair_phone`.
+    PairingCode { code: String },
     Paired { jid: String },
     Connected,
     Disconnected { reason: String },
@@ -757,6 +760,13 @@ pub struct Session {
     /// keyed by message id. Bounded FIFO ring (mirrors whatsmeow's
     /// `recentMessages`); in-memory only.
     recent_sends: PlMutex<VecDeque<RecentSend>>,
+    /// In-flight phone-code pairing, set by `pair_phone` and consumed by the
+    /// code-pair notification handler. `None` outside a code-pairing attempt.
+    phone_linking: RwLock<Option<PhoneLinkingState>>,
+    /// App-state sync key IDs we've already asked the phone to (re)share, so the
+    /// missing-key sweep doesn't re-request the same ones on every sync. In-
+    /// memory; resets on restart (matching whatsmeow's throttle intent).
+    requested_app_state_keys: PlMutex<HashSet<Vec<u8>>>,
 }
 
 /// One entry in [`Session::recent_sends`] — enough to rebuild and resend a
@@ -770,6 +780,37 @@ struct RecentSend {
 /// Cap on [`Session::recent_sends`]. whatsmeow keeps 256; a retry almost
 /// always arrives within seconds of the send, so this is ample headroom.
 const RECENT_SENDS_MAX: usize = 256;
+
+/// In-flight phone-number ("Link with phone number") pairing state, stashed
+/// between the `companion_hello` IQ (`pair_phone`) and the server's
+/// code-pair notification. Mirrors whatsmeow's `phoneLinkingCache`.
+#[derive(Clone)]
+pub(crate) struct PhoneLinkingState {
+    /// `phone@s.whatsapp.net` the code was requested for.
+    pub jid: String,
+    /// Our ephemeral Curve25519 keypair (private half drives the ECDH when the
+    /// notification arrives).
+    pub ephemeral_keypair: crate::crypto::identity::KeyPair,
+    /// The 80-byte wrapped ephemeral pub (`salt||iv||ct`) sent in
+    /// `companion_hello`. Cached so re-arm can resend the *same* registration
+    /// (and thus keep the same code) on each reconnect.
+    pub ephemeral_key: [u8; 80],
+    /// The 8-char (un-hyphenated) linking code — the PBKDF2 password.
+    pub linking_code: String,
+    /// `Browser (OS)` display name, echoed on each re-arm.
+    pub client_display_name: String,
+    /// `link_code_pairing_ref` echoed back by the server; matched against the
+    /// notification to reject a stale/mismatched one. Refreshed on each re-arm.
+    pub pairing_ref: String,
+    /// How many times the re-arm loop has resent `companion_hello`. Backstop so
+    /// an abandoned pairing can't hammer the server forever (which rate-limits
+    /// the phone number out of link-code registration). See [`REARM_MAX`].
+    pub rearm_attempts: u32,
+}
+
+/// Hard cap on phone-code re-arm resends (~`REARM_MAX × 30s` socket recycle).
+/// Past this we give up on an un-entered code rather than keep spamming.
+const REARM_MAX: u32 = 6;
 
 impl Session {
     pub fn new(meta: SessionMeta) -> Self {
@@ -798,7 +839,16 @@ impl Session {
             device_cache: RwLock::new(HashMap::new()),
             message_retries: PlMutex::new(HashMap::new()),
             recent_sends: PlMutex::new(VecDeque::new()),
+            phone_linking: RwLock::new(None),
+            requested_app_state_keys: PlMutex::new(HashSet::new()),
         }
+    }
+
+    /// Filter `ids` to the app-state key IDs we haven't requested before,
+    /// marking the survivors as requested. Returns the genuinely-new ones.
+    fn take_unrequested_app_state_keys(&self, ids: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut seen = self.requested_app_state_keys.lock();
+        ids.into_iter().filter(|id| seen.insert(id.clone())).collect()
     }
 
     /// Fresh cached device list for `user_key`, or `None` on miss/expiry.
@@ -899,6 +949,132 @@ impl Session {
             .map_err(|e| Error::Internal(anyhow::anyhow!("iq request failed: {e}")))
     }
 
+    /// Phone-number pairing ("Link with phone number"): ask WhatsApp for an
+    /// 8-char linking code for `phone` and return it hyphenated (`XXXX-XXXX`).
+    /// The user enters it on their phone under Linked Devices → Link with phone
+    /// number. Requires the session to already be connected (the Noise
+    /// handshake must be up so the server will issue a code, and there's a
+    /// ~160 s window before the login socket closes — call this promptly after
+    /// `connect`). Mirrors whatsmeow's `PairPhone`.
+    pub(crate) async fn pair_phone(
+        &self,
+        noise_pub: &[u8; 32],
+        phone: &str,
+        client_display_name: &str,
+    ) -> Result<String> {
+        // Normalize to digits and validate the international form (mirrors
+        // whatsmeow's notNumbers strip + length/leading-zero checks).
+        let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.len() <= 6 {
+            return Err(Error::BadRequest("phone number too short".into()));
+        }
+        if digits.starts_with('0') {
+            return Err(Error::BadRequest(
+                "phone number must be international (no leading 0)".into(),
+            ));
+        }
+        let jid = format!("{digits}@s.whatsapp.net");
+
+        let companion = crate::crypto::linking::generate_companion_ephemeral_key();
+        let iq = build_companion_hello_iq(
+            &uuid_v4(),
+            &jid,
+            &companion.ephemeral_key,
+            noise_pub,
+            client_display_name,
+        );
+        let reply = self.iq_request(iq).await?;
+        if iq_is_error(&reply) {
+            return Err(Error::Internal(anyhow::anyhow!(
+                "server rejected link-code registration (display name must be 'Browser (OS)')"
+            )));
+        }
+        let pairing_ref = extract_link_code_pairing_ref(&reply).ok_or_else(|| {
+            Error::Internal(anyhow::anyhow!("response missing link_code_pairing_ref"))
+        })?;
+
+        let code = companion.linking_code.clone();
+        *self.phone_linking.write() = Some(PhoneLinkingState {
+            jid,
+            ephemeral_keypair: companion.keypair,
+            ephemeral_key: companion.ephemeral_key,
+            linking_code: code.clone(),
+            client_display_name: client_display_name.to_string(),
+            pairing_ref,
+            rearm_attempts: 0,
+        });
+
+        let formatted = format!("{}-{}", &code[0..4], &code[4..8]);
+        let _ = self.events.send(SessionEvent::PairingCode {
+            code: formatted.clone(),
+        });
+        Ok(formatted)
+    }
+
+    /// Snapshot the in-flight phone-code pairing state (for the notification
+    /// handler), or `None` if no `pair_phone` is pending.
+    fn phone_linking_state(&self) -> Option<PhoneLinkingState> {
+        self.phone_linking.read().clone()
+    }
+
+    /// Clear the in-flight phone-code pairing state once the handshake finishes
+    /// (or is abandoned).
+    fn clear_phone_linking(&self) {
+        *self.phone_linking.write() = None;
+    }
+
+    /// Re-send `companion_hello` for an in-flight phone-code pairing on a fresh
+    /// connection, reusing the cached ephemeral + linking code so the SAME
+    /// user-facing code stays valid. WhatsApp force-closes an unpaired pairing
+    /// socket every ~30s, and each reconnect re-registers the device — which
+    /// would otherwise invalidate the code before the user can type it. Called
+    /// from the `pair-device` handler on every reconnect while a pairing is
+    /// pending; refreshes the cached pairing ref from the reply.
+    async fn rearm_phone_pairing(&self, dispatcher: &ConnDispatcher, noise_pub: &[u8; 32]) {
+        let state = match self.phone_linking.read().clone() {
+            Some(s) => s,
+            None => return,
+        };
+        // Stop *resending* after the cap so an un-entered code can't hammer the
+        // server (which rate-limits the number out of link-code registration).
+        // Crucially we KEEP `phone_linking` — the originally-registered code may
+        // still be valid, and the user could enter it at any time; discarding
+        // the state would make the inbound `link_code_companion_reg`
+        // notification get ignored. State is cleared only on pair-success/logout.
+        if state.rearm_attempts >= REARM_MAX {
+            return;
+        }
+        if let Some(s) = self.phone_linking.write().as_mut() {
+            s.rearm_attempts += 1;
+        }
+        let iq = build_companion_hello_iq(
+            &uuid_v4(),
+            &state.jid,
+            &state.ephemeral_key,
+            noise_pub,
+            &state.client_display_name,
+        );
+        match dispatcher.iq_request(iq).await {
+            Ok(reply) if !iq_is_error(&reply) => match extract_link_code_pairing_ref(&reply) {
+                Some(new_ref) => {
+                    if let Some(s) = self.phone_linking.write().as_mut() {
+                        s.pairing_ref = new_ref;
+                    }
+                    tracing::info!("re-armed phone-code pairing on fresh socket");
+                }
+                None => tracing::warn!("phone-code re-arm: reply carried no pairing ref"),
+            },
+            // A rejected re-register usually means "already have a pending
+            // registration" (the original code is still valid) or the window
+            // lapsed. Either way, do NOT clear — keep the state so the user can
+            // still complete pairing; the cap above bounds the resends.
+            Ok(_) => tracing::debug!("phone-code re-arm: server rejected resend (state kept)"),
+            // Transient (socket died mid-request) — leave the state so the next
+            // reconnect's pair-device re-arms again.
+            Err(e) => tracing::warn!(error = %e, "phone-code re-arm: iq request failed (transient)"),
+        }
+    }
+
     /// Spawn the egress delivery worker (webhook + redis fan-out) exactly once for
     /// this session. Safe to call on every `connect`: the atomic guard ensures only
     /// the first call spawns (a second worker would double-deliver every event). The
@@ -915,11 +1091,18 @@ impl Session {
         }
     }
 
-    /// Store the driver-task handle, replacing (and detaching) any prior one.
-    /// A prior handle only lingers if a previous connection task already
-    /// exited, so we drop it without aborting.
+    /// Store the driver-task handle, **aborting** any prior one first. A prior
+    /// `run_with_reconnect` driver can still be alive here — during its
+    /// reconnect backoff the status is `Disconnected`, which slips past
+    /// `connect`'s `Connecting|Connected` guard, so a fresh `connect` would
+    /// otherwise spawn a SECOND driver. Two drivers both log in as the same
+    /// device and WhatsApp resolves it with `conflict=replaced` — a self-
+    /// inflicted replace-war. Aborting guarantees exactly one driver per
+    /// session. (Mirrors `set_keepalive_handle`.)
     pub fn set_task_handle(&self, h: tokio::task::JoinHandle<()>) {
-        *self.task_handle.lock() = Some(h);
+        if let Some(prev) = self.task_handle.lock().replace(h) {
+            prev.abort();
+        }
     }
 
     /// Take the driver-task handle for awaiting during graceful shutdown.
@@ -3048,9 +3231,12 @@ async fn encrypt_per_device(
         })?;
         // Pick the plaintext: our own account's other devices get the
         // DeviceSentMessage copy; the peer's devices get the plain message.
-        // (own-ness keys off the wire/PN user, unaffected by the enc addr.)
+        // Match on `lid_user_part` (not `jid_user`) so an own device addressed
+        // by LID (`<ourlid>.1:N@lid`, user-part `<ourlid>`) is recognised as ours
+        // — `own_user` is then our LID on the LID path. For PN jids (no `.`)
+        // `lid_user_part` == `jid_user`, so the PN path is byte-identical.
         let pt: &[u8] = match own_user {
-            Some(u) if jid_user(d) == u => padded_own,
+            Some(u) if lid_user_part(d) == u => padded_own,
             _ => padded,
         };
         let cipher = match state.pending_pre_key.clone() {
@@ -3364,25 +3550,48 @@ async fn encrypt_inner_proto_and_ship(
         .await;
     }
 
-    // Resolve a LID-addressed recipient to its phone-number address BEFORE we do
-    // anything else. WhatsApp routes our sends by PN: a usync against a bare
-    // `@lid` returns no device list (observed: "iq reply timeout"), so the send
-    // falls back to a bare-LID `<message>` that the server never delivers — the
-    // exact reason a reply typed into a LID-addressed chat silently vanished.
-    // The LID<->PN map (learned from inbound traffic) gives us the PN the peer's
-    // Signal session is actually established under. Resolve to the BARE PN so
-    // usync enumerates every linked device, matching the working PN send path.
+    // Decide how to ADDRESS a `@lid` recipient. Modern WhatsApp (and whatsmeow,
+    // send.go:323 — for a `HiddenUserServer` recipient it sets
+    // `ownID = cli.getOwnLID()` and keeps `to=@lid`) sends to a LID contact UNDER
+    // @lid: keep `to=@lid`, enumerate the peer's LID devices, encrypt LID<->LID.
+    // A LID-MIGRATED contact ONLY routes LID-addressed sends — a PN-addressed
+    // stanza is acked by the server but silently NOT delivered (no receipt, no
+    // retry), the exact symptom where replies into a LID chat vanished.
+    //
+    // So PREFER @lid: probe the @lid device list, and if the server returns real
+    // devices, send LID-addressed. We fall back to the legacy PN resolution only
+    // when the @lid usync yields nothing (older servers / unmigrated peers where
+    // @lid carries no device list) — that keeps the PN send path byte-identical.
+    //
+    // NOTE: the old comment here claimed "@lid usync returns no device list (iq
+    // reply timeout)"; that predated the PR #9 usync fixes (`<lid/>` element +
+    // distinct `sid` + `parse_usync_devices_response` preserving @lid). The probe
+    // below is now the source of truth — if it returns devices, LID send is on.
     let resolved_recipient;
+    let mut send_as_lid = false;
     let chat_jid: &str = if chat_jid.ends_with("@lid") {
-        match store.lid_to_pn(&session_id, lid_user_part(chat_jid)) {
-            Ok(Some(pn)) => {
-                resolved_recipient = format!("{pn}@s.whatsapp.net");
-                tracing::info!(lid = %chat_jid, pn = %resolved_recipient, "resolved LID recipient to PN for send");
-                resolved_recipient.as_str()
-            }
-            _ => {
-                tracing::warn!(lid = %chat_jid, "no LID->PN mapping for recipient; sending to bare LID (may not deliver)");
-                chat_jid
+        // Probe the @lid device list and, when it returns real devices, send
+        // LID-addressed (verified to deliver — a migrated contact only routes
+        // LID-addressed sends). `resolve_device_jids` falls back to `[chat_jid]`
+        // (the bare LID) when the server returns no devices, so a real device list
+        // is anything other than that; in that case we drop to the legacy PR #9
+        // PN-rewrite path below.
+        let lid_devices = resolve_device_jids(session, dispatcher, chat_jid).await;
+        if lid_devices.iter().any(|d| d != chat_jid) {
+            send_as_lid = true;
+            tracing::info!(lid = %chat_jid, devices = lid_devices.len(), "sending to @lid recipient under LID addressing (modern path)");
+            chat_jid
+        } else {
+            match store.lid_to_pn(&session_id, lid_user_part(chat_jid)) {
+                Ok(Some(pn)) => {
+                    resolved_recipient = format!("{pn}@s.whatsapp.net");
+                    tracing::info!(lid = %chat_jid, pn = %resolved_recipient, "LID usync empty; falling back to PN addressing for send");
+                    resolved_recipient.as_str()
+                }
+                _ => {
+                    tracing::warn!(lid = %chat_jid, "no LID devices and no LID->PN mapping; sending to bare LID (may not deliver)");
+                    chat_jid
+                }
             }
         }
     } else {
@@ -3393,16 +3602,17 @@ async fn encrypt_inner_proto_and_ship(
     // and resend it (the peer's session to us desynced and it asked again).
     session.record_recent_send(msg_id, chat_jid, inner_proto_bytes);
 
-    // 1. Discover the peer's linked devices via usync, and — so our sent
-    //    message also lands in our own chat history — our own account's
-    //    *other* devices. The sending device itself is always excluded.
-    //    Falls back to the bare chat_jid if usync returns nothing.
+    // 1. Discover the peer's linked devices via usync. On the PN path we also
+    //    fan out to our OWN account's *other* devices in the same batch (legacy
+    //    behavior) so the message echoes into our chat history. The sending
+    //    device is always excluded. Falls back to bare chat_jid if usync empty.
     let mut device_jids = resolve_device_jids(session, dispatcher, chat_jid).await;
-    let own_user = own_jid.as_deref().map(|j| jid_user(j).to_string());
+    let own_pn_user = own_jid.as_deref().map(|j| jid_user(j).to_string());
     if let Some(own) = own_jid.as_deref() {
-        // Only fan out to our own devices separately when we're not already
-        // messaging ourselves (a self-send already resolved them above).
-        if jid_user(chat_jid) != jid_user(own) {
+        // PN path only: own devices are PN-addressed here (`encryption_address`
+        // redirects each to its LID session if migrated). On the LID path our own
+        // devices are mirrored separately below to keep the stanza all-`@lid`.
+        if !send_as_lid && jid_user(chat_jid) != jid_user(own) {
             let own_bare = format!("{}@s.whatsapp.net", jid_user(own));
             for d in resolve_device_jids(session, dispatcher, &own_bare).await {
                 if !device_jids.contains(&d) {
@@ -3420,7 +3630,9 @@ async fn encrypt_inner_proto_and_ship(
         Some(dsm) => pad_message(&dsm),
         None => padded.clone(),
     };
-    let recipients = encrypt_per_device(
+    // 2a. Encrypt for the peer (+ own PN devices on the PN path). This MUST
+    //     succeed — it is the actual delivery.
+    let mut recipients = encrypt_per_device(
         store,
         keys,
         dispatcher,
@@ -3428,9 +3640,63 @@ async fn encrypt_inner_proto_and_ship(
         &device_jids,
         &padded,
         &padded_own,
-        own_user.as_deref(),
+        own_pn_user.as_deref(),
     )
     .await?;
+
+    // 2b. LID path: also mirror the message to our OWN LID devices so it lands in
+    //     the ruwa account's other linked devices (e.g. the phone's copy of the
+    //     chat). Done as a SEPARATE, BEST-EFFORT batch: an own-device hiccup must
+    //     never fail the peer delivery above. Keeps the stanza all-`@lid` and
+    //     self-excludes THIS sending device by its LID form.
+    if send_as_lid {
+        if let (Some(own), Some(own_lid)) = (
+            own_jid.as_deref(),
+            own_pn_user
+                .as_deref()
+                .and_then(|u| store.pn_to_lid(&session_id, u).ok().flatten()),
+        ) {
+            let own_lid_bare = format!("{own_lid}@lid");
+            // The sending device's LID form: `<ourlid>.1:<device>@lid` (agent is
+            // always `.1` for an @lid hosted identity). Keep device 0 (the phone)
+            // unless WE are device 0.
+            let mut self_forms: Vec<String> = Vec::new();
+            match own.split(':').nth(1).and_then(|s| s.split('@').next()) {
+                Some(dev) => {
+                    self_forms.push(format!("{own_lid}.1:{dev}@lid"));
+                    if dev == "0" {
+                        self_forms.push(format!("{own_lid}.1@lid"));
+                    }
+                }
+                None => self_forms.push(format!("{own_lid}.1@lid")),
+            }
+            let own_lid_jids: Vec<String> = resolve_device_jids(session, dispatcher, &own_lid_bare)
+                .await
+                .into_iter()
+                .filter(|d| d != &own_lid_bare && !self_forms.contains(d))
+                .collect();
+            if !own_lid_jids.is_empty() {
+                match encrypt_per_device(
+                    store,
+                    keys,
+                    dispatcher,
+                    &session_id,
+                    &own_lid_jids,
+                    &padded_own,
+                    &padded_own,
+                    Some(own_lid.as_str()),
+                )
+                .await
+                {
+                    Ok(mut own_recips) => recipients.append(&mut own_recips),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "own-device LID echo failed; peer delivery unaffected"
+                    ),
+                }
+            }
+        }
+    }
 
     // 2. Build the <message> node, register the pending ack BEFORE
     //    pushing onto the wire (so a fast server can't beat us), then
@@ -4815,6 +5081,18 @@ fn process_inbound_node(
                 }
             }
         }
+        // `<notification>` carrying `link_code_companion_reg` — the user typed
+        // our phone-pairing code into their phone. Run the companion-finish
+        // dance off this signal; the normal ack below still fires.
+        if node.tag == "notification" {
+            if let Content::Nodes(ns) = &node.content {
+                if let Some(reg) = ns.iter().find(|c| c.tag == "link_code_companion_reg") {
+                    if let Some(d) = dispatcher {
+                        handle_code_pair_notification(session, store, keys, d, reg);
+                    }
+                }
+            }
+        }
         if let Some(d) = dispatcher {
             use crate::protocol::binary::{Attrs, Content, Node};
             let mut attrs = Attrs::new();
@@ -4889,8 +5167,10 @@ fn process_inbound_node(
             let session_id = session.meta.read().id.clone();
             tokio::spawn(handle_app_state_sync_iq(
                 Arc::clone(store),
+                Arc::clone(session),
                 session_id,
                 d.clone(),
+                keys.clone(),
                 sync.clone(),
             ));
         }
@@ -4902,6 +5182,17 @@ fn process_inbound_node(
             return None;
         }
         session.install_qr_rotation(codes);
+        // If a phone-code pairing is in flight, re-arm it on this fresh socket
+        // so the same code survives WhatsApp's ~30s pairing-socket recycle.
+        // (No-op on the first pair-device: `pair_phone` hasn't run yet.)
+        if session.phone_linking.read().is_some() {
+            if let Some(d) = dispatcher {
+                let s = Arc::clone(session);
+                let d2 = d.clone();
+                let noise_pub = keys.noise.public;
+                tokio::spawn(async move { s.rearm_phone_pairing(&d2, &noise_pub).await });
+            }
+        }
         return Some(build_iq_ack(node));
     }
 
@@ -4951,6 +5242,91 @@ const ADV_DEVICE_SIG_PREFIX: [u8; 2] = [6, 1];
 /// signed `<iq type=result><pair-device-sign>...</pair-device-sign></iq>`
 /// reply that completes the pairing handshake. Mirrors whatsmeow's
 /// `Client.handlePair` in pair.go.
+/// Handle a `<notification>` carrying `link_code_companion_reg` — the server's
+/// signal that the user typed our linking code into their phone. Runs the
+/// companion-side ECDH dance, persists the derived adv secret, and ships the
+/// `companion_finish` IQ; the subsequent `<pair-success>` then completes
+/// exactly as it does for QR. Mirrors whatsmeow's `handleCodePairNotification`.
+fn handle_code_pair_notification(
+    session: &Arc<Session>,
+    store: &Arc<Store>,
+    keys: &DeviceKeys,
+    dispatcher: &ConnDispatcher,
+    reg: &crate::protocol::binary::Node,
+) {
+    use crate::protocol::binary::Content;
+
+    let Some(state) = session.phone_linking_state() else {
+        tracing::warn!("code-pair notification with no pending pair_phone — ignoring");
+        return;
+    };
+    let Content::Nodes(children) = &reg.content else {
+        return;
+    };
+    let child_bytes = |tag: &str| -> Option<Vec<u8>> {
+        children
+            .iter()
+            .find(|n| n.tag == tag)
+            .and_then(|n| match &n.content {
+                Content::Bytes(b) => Some(b.clone()),
+                _ => None,
+            })
+    };
+
+    // The notification must carry the same pairing ref we cached at hello.
+    let notif_ref = child_bytes("link_code_pairing_ref")
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    if notif_ref != state.pairing_ref {
+        tracing::warn!("code-pair notification ref mismatch — ignoring");
+        return;
+    }
+    let Some(wrapped_primary) = child_bytes("link_code_pairing_wrapped_primary_ephemeral_pub")
+    else {
+        tracing::warn!("code-pair notification missing wrapped primary ephemeral pub");
+        return;
+    };
+    let Some(primary_identity_pub) = child_bytes("primary_identity_pub") else {
+        tracing::warn!("code-pair notification missing primary_identity_pub");
+        return;
+    };
+
+    let result = match crate::crypto::linking::complete_code_pair(
+        &state.linking_code,
+        &state.ephemeral_keypair.private,
+        &keys.identity,
+        &wrapped_primary,
+        &primary_identity_pub,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "code-pair crypto failed");
+            return;
+        }
+    };
+
+    // The derived adv_secret REPLACES the random one minted at session
+    // creation; pair-success HMAC-verifies against it. Persist so the live
+    // pair-success (which reloads adv_secret from the store) and any reconnect
+    // see the right value.
+    let session_id = session.meta.read().id.clone();
+    if let Err(e) = store.device_keys_set_adv_secret(&session_id, &result.adv_secret) {
+        tracing::error!(error = %e, "persisting derived adv_secret failed");
+        return;
+    }
+
+    let iq = build_companion_finish_iq(
+        &uuid_v4(),
+        &state.jid,
+        &result.wrapped_key_bundle,
+        &keys.identity.public,
+        &notif_ref,
+    );
+    dispatcher.send_node(iq);
+    session.clear_phone_linking();
+    tracing::info!("phone-code pairing: sent companion_finish, awaiting pair-success");
+}
+
 fn apply_pair_success(
     session: &Arc<Session>,
     store: &Store,
@@ -4992,7 +5368,18 @@ fn apply_pair_success(
         container.account_type == Some(AdvEncryptionType::Hosted as i32);
 
     // 2. HMAC-SHA256(adv_secret, [hosted-prefix?] || details) == container.hmac.
-    let mut mac = Hmac::<Sha256>::new_from_slice(&keys.adv_secret)
+    // Phone-code pairing *derives* the adv_secret during the link-code
+    // handshake and persists it to the store, so prefer the stored value over
+    // the random one the connection task's `keys` carries. For QR pairing the
+    // two are identical.
+    let adv_secret: Vec<u8> = store
+        .device_keys_load(&session.meta.read().id)
+        .ok()
+        .flatten()
+        .map(|r| r.adv_secret)
+        .filter(|s| s.len() == 32)
+        .unwrap_or_else(|| keys.adv_secret.to_vec());
+    let mut mac = Hmac::<Sha256>::new_from_slice(&adv_secret)
         .map_err(|e| Error::Internal(anyhow::anyhow!("hmac init: {e}")))?;
     if is_hosted {
         mac.update(&ADV_HOSTED_ACCOUNT_SIG_PREFIX);
@@ -7552,6 +7939,116 @@ pub struct DevicePrekeyBundle {
 /// Caller stitches `<phone>:<device_id>@s.whatsapp.net` for each one.
 /// Build an IQ that sets our own "about"/status text. Mirrors whatsmeow's
 /// `SetStatusMessage` (`xmlns="status"`, `<status>text</status>`).
+/// Build the `companion_hello` link-code registration IQ — phone-code pairing
+/// step 1 (whatsmeow's `PairPhone`). `xmlns="md"`; asks the server for an
+/// 8-char code bound to `jid`.
+pub fn build_companion_hello_iq(
+    iq_id: &str,
+    jid: &str,
+    wrapped_ephemeral_pub: &[u8; 80],
+    noise_pub: &[u8; 32],
+    client_display_name: &str,
+) -> crate::protocol::binary::Node {
+    use crate::protocol::binary::{Attrs, Content, Node};
+    let child = |tag: &str, bytes: Vec<u8>| Node {
+        tag: tag.into(),
+        attrs: Attrs::new(),
+        content: Content::Bytes(bytes),
+    };
+    let mut reg_attrs = Attrs::new();
+    reg_attrs.insert("jid".into(), jid.into());
+    reg_attrs.insert("stage".into(), "companion_hello".into());
+    reg_attrs.insert("should_show_push_notification".into(), "true".into());
+    let reg = Node {
+        tag: "link_code_companion_reg".into(),
+        attrs: reg_attrs,
+        content: Content::Nodes(vec![
+            child(
+                "link_code_pairing_wrapped_companion_ephemeral_pub",
+                wrapped_ephemeral_pub.to_vec(),
+            ),
+            child("companion_server_auth_key_pub", noise_pub.to_vec()),
+            // Platform id "1" = Chrome — must agree with the "Browser (OS)"
+            // display name or the server 400s.
+            child("companion_platform_id", b"1".to_vec()),
+            child(
+                "companion_platform_display",
+                client_display_name.as_bytes().to_vec(),
+            ),
+            child("link_code_pairing_nonce", vec![0u8]),
+        ]),
+    };
+    let mut iq_attrs = Attrs::new();
+    iq_attrs.insert("id".into(), iq_id.into());
+    iq_attrs.insert("type".into(), "set".into());
+    iq_attrs.insert("xmlns".into(), "md".into());
+    iq_attrs.insert("to".into(), "s.whatsapp.net".into());
+    Node {
+        tag: "iq".into(),
+        attrs: iq_attrs,
+        content: Content::Nodes(vec![reg]),
+    }
+}
+
+/// Build the `companion_finish` link-code IQ — phone-code pairing step 3, sent
+/// after the code-pair notification's ECDH dance succeeds.
+pub fn build_companion_finish_iq(
+    iq_id: &str,
+    jid: &str,
+    wrapped_key_bundle: &[u8],
+    our_identity_pub: &[u8; 32],
+    pairing_ref: &str,
+) -> crate::protocol::binary::Node {
+    use crate::protocol::binary::{Attrs, Content, Node};
+    let child = |tag: &str, bytes: Vec<u8>| Node {
+        tag: tag.into(),
+        attrs: Attrs::new(),
+        content: Content::Bytes(bytes),
+    };
+    let mut reg_attrs = Attrs::new();
+    reg_attrs.insert("jid".into(), jid.into());
+    reg_attrs.insert("stage".into(), "companion_finish".into());
+    let reg = Node {
+        tag: "link_code_companion_reg".into(),
+        attrs: reg_attrs,
+        content: Content::Nodes(vec![
+            child(
+                "link_code_pairing_wrapped_key_bundle",
+                wrapped_key_bundle.to_vec(),
+            ),
+            child("companion_identity_public", our_identity_pub.to_vec()),
+            child("link_code_pairing_ref", pairing_ref.as_bytes().to_vec()),
+        ]),
+    };
+    let mut iq_attrs = Attrs::new();
+    iq_attrs.insert("id".into(), iq_id.into());
+    iq_attrs.insert("type".into(), "set".into());
+    iq_attrs.insert("xmlns".into(), "md".into());
+    iq_attrs.insert("to".into(), "s.whatsapp.net".into());
+    Node {
+        tag: "iq".into(),
+        attrs: iq_attrs,
+        content: Content::Nodes(vec![reg]),
+    }
+}
+
+/// Extract `link_code_pairing_ref` from a `link_code_companion_reg` reply.
+fn extract_link_code_pairing_ref(reply: &crate::protocol::binary::Node) -> Option<String> {
+    use crate::protocol::binary::Content;
+    let Content::Nodes(top) = &reply.content else {
+        return None;
+    };
+    let reg = top.iter().find(|n| n.tag == "link_code_companion_reg")?;
+    let Content::Nodes(inner) = &reg.content else {
+        return None;
+    };
+    let ref_node = inner.iter().find(|n| n.tag == "link_code_pairing_ref")?;
+    match &ref_node.content {
+        Content::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    }
+}
+
 pub fn build_set_status_iq(iq_id: &str, text: &str) -> crate::protocol::binary::Node {
     use crate::protocol::binary::{Attrs, Content, Node};
     let mut iq_attrs = Attrs::new();
@@ -8004,12 +8501,22 @@ pub fn parse_usync_devices_response(
             Some(j) => j.clone(),
             None => continue,
         };
-        // The user element is `5511...@s.whatsapp.net`; extract phone
-        // local before splitting devices.
-        let local_phone = match user_jid.split('@').next() {
-            Some(p) => p.to_string(),
-            None => continue,
+        // Preserve the QUERIED addressing. A `@lid`-addressed usync returns the
+        // recipient's LID devices, which must stay LID — keyed `<lid>.1@lid`
+        // (agent-1 primary, matching `lid_pn_alternates` / the session-keying
+        // convention). The old code stitched every user-part onto
+        // `@s.whatsapp.net`, turning a LID into a bogus `<lid>.1@s.whatsapp.net`
+        // with no Signal session — the cause of LID-recipient send failures.
+        // PN users are unchanged.
+        let is_lid = user_jid.ends_with("@lid");
+        let local = if is_lid {
+            lid_user_part(&user_jid)
+        } else {
+            user_jid.split('@').next().unwrap_or("")
         };
+        if local.is_empty() {
+            continue;
+        }
         for devices in walk(&user, "devices") {
             // Server wraps the per-device list in a `<device-list>` element.
             // Older parsers expected `<devices><device/></devices>` directly;
@@ -8029,11 +8536,12 @@ pub fn parse_usync_devices_response(
                             Ok(n) => n,
                             Err(_) => continue,
                         };
-                        if device_id == 0 {
-                            result.push(format!("{local_phone}@s.whatsapp.net"));
-                        } else {
-                            result.push(format!("{local_phone}:{device_id}@s.whatsapp.net"));
-                        }
+                        result.push(match (is_lid, device_id) {
+                            (true, 0) => format!("{local}.1@lid"),
+                            (true, n) => format!("{local}.1:{n}@lid"),
+                            (false, 0) => format!("{local}@s.whatsapp.net"),
+                            (false, n) => format!("{local}:{n}@s.whatsapp.net"),
+                        });
                     }
                 }
             }
@@ -9249,6 +9757,7 @@ pub fn decode_authenticated_app_state_patch(
     session_id: &str,
     collection_name: &str,
     patch_bytes: &[u8],
+    missing_keys: &mut Vec<Vec<u8>>,
 ) -> Result<Vec<AppStateMutation>> {
     use aes::Aes256;
     use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
@@ -9307,7 +9816,10 @@ pub fn decode_authenticated_app_state_patch(
                     key_cache.insert(rec_key_id.clone(), k.clone());
                     k
                 }
-                None => continue,
+                None => {
+                    missing_keys.push(rec_key_id.clone());
+                    continue;
+                }
             },
         };
         let value_blob = record
@@ -9451,6 +9963,7 @@ fn decode_app_state_snapshot(
     store: &Store,
     session_id: &str,
     snapshot_bytes: &[u8],
+    missing_keys: &mut Vec<Vec<u8>>,
 ) -> Result<(u64, Vec<AppStateMutation>, [u8; 128])> {
     use aes::Aes256;
     use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
@@ -9502,6 +10015,7 @@ fn decode_app_state_snapshot(
                 }
                 None => {
                     n_no_key += 1;
+                    missing_keys.push(rec_key_id.clone());
                     continue;
                 }
             },
@@ -9608,8 +10122,10 @@ fn decode_app_state_snapshot(
 /// an un-synced state. Spawned off the recv loop (it does network I/O).
 async fn handle_app_state_sync_iq(
     store: Arc<Store>,
+    session: Arc<Session>,
     session_id: String,
     dispatcher: ConnDispatcher,
+    keys: DeviceKeys,
     sync: crate::protocol::binary::Node,
 ) {
     use crate::protocol::binary::Content;
@@ -9630,6 +10146,11 @@ async fn handle_app_state_sync_iq(
         }
     };
     let proxy: Option<String> = store.session_proxy(&session_id).ok().flatten();
+
+    // App-state key IDs referenced by snapshot/patch records we can't decrypt
+    // because the phone never shared that key. Collected across collections, then
+    // requested in one batch at the end.
+    let mut missing_keys: Vec<Vec<u8>> = Vec::new();
 
     for collection in collections.iter().filter(|c| c.tag == "collection") {
         let name = collection.attrs.get("name").cloned().unwrap_or_default();
@@ -9688,13 +10209,29 @@ async fn handle_app_state_sync_iq(
                             continue;
                         }
                     };
-                    match decode_app_state_snapshot(&store, &session_id, &snap_bytes) {
+                    let before = missing_keys.len();
+                    match decode_app_state_snapshot(&store, &session_id, &snap_bytes, &mut missing_keys) {
                         Ok((version, muts, hash)) => {
                             for m in &muts {
                                 let _ = apply_app_state_mutation(&store, &session_id, m);
                             }
-                            let _ =
-                                store.app_state_version_set(&session_id, &name, version, &hash);
+                            // Only advance the version when EVERY record decoded.
+                            // If some were skipped for want of a key, leave the
+                            // cursor at 0 so the post-loop key request + a later
+                            // re-fetch re-pull this snapshot and decode them
+                            // (e.g. contact names) once the keys arrive.
+                            let had_missing = missing_keys.len() > before;
+                            if had_missing {
+                                tracing::info!(
+                                    collection = %name,
+                                    missing_keys = missing_keys.len() - before,
+                                    "app-state snapshot partial (missing keys) — holding version for re-fetch"
+                                );
+                            } else {
+                                let _ = store.app_state_version_set(
+                                    &session_id, &name, version, &hash,
+                                );
+                            }
                             tracing::info!(
                                 collection = %name,
                                 version,
@@ -9717,7 +10254,7 @@ async fn handle_app_state_sync_iq(
                             Content::Bytes(b) => b,
                             _ => continue,
                         };
-                        match decode_authenticated_app_state_patch(&store, &session_id, &name, pb) {
+                        match decode_authenticated_app_state_patch(&store, &session_id, &name, pb, &mut missing_keys) {
                             Ok(muts) => {
                                 for m in &muts {
                                     let _ = apply_app_state_mutation(&store, &session_id, m);
@@ -9737,6 +10274,64 @@ async fn handle_app_state_sync_iq(
                 _ => {}
             }
         }
+    }
+
+    // Ask the phone to (re)share any app-state keys the records referenced but we
+    // don't hold — without them records (notably contact names in
+    // `critical_unblock_low`) decode-skip forever. Dedup so we don't re-request
+    // the same keys on every sync.
+    let to_request = session.take_unrequested_app_state_keys(missing_keys);
+    if !to_request.is_empty() {
+        request_app_state_keys(&dispatcher, &session, &store, &keys, to_request).await;
+    }
+}
+
+/// Ask the phone to (re)share the app-state sync keys for `missing` key IDs by
+/// sending an `APP_STATE_SYNC_KEY_REQUEST` protocol message to our own account.
+/// Mirrors whatsmeow's `requestAppStateKeys`. The phone replies with an
+/// `app_state_sync_key_share` (handled by the inbound path), which stores the
+/// keys; the next sync then decodes the previously key-skipped records.
+async fn request_app_state_keys(
+    dispatcher: &ConnDispatcher,
+    session: &Arc<Session>,
+    store: &Arc<Store>,
+    keys: &DeviceKeys,
+    missing: Vec<Vec<u8>>,
+) {
+    use crate::proto::wa_web_protobufs_e2e as e2e;
+    use prost::Message as _;
+
+    let Some(own_jid) = session.meta.read().jid.clone() else {
+        return;
+    };
+    let count = missing.len();
+    let key_ids: Vec<e2e::AppStateSyncKeyId> = missing
+        .into_iter()
+        .map(|id| e2e::AppStateSyncKeyId { key_id: Some(id) })
+        .collect();
+    let pm = e2e::ProtocolMessage {
+        r#type: Some(e2e::protocol_message::Type::AppStateSyncKeyRequest as i32),
+        app_state_sync_key_request: Some(e2e::AppStateSyncKeyRequest { key_i_ds: key_ids }),
+        ..Default::default()
+    };
+    let msg = e2e::Message {
+        protocol_message: Some(Box::new(pm)),
+        ..Default::default()
+    };
+    let inner = msg.encode_to_vec();
+    let msg_id = {
+        use rand::RngCore;
+        let mut buf = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut buf);
+        hex::encode_upper(buf)
+    };
+    let own_bare = format!("{}@s.whatsapp.net", jid_user(&own_jid));
+    let ts = chrono::Utc::now().timestamp();
+    match encrypt_inner_proto_and_ship(dispatcher, session, store, keys, &own_bare, &msg_id, &inner, ts)
+        .await
+    {
+        Ok(()) => tracing::info!(keys = count, "requested missing app-state sync keys from phone"),
+        Err(e) => tracing::warn!(error = %e, "failed to request app-state sync keys"),
     }
 }
 
@@ -12753,6 +13348,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_usync_devices_keeps_lid_recipients_on_lid() {
+        // A `@lid`-addressed usync reply must yield LID device addresses
+        // (`<lid>.1@lid`, `<lid>.1:N@lid`), NOT `<lid>.1@s.whatsapp.net` — the
+        // latter has no Signal session and was why LID-recipient sends failed.
+        use crate::protocol::binary::{Attrs, Content, Node};
+        fn child(tag: &str, attrs: Attrs, content: Content) -> Node {
+            Node { tag: tag.into(), attrs, content }
+        }
+        let mut d0 = Attrs::new();
+        d0.insert("id".into(), "0".into());
+        let mut d5 = Attrs::new();
+        d5.insert("id".into(), "5".into());
+        let devices = child(
+            "devices",
+            Attrs::new(),
+            Content::Nodes(vec![
+                child("device", d0, Content::None),
+                child("device", d5, Content::None),
+            ]),
+        );
+        let mut user_attrs = Attrs::new();
+        // Server echoes the queried LID (may carry the `.1` agent suffix).
+        user_attrs.insert("jid".into(), "64000000000001.1@lid".into());
+        let user = child("user", user_attrs, Content::Nodes(vec![devices]));
+        let list = child("list", Attrs::new(), Content::Nodes(vec![user]));
+        let usync = child("usync", Attrs::new(), Content::Nodes(vec![list]));
+        let reply = Node { tag: "iq".into(), attrs: Attrs::new(), content: Content::Nodes(vec![usync]) };
+
+        assert_eq!(
+            parse_usync_devices_response(&reply),
+            vec![
+                "64000000000001.1@lid".to_string(),
+                "64000000000001.1:5@lid".to_string(),
+            ],
+        );
+    }
+
+    #[test]
     fn build_prekey_fetch_iq_has_canonical_shape() {
         use crate::protocol::binary::Content;
 
@@ -13967,7 +14600,8 @@ mod tests {
         };
 
         let (version, muts, _hash) =
-            decode_app_state_snapshot(&mgr.store, &id, &snap.encode_to_vec()).unwrap();
+            decode_app_state_snapshot(&mgr.store, &id, &snap.encode_to_vec(), &mut Vec::new())
+                .unwrap();
         assert_eq!(version, 5);
         // BOTH decode — the old single-key code yielded only the key-A record.
         assert_eq!(muts.len(), 2, "both per-key records must decode");
@@ -15045,5 +15679,77 @@ mod tests {
         assert!(store_load_record(&store, &id, "64000000000001.1@lid")
             .unwrap()
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod pair_phone_tests {
+    use super::*;
+    use crate::protocol::binary::Content;
+
+    fn child<'a>(n: &'a crate::protocol::binary::Node, tag: &str) -> &'a crate::protocol::binary::Node {
+        match &n.content {
+            Content::Nodes(ns) => ns.iter().find(|c| c.tag == tag).expect("child present"),
+            _ => panic!("expected node children"),
+        }
+    }
+    fn bytes(n: &crate::protocol::binary::Node) -> &[u8] {
+        match &n.content {
+            Content::Bytes(b) => b,
+            _ => panic!("expected byte content"),
+        }
+    }
+
+    #[test]
+    fn companion_hello_iq_shape() {
+        let eph = [7u8; 80];
+        let noise = [9u8; 32];
+        let iq = build_companion_hello_iq("ID1", "15551234567@s.whatsapp.net", &eph, &noise, "Chrome (Linux)");
+        assert_eq!(iq.tag, "iq");
+        assert_eq!(iq.attrs.get("xmlns").map(String::as_str), Some("md"));
+        assert_eq!(iq.attrs.get("type").map(String::as_str), Some("set"));
+        assert_eq!(iq.attrs.get("to").map(String::as_str), Some("s.whatsapp.net"));
+        let reg = child(&iq, "link_code_companion_reg");
+        assert_eq!(reg.attrs.get("jid").map(String::as_str), Some("15551234567@s.whatsapp.net"));
+        assert_eq!(reg.attrs.get("stage").map(String::as_str), Some("companion_hello"));
+        assert_eq!(bytes(child(reg, "link_code_pairing_wrapped_companion_ephemeral_pub")).len(), 80);
+        assert_eq!(bytes(child(reg, "companion_server_auth_key_pub")).len(), 32);
+        assert_eq!(bytes(child(reg, "companion_platform_id")), b"1");
+        assert_eq!(bytes(child(reg, "companion_platform_display")), b"Chrome (Linux)");
+        assert_eq!(bytes(child(reg, "link_code_pairing_nonce")), &[0u8]);
+    }
+
+    #[test]
+    fn companion_finish_iq_shape() {
+        let bundle = vec![1u8; 140];
+        let id_pub = [3u8; 32];
+        let iq = build_companion_finish_iq("ID2", "15551234567@s.whatsapp.net", &bundle, &id_pub, "REF123");
+        let reg = child(&iq, "link_code_companion_reg");
+        assert_eq!(reg.attrs.get("stage").map(String::as_str), Some("companion_finish"));
+        assert_eq!(bytes(child(reg, "link_code_pairing_wrapped_key_bundle")).len(), 140);
+        assert_eq!(bytes(child(reg, "companion_identity_public")).len(), 32);
+        assert_eq!(bytes(child(reg, "link_code_pairing_ref")), b"REF123");
+    }
+
+    #[test]
+    fn extract_pairing_ref_from_reply() {
+        use crate::protocol::binary::{Attrs, Node};
+        let reply = Node {
+            tag: "iq".into(),
+            attrs: Attrs::new(),
+            content: Content::Nodes(vec![Node {
+                tag: "link_code_companion_reg".into(),
+                attrs: Attrs::new(),
+                content: Content::Nodes(vec![Node {
+                    tag: "link_code_pairing_ref".into(),
+                    attrs: Attrs::new(),
+                    content: Content::Bytes(b"abc-ref".to_vec()),
+                }]),
+            }]),
+        };
+        assert_eq!(extract_link_code_pairing_ref(&reply).as_deref(), Some("abc-ref"));
+        // A reply without the nested ref yields None.
+        let empty = Node { tag: "iq".into(), attrs: Attrs::new(), content: Content::None };
+        assert_eq!(extract_link_code_pairing_ref(&empty), None);
     }
 }

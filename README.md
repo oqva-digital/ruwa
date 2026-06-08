@@ -28,7 +28,7 @@ WhatsApp accounts at once.
 | Multi-tenant | **built-in** — N accounts, per-tenant API keys | yes | do-it-yourself |
 | Dependencies | **in-house** crypto + protocol + Redis/S3 clients | Baileys + full Node stack | Go / TS library |
 | Interface | REST + SSE + webhooks + Redis | REST + webhooks | library calls |
-| **Agent tools (MCP)** | **built-in — 38 tools** | none | none |
+| **Agent tools (MCP)** | **built-in — 39 tools** | none | none |
 | Store | **SQLite or Postgres** | Postgres + Redis | your choice |
 
 **What's different:** ruwa is the lightest WhatsApp server we know of and the fastest
@@ -83,7 +83,7 @@ caveats.
 - **Messaging** — text with **@mentions** and **reply/quote**, media
   (image/video/audio/ptt/document/sticker), **location**, **contact (vCard)**,
   **poll**, **calendar event**, reactions, edit, revoke.
-- **Multi-tenant sessions** — pair via QR, many accounts per instance, **per-tenant
+- **Multi-tenant sessions** — pair via QR or phone code, many accounts per instance, **per-tenant
   API keys**, **per-session proxy**, graceful shutdown.
 - **Event egress** — live **SSE** stream, **webhooks** (HMAC-signed, retried,
   event-filtered), and **Redis** queues (RPUSH / PUBLISH) — pick one or all.
@@ -99,7 +99,7 @@ caveats.
 - **Ops** — `/health`, Prometheus `/metrics`, and a built-in dashboard (ruwa Console)
   served at `GET /`.
 - **Agent-ready (MCP)** — a first-party **Model Context Protocol** server (`mcp/`)
-  exposing 38 tools so any MCP client (Claude, etc.) can create instances, pair them,
+  exposing 39 tools so any MCP client (Claude, etc.) can create instances, pair them,
   send every message type, manage chats, and **search history by meaning** — no other
   WhatsApp stack ships this.
 
@@ -109,8 +109,9 @@ ruwa ships a first-party **Model Context Protocol** server (`mcp/ruwa-mcp`) so a
 agent can drive WhatsApp directly — no REST glue. As far as we know, no other WhatsApp
 stack (Evolution, whatsmeow, Baileys) offers this out of the box.
 
-**38 tools** cover the full lifecycle — _create an instance → pair it (QR) → hold a
-conversation → wire up webhooks_: `create_session`, `get_qr`, `connect_session`,
+**39 tools** cover the full lifecycle — _create an instance → pair it (QR or phone
+code) → hold a conversation → wire up webhooks_: `create_session`, `get_qr`,
+`pair_phone`, `connect_session`,
 `send_text` (with @mentions / quote), `send_media` / `location` / `poll` / `reaction`,
 `edit_message` / `revoke_message`, `mark_read`, `set_typing`, `set_presence`,
 `list_chats` / `list_messages` / `list_contacts`, `search_conversations` (semantic),

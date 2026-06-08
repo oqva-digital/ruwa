@@ -58,6 +58,7 @@ DELETE /v1/sessions/:id
 
 POST /v1/sessions/:id/connect         (initiates pairing if unpaired, else reconnects)
 GET  /v1/sessions/:id/qr              -> {"code":"...", "image_png_base64":"..."}
+POST /v1/sessions/:id/pair-phone      {"phone":"15551234567"} -> {"code":"ABCD-1234"}  (Link with phone number; alternative to QR)
 POST /v1/sessions/:id/logout
 
 POST /v1/sessions/:id/messages        {"to":"5511...","text":"hi", "reply_to": "..."}

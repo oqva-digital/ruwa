@@ -136,6 +136,7 @@ store_delegate! {
     consolidate_lid_chats(session_id: &str) -> rusqlite::Result<usize>;
     create_session(s: &NewSession, prekeys: &[(u32, &[u8], &[u8])]) -> rusqlite::Result<()>;
     device_keys_load(id: &str) -> rusqlite::Result<Option<DeviceKeyRow>>;
+    device_keys_set_adv_secret(id: &str, adv_secret: &[u8]) -> rusqlite::Result<()>;
     sessions_all() -> rusqlite::Result<Vec<SessionRow>>;
     session_delete(id: &str) -> rusqlite::Result<()>;
     session_api_key(id: &str) -> rusqlite::Result<Option<String>>;
@@ -912,6 +913,21 @@ impl SqliteStore {
             }
             None => Ok(None),
         }
+    }
+
+    /// Overwrite a session's `adv_secret_key` (sealed). Phone-code pairing
+    /// *derives* the adv secret during the link-code handshake (rather than
+    /// using the random one minted at session creation), so it must replace the
+    /// stored value before `<pair-success>` HMAC-verifies against it.
+    pub fn device_keys_set_adv_secret(&self, id: &str, adv_secret: &[u8]) -> rusqlite::Result<()> {
+        let sealed = vault::seal(adv_secret);
+        self.with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE sessions SET adv_secret_key = ?, updated_at = ? WHERE id = ?",
+                rusqlite::params![sealed, chrono::Utc::now().timestamp(), id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Every session's restore-time metadata (status as the raw stored string;
@@ -2852,6 +2868,17 @@ impl PgStore {
                 adv_secret: unseal(r.get::<_, Vec<u8>>(9))?,
             })),
         }
+    }
+
+    pub fn device_keys_set_adv_secret(&self, id: &str, adv_secret: &[u8]) -> rusqlite::Result<()> {
+        let sealed = vault::seal(adv_secret);
+        self.conn()?
+            .execute(
+                "UPDATE sessions SET adv_secret_key=$1, updated_at=$2 WHERE id=$3",
+                &[&sealed, &chrono::Utc::now().timestamp(), &id],
+            )
+            .map_err(pg_err)?;
+        Ok(())
     }
 
     pub fn sessions_all(&self) -> rusqlite::Result<Vec<SessionRow>> {
