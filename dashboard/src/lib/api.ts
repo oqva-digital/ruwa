@@ -136,6 +136,13 @@ export const api = {
     req<unknown>("POST", `/v1/sessions/${id}/proxy`, { proxy }),
   getQr: (id: string) =>
     req<{ qr: string; svg_base64: string }>("GET", `/v1/sessions/${id}/qr`),
+  /** Request an 8-char phone-number pairing code ("Link with phone number"),
+   *  the alternative to scanning a QR. Session must be connected first. */
+  pairPhone: (id: string, phone: string, clientDisplayName?: string) =>
+    req<{ code: string }>("POST", `/v1/sessions/${id}/pair-phone`, {
+      phone,
+      client_display_name: clientDisplayName || null,
+    }),
   /** Persisted event history (durable backing for the live SSE feed), oldest-first. */
   eventHistory: (id: string, opts?: { before?: number; limit?: number; type?: string }) => {
     const p = new URLSearchParams()

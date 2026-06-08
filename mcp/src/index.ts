@@ -51,7 +51,7 @@ const server = new McpServer({ name: "ruwa", version: "0.2.0" })
 
 server.tool(
   "create_session",
-  "Create a new WhatsApp session (instance). Returns its id; then call get_qr to pair it by scanning the QR in WhatsApp → Linked devices.",
+  "Create a new WhatsApp session (instance). Returns its id; then pair it either with get_qr (scan a QR) or pair_phone (enter an 8-char code) in WhatsApp → Linked devices.",
   {
     label: z.string().optional().describe("human-friendly label for the instance"),
     proxy: z.string().optional().describe("optional egress proxy URL (socks5/socks5h/http)"),
@@ -71,6 +71,25 @@ server.tool(
       return ok({
         qr: r?.qr ?? r,
         note: "Render this string as a QR code; the user scans it once to pair. Then poll session_health until connected=true.",
+      })
+    } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
+  "pair_phone",
+  "Pair a session by phone number ('Link with phone number') instead of scanning a QR. Returns an 8-char code (XXXX-XXXX) the user types in WhatsApp → Linked devices → Link a device → 'Link with phone number instead'. The session must be connected first (call connect_session, then wait ~2s). The code is valid for a couple of minutes; then poll session_health until connected=true.",
+  {
+    session_id: z.string(),
+    phone: z.string().describe("international phone number, digits only (e.g. 15551234567) — no leading 0"),
+    client_display_name: z.string().optional().describe("display name shown on the phone, formatted 'Browser (OS)'; defaults to 'Chrome (Linux)'"),
+  },
+  async ({ session_id, phone, client_display_name }) => {
+    try {
+      const r = (await call("POST", `/v1/sessions/${enc(session_id)}/pair-phone`, { phone, client_display_name })) as { code?: string }
+      return ok({
+        code: r?.code ?? r,
+        note: "Give this code to the user to enter in WhatsApp → Linked devices → Link a device → 'Link with phone number instead'. Then poll session_health until connected=true.",
       })
     } catch (e) { return err(e) }
   },

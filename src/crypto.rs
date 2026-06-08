@@ -2533,3 +2533,324 @@ pub mod hkdf {
         }
     }
 }
+
+pub mod linking {
+    //! Phone-number ("Link with phone number") pairing crypto.
+    //!
+    //! WhatsApp's alternative to QR pairing: instead of the primary phone
+    //! scanning a QR, the companion generates an 8-char code the user types
+    //! into their phone. The code keys a PBKDF2/AES-CTR wrap of each side's
+    //! ephemeral Curve25519 public key; an ECDH over those plus the identity
+    //! keys derives the same `adv_secret` that the regular `<pair-success>`
+    //! flow consumes — so once the dance finishes, pairing completes exactly
+    //! as it does for QR.
+    //!
+    //! whatsmeow reference: pair-code.go (`generateCompanionEphemeralKey`,
+    //! `PairPhone`, `handleCodePairNotification`).
+
+    use super::hkdf;
+    use super::identity::KeyPair;
+    use aes::Aes256;
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use ctr::cipher::{KeyIvInit, StreamCipher};
+    use hmac::{Hmac, Mac};
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    use sha2::Sha256;
+
+    /// WhatsApp's custom base32 alphabet for linking codes (Crockford-ish:
+    /// digits `1-9` then `A-Z` minus the ambiguous `I`/`O`/`0`/`U`).
+    const LINKING_ALPHABET: &[u8; 32] = b"123456789ABCDEFGHJKLMNPQRSTVWXYZ";
+
+    /// PBKDF2 iteration count whatsmeow uses for the linking-code KDF (`2 << 16`).
+    const LINK_PBKDF2_ITERS: u32 = 2 << 16;
+
+    /// AES-256 in CTR mode with a 128-bit big-endian counter — matches Go's
+    /// `cipher.NewCTR`, which seeds the counter with the full IV and increments
+    /// the whole 128-bit block big-endian.
+    type Aes256Ctr = ctr::Ctr128BE<Aes256>;
+
+    /// Result of [`generate_companion_ephemeral_key`]: our ephemeral keypair,
+    /// the 80-byte wrapped ephemeral public to send to the server, and the
+    /// human-facing linking code (still un-hyphenated, 8 chars).
+    pub struct CompanionEphemeral {
+        pub keypair: KeyPair,
+        /// `salt(32) || iv(16) || aes-ctr(ephemeral_pub)(32)`.
+        pub ephemeral_key: [u8; 80],
+        /// 8-char base32 code; the user types it as `XXXX-XXXX`.
+        pub linking_code: String,
+    }
+
+    /// Output of the companion side of the code-pair notification: the wrapped
+    /// key bundle to send back, and the derived adv secret to persist (it
+    /// authenticates the subsequent `<pair-success>`).
+    pub struct CodePairResult {
+        /// `keyBundleSalt(32) || keyBundleNonce(12) || aes-gcm(key bundle)`.
+        pub wrapped_key_bundle: Vec<u8>,
+        pub adv_secret: [u8; 32],
+    }
+
+    /// Encode bytes with WhatsApp's linking base32 alphabet, MSB-first, no
+    /// padding. A 5-byte input yields exactly 8 chars (the linking-code case).
+    pub fn base32_encode(data: &[u8]) -> String {
+        let mut out = String::with_capacity(data.len().div_ceil(5) * 8);
+        let mut acc: u64 = 0;
+        let mut bits: u32 = 0;
+        for &b in data {
+            acc = (acc << 8) | b as u64;
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                let idx = ((acc >> bits) & 0x1f) as usize;
+                out.push(LINKING_ALPHABET[idx] as char);
+                acc &= (1u64 << bits) - 1;
+            }
+        }
+        if bits > 0 {
+            let idx = ((acc << (5 - bits)) & 0x1f) as usize;
+            out.push(LINKING_ALPHABET[idx] as char);
+        }
+        out
+    }
+
+    /// PBKDF2-HMAC-SHA256 (RFC 2898). Hand-rolled on the `hmac` crate ruwa
+    /// already depends on, to avoid pulling in the `pbkdf2` crate.
+    pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iters: u32, dk_len: usize) -> Vec<u8> {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut out = Vec::with_capacity(dk_len);
+        let n_blocks = dk_len.div_ceil(32) as u32;
+        for block in 1..=n_blocks {
+            // U_1 = PRF(password, salt || INT_BE32(block))
+            let mut mac =
+                <HmacSha256 as Mac>::new_from_slice(password).expect("hmac key any length");
+            mac.update(salt);
+            mac.update(&block.to_be_bytes());
+            let mut u = mac.finalize().into_bytes();
+            let mut t = u;
+            for _ in 1..iters {
+                let mut mac =
+                <HmacSha256 as Mac>::new_from_slice(password).expect("hmac key any length");
+                mac.update(&u);
+                u = mac.finalize().into_bytes();
+                for (ti, ui) in t.iter_mut().zip(u.iter()) {
+                    *ti ^= *ui;
+                }
+            }
+            out.extend_from_slice(&t);
+        }
+        out.truncate(dk_len);
+        out
+    }
+
+    /// Derive the AES-CTR key for a wrapped ephemeral pubkey from the linking
+    /// code and the wrap's salt.
+    fn link_code_key(linking_code: &str, salt: &[u8]) -> [u8; 32] {
+        let dk = pbkdf2_sha256(linking_code.as_bytes(), salt, LINK_PBKDF2_ITERS, 32);
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&dk);
+        k
+    }
+
+    /// Wrap a 32-byte ephemeral public key under `linking_code` with a fresh
+    /// random salt+iv: returns `salt(32) || iv(16) || ciphertext(32)`.
+    fn wrap_ephemeral_pub(linking_code: &str, pubkey: &[u8; 32]) -> [u8; 80] {
+        let mut salt = [0u8; 32];
+        let mut iv = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        OsRng.fill_bytes(&mut iv);
+        let key = link_code_key(linking_code, &salt);
+        let mut buf = *pubkey;
+        Aes256Ctr::new((&key).into(), (&iv).into()).apply_keystream(&mut buf);
+        let mut out = [0u8; 80];
+        out[0..32].copy_from_slice(&salt);
+        out[32..48].copy_from_slice(&iv);
+        out[48..80].copy_from_slice(&buf);
+        out
+    }
+
+    /// Unwrap an 80-byte wrapped ephemeral public key using `linking_code`.
+    fn unwrap_ephemeral_pub(linking_code: &str, wrapped: &[u8]) -> Result<[u8; 32], &'static str> {
+        if wrapped.len() < 80 {
+            return Err("wrapped ephemeral pub too short");
+        }
+        let salt = &wrapped[0..32];
+        let iv = &wrapped[32..48];
+        let key = link_code_key(linking_code, salt);
+        let mut buf = [0u8; 32];
+        buf.copy_from_slice(&wrapped[48..80]);
+        let iv_arr: [u8; 16] = iv.try_into().expect("iv slice is 16 bytes");
+        Aes256Ctr::new((&key).into(), (&iv_arr).into()).apply_keystream(&mut buf);
+        Ok(buf)
+    }
+
+    /// Companion side, step 1: generate the ephemeral keypair + linking code and
+    /// the 80-byte wrapped ephemeral pub to put in the `companion_hello` IQ.
+    pub fn generate_companion_ephemeral_key() -> CompanionEphemeral {
+        let keypair = KeyPair::generate();
+        let mut code_bytes = [0u8; 5];
+        OsRng.fill_bytes(&mut code_bytes);
+        let linking_code = base32_encode(&code_bytes);
+        let ephemeral_key = wrap_ephemeral_pub(&linking_code, &keypair.public);
+        CompanionEphemeral {
+            keypair,
+            ephemeral_key,
+            linking_code,
+        }
+    }
+
+    /// Companion side, step 2: handle the code-pair notification. Decrypts the
+    /// primary's wrapped ephemeral pub, derives the shared secrets, builds the
+    /// encrypted key bundle for the `companion_finish` IQ, and returns the
+    /// `adv_secret` to persist. Mirrors `handleCodePairNotification`.
+    pub fn complete_code_pair(
+        linking_code: &str,
+        our_eph_priv: &[u8; 32],
+        our_identity: &KeyPair,
+        wrapped_primary_eph_pub: &[u8],
+        primary_identity_pub: &[u8],
+    ) -> Result<CodePairResult, &'static str> {
+        if primary_identity_pub.len() != 32 {
+            return Err("primary identity pub must be 32 bytes");
+        }
+        let primary_eph_pub = unwrap_ephemeral_pub(linking_code, wrapped_primary_eph_pub)?;
+
+        let mut adv_secret_random = [0u8; 32];
+        let mut key_bundle_salt = [0u8; 32];
+        let mut key_bundle_nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut adv_secret_random);
+        OsRng.fill_bytes(&mut key_bundle_salt);
+        OsRng.fill_bytes(&mut key_bundle_nonce);
+
+        let ephemeral_shared = x25519_dalek::x25519(*our_eph_priv, primary_eph_pub);
+
+        // Encrypt the key bundle: our identity pub || primary identity pub || adv randomness.
+        let bundle_key = hkdf::expand_with_salt(
+            Some(&key_bundle_salt),
+            &ephemeral_shared,
+            b"link_code_pairing_key_bundle_encryption_key",
+            32,
+        );
+        let mut plaintext = Vec::with_capacity(96);
+        plaintext.extend_from_slice(&our_identity.public);
+        plaintext.extend_from_slice(primary_identity_pub);
+        plaintext.extend_from_slice(&adv_secret_random);
+        let cipher = Aes256Gcm::new_from_slice(&bundle_key).expect("32-byte key");
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&key_bundle_nonce), plaintext.as_ref())
+            .map_err(|_| "key bundle encrypt failed")?;
+        let mut wrapped_key_bundle = Vec::with_capacity(32 + 12 + ct.len());
+        wrapped_key_bundle.extend_from_slice(&key_bundle_salt);
+        wrapped_key_bundle.extend_from_slice(&key_bundle_nonce);
+        wrapped_key_bundle.extend_from_slice(&ct);
+
+        // adv_secret = HKDF(ephemeral_shared || identity_shared || adv_random, "adv_secret").
+        let mut primary_id = [0u8; 32];
+        primary_id.copy_from_slice(primary_identity_pub);
+        let identity_shared = x25519_dalek::x25519(our_identity.private, primary_id);
+        let mut adv_input = Vec::with_capacity(96);
+        adv_input.extend_from_slice(&ephemeral_shared);
+        adv_input.extend_from_slice(&identity_shared);
+        adv_input.extend_from_slice(&adv_secret_random);
+        let adv = hkdf::expand_with_salt(None, &adv_input, b"adv_secret", 32);
+        let mut adv_secret = [0u8; 32];
+        adv_secret.copy_from_slice(&adv);
+
+        Ok(CodePairResult {
+            wrapped_key_bundle,
+            adv_secret,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn base32_known_vector() {
+            // All-zero 5 bytes -> 8x the first alphabet char ('1').
+            assert_eq!(base32_encode(&[0u8; 5]), "11111111");
+            // 0xFF * 5 = 40 one-bits -> 8x the last char ('Z').
+            assert_eq!(base32_encode(&[0xFFu8; 5]), "ZZZZZZZZ");
+            // A 5-byte input always yields exactly 8 chars.
+            assert_eq!(base32_encode(&[0x12, 0x34, 0x56, 0x78, 0x9a]).len(), 8);
+        }
+
+        #[test]
+        fn pbkdf2_rfc_vector() {
+            // Well-known PBKDF2-HMAC-SHA256 vector: P="password", S="salt",
+            // c=1, dkLen=32.
+            let dk = pbkdf2_sha256(b"password", b"salt", 1, 32);
+            assert_eq!(
+                hex::encode(dk),
+                "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+            );
+            // c=2.
+            let dk2 = pbkdf2_sha256(b"password", b"salt", 2, 32);
+            assert_eq!(
+                hex::encode(dk2),
+                "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+            );
+        }
+
+        #[test]
+        fn ephemeral_wrap_roundtrips() {
+            let kp = KeyPair::generate();
+            let wrapped = wrap_ephemeral_pub("ABCD1234", &kp.public);
+            let got = unwrap_ephemeral_pub("ABCD1234", &wrapped).unwrap();
+            assert_eq!(got, kp.public);
+            // Wrong code yields different (garbage) plaintext.
+            let bad = unwrap_ephemeral_pub("ZZZZ9999", &wrapped).unwrap();
+            assert_ne!(bad, kp.public);
+        }
+
+        #[test]
+        fn companion_key_shapes() {
+            let c = generate_companion_ephemeral_key();
+            assert_eq!(c.linking_code.len(), 8);
+            assert!(c.linking_code.bytes().all(|b| LINKING_ALPHABET.contains(&b)));
+            // The wrapped pub round-trips back to the keypair's public.
+            let unwrapped = unwrap_ephemeral_pub(&c.linking_code, &c.ephemeral_key).unwrap();
+            assert_eq!(unwrapped, c.keypair.public);
+        }
+
+        // Full two-sided round trip: simulate the primary device and confirm
+        // both sides derive the SAME ephemeral shared secret, which is what the
+        // adv_secret (and thus pair-success) ultimately depends on.
+        #[test]
+        fn code_pair_derives_matching_ephemeral_secret() {
+            // Companion generates its ephemeral + code.
+            let companion = generate_companion_ephemeral_key();
+            let code = companion.linking_code.clone();
+
+            // Primary makes its own ephemeral keypair and identity key, and
+            // wraps its ephemeral pub under the same code (as the phone would).
+            let primary_eph = KeyPair::generate();
+            let primary_identity = KeyPair::generate();
+            let wrapped_primary = wrap_ephemeral_pub(&code, &primary_eph.public);
+
+            let our_identity = KeyPair::generate();
+            let result = complete_code_pair(
+                &code,
+                &companion.keypair.private,
+                &our_identity,
+                &wrapped_primary,
+                &primary_identity.public,
+            )
+            .unwrap();
+
+            // Companion's view of the ephemeral shared secret:
+            let companion_shared =
+                x25519_dalek::x25519(companion.keypair.private, primary_eph.public);
+            // Primary's view (it would unwrap the companion's pub from the
+            // companion_hello IQ; here we use it directly):
+            let primary_shared =
+                x25519_dalek::x25519(primary_eph.private, companion.keypair.public);
+            assert_eq!(companion_shared, primary_shared);
+
+            // Sanity: the wrapped key bundle is salt(32)+nonce(12)+GCM(96+16).
+            assert_eq!(result.wrapped_key_bundle.len(), 32 + 12 + 96 + 16);
+            assert_eq!(result.adv_secret.len(), 32);
+        }
+    }
+}

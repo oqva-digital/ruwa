@@ -100,6 +100,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id", get(get_session).delete(delete_session))
         .route("/sessions/:id/health", get(session_health))
         .route("/sessions/:id/qr", get(get_qr))
+        .route("/sessions/:id/pair-phone", post(pair_phone_session))
         .route("/sessions/:id/connect", post(connect_session))
         .route("/sessions/:id/logout", post(logout_session))
         .route("/sessions/:id/proxy", post(set_session_proxy))
@@ -595,6 +596,42 @@ fn render_qr_svg(data: &str) -> String {
         .min_dimensions(256, 256)
         .quiet_zone(true)
         .build()
+}
+
+/// Body for `POST /sessions/:id/pair-phone`.
+#[derive(Deserialize)]
+struct PairPhoneReq {
+    /// International phone number, digits only (e.g. `15551234567`). A leading
+    /// `+` or punctuation is tolerated — non-digits are stripped server-side.
+    phone: String,
+    /// Display name shown on the phone, formatted `Browser (OS)`. WhatsApp
+    /// validates it and 400s on an unrecognized value; defaults to
+    /// `Chrome (Linux)`.
+    #[serde(default)]
+    client_display_name: Option<String>,
+}
+
+/// Request an 8-char phone-number pairing code ("Link with phone number"), the
+/// alternative to scanning a QR. The session must already be `connect`ed (the
+/// Noise socket has to be up), and the code should be entered promptly — the
+/// login socket closes after ~160 s.
+async fn pair_phone_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<PairPhoneReq>,
+) -> Result<Json<serde_json::Value>> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    let keys = state.manager.load_device_keys(&id)?;
+    let display = req
+        .client_display_name
+        .as_deref()
+        .unwrap_or("Chrome (Linux)");
+    let code = session
+        .pair_phone(&keys.noise.public, &req.phone, display)
+        .await?;
+    Ok(Json(json!({ "code": code })))
 }
 
 async fn connect_session(
