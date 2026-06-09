@@ -996,8 +996,14 @@ impl Session {
         );
         let reply = self.iq_request(iq).await?;
         if iq_is_error(&reply) {
+            // Surface the SERVER's actual rejection, not a guess. WhatsApp
+            // commonly returns 400/`bad-request` when `companion_platform_display`
+            // isn't `Browser (OS)` (e.g. "Chrome (Linux)"), 429 when link-code
+            // pairing is rate-limited, or 405/`not-authorized` for policy blocks.
+            let detail = iq_error_detail(&reply);
+            tracing::warn!(phone = %digits, %detail, "link-code companion_hello rejected");
             return Err(Error::Internal(anyhow::anyhow!(
-                "server rejected link-code registration (display name must be 'Browser (OS)')"
+                "server rejected link-code registration: {detail}"
             )));
         }
         let pairing_ref = extract_link_code_pairing_ref(&reply).ok_or_else(|| {
@@ -8661,6 +8667,37 @@ pub fn build_block_iq(
     }
 }
 
+/// Human-readable detail from an IQ `<error>` child: its `code`/`text` attrs
+/// plus the first nested element tag (e.g. `not-authorized`, `bad-request`),
+/// so callers surface WHAT the server actually rejected instead of guessing.
+/// Returns `"unspecified error"` when no `<error>` is present.
+pub fn iq_error_detail(iq: &crate::protocol::binary::Node) -> String {
+    use crate::protocol::binary::Content;
+    let Content::Nodes(ns) = &iq.content else {
+        return "unspecified error".to_string();
+    };
+    let Some(err) = ns.iter().find(|n| n.tag == "error") else {
+        return "unspecified error".to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(code) = err.attrs.get("code") {
+        parts.push(format!("code={code}"));
+    }
+    if let Some(text) = err.attrs.get("text").filter(|t| !t.is_empty()) {
+        parts.push(format!("text={text:?}"));
+    }
+    if let Content::Nodes(children) = &err.content {
+        if let Some(first) = children.first() {
+            parts.push(first.tag.clone());
+        }
+    }
+    if parts.is_empty() {
+        "unspecified error".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
 /// Whether an IQ reply is a server error (`type="error"` or an `<error>` child).
 pub fn iq_is_error(iq: &crate::protocol::binary::Node) -> bool {
     if iq.attrs.get("type").map(String::as_str) == Some("error") {
@@ -12159,6 +12196,37 @@ mod tests {
             content: Content::None,
         };
         assert!(!iq_is_error(&ok));
+    }
+
+    #[test]
+    fn iq_error_detail_extracts_code_text_and_child() {
+        use crate::protocol::binary::{Attrs, Content, Node};
+
+        // <iq><error code="400" text="..."><bad-request/></error></iq>
+        let mut ea = Attrs::new();
+        ea.insert("code".into(), "400".into());
+        ea.insert("text".into(), "invalid companion display".into());
+        let iq = Node {
+            tag: "iq".into(),
+            attrs: Attrs::new(),
+            content: Content::Nodes(vec![Node {
+                tag: "error".into(),
+                attrs: ea,
+                content: Content::Nodes(vec![Node {
+                    tag: "bad-request".into(),
+                    attrs: Attrs::new(),
+                    content: Content::None,
+                }]),
+            }]),
+        };
+        let detail = iq_error_detail(&iq);
+        assert!(detail.contains("code=400"), "got: {detail}");
+        assert!(detail.contains("invalid companion display"), "got: {detail}");
+        assert!(detail.contains("bad-request"), "got: {detail}");
+
+        // No <error> child → a stable fallback, never a panic.
+        let clean = Node { tag: "iq".into(), attrs: Attrs::new(), content: Content::None };
+        assert_eq!(iq_error_detail(&clean), "unspecified error");
     }
 
     #[test]
