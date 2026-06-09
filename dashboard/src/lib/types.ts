@@ -42,6 +42,13 @@ export interface SessionHealth {
   proxy_configured: boolean
 }
 
+/** The message a reply is quoting. Present only on reply messages. */
+export interface QuotedRef {
+  stanza_id: string | null
+  participant: string | null
+  text: string | null
+}
+
 export interface MessageRow {
   message_id: string
   chat_jid: string
@@ -49,6 +56,7 @@ export interface MessageRow {
   from_me: boolean
   msg_type: string
   body_text: string | null
+  quoted?: QuotedRef | null
   timestamp: number
   [k: string]: unknown
 }
