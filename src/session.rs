@@ -767,6 +767,10 @@ pub struct Session {
     /// missing-key sweep doesn't re-request the same ones on every sync. In-
     /// memory; resets on restart (matching whatsmeow's throttle intent).
     requested_app_state_keys: PlMutex<HashSet<Vec<u8>>>,
+    /// Group JIDs we've already kicked a lazy name/subject fetch for this process,
+    /// so a burst of messages in a nameless group fires one metadata query, not N.
+    /// In-memory; resets on restart (a re-fetch then just refreshes the name).
+    group_name_fetched: PlMutex<HashSet<String>>,
 }
 
 /// One entry in [`Session::recent_sends`] — enough to rebuild and resend a
@@ -841,7 +845,14 @@ impl Session {
             recent_sends: PlMutex::new(VecDeque::new()),
             phone_linking: RwLock::new(None),
             requested_app_state_keys: PlMutex::new(HashSet::new()),
+            group_name_fetched: PlMutex::new(HashSet::new()),
         }
+    }
+
+    /// Returns true the FIRST time `group_jid` is seen this process — the caller
+    /// then kicks a one-shot group-info fetch to learn its name. False after that.
+    fn group_name_fetch_once(&self, group_jid: &str) -> bool {
+        self.group_name_fetched.lock().insert(group_jid.to_string())
     }
 
     /// Filter `ids` to the app-state key IDs we haven't requested before,
@@ -3946,8 +3957,47 @@ async fn fetch_group_participants(
     // to that LID resolves to a deliverable PN. Mirrors whatsmeow group.go.
     capture_group_participant_lids(store, session_id, &reply);
     let participants = parse_group_info_response(&reply);
-    tracing::info!(group = %group_jid, count = participants.len(), "resolved group participants");
+    // Capture the group's NAME (and creator) from the same reply so the dashboard
+    // reflects it. Without this a group joined after the initial history-sync stays
+    // nameless: nothing else parses the `<group subject>` attr. Set the chat name
+    // (what `chats_list` / the dashboard read) AND the groups table.
+    let (subject, creator, creation_ts) = parse_group_meta(&reply);
+    if let Some(subj) = subject.as_deref() {
+        let _ = store.chat_set_name(session_id, group_jid, Some(subj), true, None);
+    }
+    if subject.is_some() || creator.is_some() {
+        let pg: Vec<(&str, bool, bool)> =
+            participants.iter().map(|p| (p.as_str(), false, false)).collect();
+        let _ = store.group_persist(
+            session_id,
+            group_jid,
+            subject.as_deref(),
+            creator.as_deref(),
+            creation_ts,
+            &pg,
+        );
+    }
+    tracing::info!(group = %group_jid, subject = ?subject, count = participants.len(), "resolved group info");
     Ok(participants)
+}
+
+/// Extract a group's subject, creator, and creation time from a `w:g2`
+/// group-info reply (`<iq><group subject="…" creator="…" creation="…">…`).
+fn parse_group_meta(
+    reply: &crate::protocol::binary::Node,
+) -> (Option<String>, Option<String>, Option<i64>) {
+    use crate::protocol::binary::{Content, Node};
+    let group = match &reply.content {
+        Content::Nodes(ns) => ns.iter().find(|n: &&Node| n.tag == "group"),
+        _ => None,
+    };
+    let Some(g) = group else {
+        return (None, None, None);
+    };
+    let subject = g.attrs.get("subject").cloned().filter(|s| !s.is_empty());
+    let creator = g.attrs.get("creator").cloned().filter(|s| !s.is_empty());
+    let creation_ts = g.attrs.get("creation").and_then(|s| s.parse::<i64>().ok());
+    (subject, creator, creation_ts)
 }
 
 /// Persist LID<->PN for each participant of a group-info reply, from the
@@ -6067,6 +6117,12 @@ fn process_inbound_message(
     let device_sent_dest: Option<String> =
         plain.as_ref().and_then(|p| device_sent_destination(p));
 
+    // Peek the proto for a reply quote (`contextInfo`) before `classify_e2e_message`
+    // discards it, so the stored message carries what it was replying to. Same
+    // cheap re-decode pattern as `device_sent_dest` above.
+    let quoted_ctx: Option<QuotedContext> =
+        plain.as_ref().and_then(|p| quoted_context_from_e2e(p));
+
     // Decide msg_type + body_text + payload from the decoded InboundContent.
     let (msg_type, body_text, mut payload) = match plain {
         None => (
@@ -6266,6 +6322,41 @@ fn process_inbound_message(
     let chat_canon = canonical_user_jid(store, &session_id, chat_raw);
     let sender_canon = canonical_user_jid(store, &session_id, &sender_raw);
 
+    // Lazily learn a group's name. Groups joined after the initial history-sync
+    // have no name until something fetches their metadata; do it on the first
+    // message we see from each group this process (deduped), in the background so
+    // the recv path isn't blocked. `fetch_group_participants` persists the subject
+    // + sets the chat name as a side effect.
+    if chat_canon.ends_with("@g.us") {
+        if let Some(d) = dispatcher {
+            if session.group_name_fetch_once(&chat_canon) {
+                let d = d.clone();
+                let st = Arc::clone(store);
+                let sid = session_id.clone();
+                let gj = chat_canon.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = fetch_group_participants(&d, &st, &sid, &gj).await {
+                        tracing::debug!(group = %gj, error = %e, "lazy group-name fetch failed");
+                    }
+                });
+            }
+        }
+    }
+
+    // Attach the reply quote (if any) to the payload, uniformly across text/media.
+    if let Some(q) = &quoted_ctx {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "quoted".to_string(),
+                serde_json::json!({
+                    "stanza_id": q.stanza_id,
+                    "participant": q.participant,
+                    "text": q.text,
+                }),
+            );
+        }
+    }
+
     if !is_protocol_only {
         let payload_json = payload.to_string();
         let _ = store.message_insert(
@@ -6456,6 +6547,76 @@ fn device_sent_destination(plaintext: &[u8]) -> Option<String> {
         .and_then(|m| m.device_sent_message)
         .and_then(|d| d.destination_jid)
         .filter(|j| !j.is_empty())
+}
+
+/// A captured reply reference from an INBOUND message's `contextInfo`. WhatsApp
+/// carries a reply quote on whichever content message is present (extendedText
+/// for text replies, image/video/document for media replies). `classify_e2e_message`
+/// only surfaces the body, so we extract the quote separately and store it in the
+/// message's `payload_json` (no schema change) so the API + dashboard can render
+/// the quoted bubble.
+struct QuotedContext {
+    /// Stanza id of the quoted message — lets the client resolve & link it.
+    stanza_id: Option<String>,
+    /// Author JID of the quoted message (the participant in a group).
+    participant: Option<String>,
+    /// One-line preview of the quoted content, for when the quoted message
+    /// isn't in the client's loaded window.
+    text: Option<String>,
+}
+
+/// Extract a reply quote from a decrypted `waE2E.Message`, if it is a reply.
+/// Returns `None` for a non-reply (no `contextInfo`, or a `contextInfo` that
+/// only carries mentions/forwards with no quoted stanza).
+fn quoted_context_from_e2e(plaintext: &[u8]) -> Option<QuotedContext> {
+    use crate::proto::wa_web_protobufs_e2e::{ContextInfo, Message};
+    use ::prost::Message as _;
+    let msg = Message::decode(plaintext).ok()?;
+    let ctx: &ContextInfo = msg
+        .extended_text_message
+        .as_ref()
+        .and_then(|m| m.context_info.as_deref())
+        .or_else(|| msg.image_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| msg.video_message.as_ref().and_then(|m| m.context_info.as_deref()))
+        .or_else(|| {
+            msg.document_message
+                .as_ref()
+                .and_then(|m| m.context_info.as_deref())
+        })?;
+    // A real reply has a quoted stanza id. `contextInfo` is also present for plain
+    // mentions/forwards — those carry no quote, so skip them.
+    if ctx.stanza_id.is_none() && ctx.quoted_message.is_none() {
+        return None;
+    }
+    let text = ctx.quoted_message.as_deref().and_then(quoted_preview_text);
+    Some(QuotedContext {
+        stanza_id: ctx.stanza_id.clone(),
+        participant: ctx.participant.clone(),
+        text,
+    })
+}
+
+/// Best-effort one-line preview of a quoted message's content.
+fn quoted_preview_text(m: &crate::proto::wa_web_protobufs_e2e::Message) -> Option<String> {
+    if let Some(t) = &m.conversation {
+        return Some(t.clone());
+    }
+    if let Some(t) = m.extended_text_message.as_ref().and_then(|e| e.text.clone()) {
+        return Some(t);
+    }
+    if let Some(img) = m.image_message.as_ref() {
+        return Some(img.caption.clone().unwrap_or_else(|| "[image]".to_string()));
+    }
+    if let Some(v) = m.video_message.as_ref() {
+        return Some(v.caption.clone().unwrap_or_else(|| "[video]".to_string()));
+    }
+    if m.document_message.is_some() {
+        return Some("[document]".to_string());
+    }
+    if m.audio_message.is_some() {
+        return Some("[audio]".to_string());
+    }
+    None
 }
 
 fn decode_e2e_message(plaintext: &[u8]) -> InboundContent {
@@ -11412,6 +11573,36 @@ mod tests {
         ]);
     }
 
+    /// A group-info reply carries the group's NAME on the `<group subject>` attr.
+    /// `parse_group_meta` must surface it (+ creator/creation) so a group joined
+    /// after history-sync gets a name. Before this fix only participants were read.
+    #[test]
+    fn parse_group_meta_extracts_subject_and_creator() {
+        use crate::protocol::binary::{Attrs, Content, Node};
+
+        let mut g = Attrs::new();
+        g.insert("subject".into(), "Weekend Trip".into());
+        g.insert("creator".into(), "5511999999999@s.whatsapp.net".into());
+        g.insert("creation".into(), "1700000000".into());
+        let reply = Node {
+            tag: "iq".into(),
+            attrs: Attrs::new(),
+            content: Content::Nodes(vec![Node {
+                tag: "group".into(),
+                attrs: g,
+                content: Content::None,
+            }]),
+        };
+        let (subject, creator, creation) = parse_group_meta(&reply);
+        assert_eq!(subject.as_deref(), Some("Weekend Trip"));
+        assert_eq!(creator.as_deref(), Some("5511999999999@s.whatsapp.net"));
+        assert_eq!(creation, Some(1_700_000_000));
+
+        // No <group> / no subject → no name (e.g. a non-group reply).
+        let empty = Node { tag: "iq".into(), attrs: Attrs::new(), content: Content::None };
+        assert_eq!(parse_group_meta(&empty), (None, None, None));
+    }
+
     #[test]
     fn group_message_node_has_participants_and_skmsg() {
         use crate::crypto::signal::MessageType;
@@ -14366,6 +14557,52 @@ mod tests {
             InboundContent::Text(t) => assert_eq!(t, "Yes"),
             _ => panic!("button reply"),
         }
+    }
+
+    /// A received reply (an `extendedTextMessage` whose `contextInfo` carries the
+    /// quoted message's stanza id, author, and the quoted content) must surface
+    /// that quote via `quoted_context_from_e2e`. Before this fix the decoder kept
+    /// only the body text and dropped the `contextInfo`, so the dashboard had no
+    /// reply data to render.
+    #[test]
+    fn inbound_reply_captures_quoted_context() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use prost::Message as _;
+
+        let reply = e2e::Message {
+            extended_text_message: Some(Box::new(e2e::ExtendedTextMessage {
+                text: Some("replying now".into()),
+                context_info: Some(Box::new(e2e::ContextInfo {
+                    stanza_id: Some("ORIG_STANZA_ID".into()),
+                    participant: Some("5511999999999@s.whatsapp.net".into()),
+                    quoted_message: Some(Box::new(e2e::Message {
+                        conversation: Some("the original message".into()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let bytes = reply.encode_to_vec();
+
+        // The body still decodes as plain text (unchanged) ...
+        assert!(
+            matches!(decode_e2e_message(&bytes), InboundContent::Text(t) if t == "replying now")
+        );
+        // ... and the quote is now captured.
+        let q = quoted_context_from_e2e(&bytes).expect("reply should yield a quoted context");
+        assert_eq!(q.stanza_id.as_deref(), Some("ORIG_STANZA_ID"));
+        assert_eq!(q.participant.as_deref(), Some("5511999999999@s.whatsapp.net"));
+        assert_eq!(q.text.as_deref(), Some("the original message"));
+
+        // A plain (non-reply) message carries no quote.
+        let plain = e2e::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+        assert!(quoted_context_from_e2e(&plain.encode_to_vec()).is_none());
     }
 
     /// Wrapper messages (ephemeral/disappearing, view-once, edited,

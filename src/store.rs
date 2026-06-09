@@ -17,7 +17,7 @@ use std::path::Path;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use rusqlite_migration::{Migrations, M};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::crypto::vault;
 
@@ -1586,7 +1586,7 @@ impl SqliteStore {
                 };
                 let mut sql = String::from(
                     "SELECT m.chat_jid, m.message_id, m.sender_jid, m.from_me, m.timestamp, \
-                            m.msg_type, m.body_text \
+                            m.msg_type, m.body_text, m.payload_json \
                        FROM messages_fts \
                        JOIN messages m ON m.rowid = messages_fts.rowid \
                       WHERE messages_fts MATCH ?1 AND m.session_id = ?2 AND m.timestamp < ?3",
@@ -1608,7 +1608,7 @@ impl SqliteStore {
 
             // Plain listing (no query): newest-first, optionally chat-scoped.
             let mut sql = String::from(
-                "SELECT chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text \
+                "SELECT chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json \
                    FROM messages WHERE session_id = ?1 AND timestamp < ?2",
             );
             let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id, &before];
@@ -1651,7 +1651,7 @@ impl SqliteStore {
                 })?;
             let Some(ts) = ts else { return Ok(vec![]) };
             const COLS: &str =
-                "chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text";
+                "chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json";
             // target + `before` older, newest-first; then reverse to chronological.
             let older_sql = format!(
                 "SELECT {COLS} FROM messages WHERE session_id = ?1 AND chat_jid = ?2 \
@@ -2162,6 +2162,12 @@ impl SqliteStore {
 /// `MessageListRow` (chat_jid, message_id, sender_jid, from_me, timestamp,
 /// msg_type, body_text).
 fn row_to_msg_list(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageListRow> {
+    // Column 7 is `payload_json`; pull the reply quote out of it (if present).
+    let quoted = r
+        .get::<_, String>(7)
+        .ok()
+        .as_deref()
+        .and_then(parse_quoted);
     Ok(MessageListRow {
         chat_jid: r.get(0)?,
         message_id: r.get(1)?,
@@ -2170,6 +2176,7 @@ fn row_to_msg_list(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageListRow> {
         timestamp: r.get(4)?,
         msg_type: r.get(5)?,
         body_text: r.get(6)?,
+        quoted,
     })
 }
 
@@ -2213,6 +2220,25 @@ fn row_to_egress(r: &rusqlite::Row<'_>) -> rusqlite::Result<EgressTarget> {
     })
 }
 
+/// The reply quote of an inbound message, parsed out of `payload_json`. Present
+/// only when the message was a reply. `stanza_id` lets the client link/scroll to
+/// the quoted message; `text` is a preview for when it isn't loaded.
+#[derive(Serialize, Deserialize)]
+pub struct QuotedInfo {
+    pub stanza_id: Option<String>,
+    pub participant: Option<String>,
+    pub text: Option<String>,
+}
+
+/// Pull the `quoted` reply reference out of a message's `payload_json`, if present.
+/// Shared by the SQLite + Postgres row mappers.
+fn parse_quoted(payload_json: &str) -> Option<QuotedInfo> {
+    serde_json::from_str::<serde_json::Value>(payload_json)
+        .ok()
+        .and_then(|v| v.get("quoted").cloned())
+        .and_then(|q| serde_json::from_value::<QuotedInfo>(q).ok())
+}
+
 /// A stored message row for the list API (field names are the JSON shape).
 #[derive(Serialize)]
 pub struct MessageListRow {
@@ -2223,6 +2249,9 @@ pub struct MessageListRow {
     pub timestamp: i64,
     pub msg_type: String,
     pub body_text: Option<String>,
+    /// The quoted message this is a reply to, if any (`null` for non-replies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quoted: Option<QuotedInfo>,
 }
 
 #[derive(Serialize)]
@@ -3419,7 +3448,7 @@ impl PgStore {
         limit: u32,
     ) -> rusqlite::Result<Vec<MessageListRow>> {
         let mut sql = String::from(
-            "SELECT chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text \
+            "SELECT chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json \
              FROM messages WHERE session_id=$1 AND timestamp < $2",
         );
         let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&session_id, &before];
@@ -3445,15 +3474,7 @@ impl PgStore {
         let rows = self.conn()?.query(sql.as_str(), &params).map_err(pg_err)?;
         Ok(rows
             .iter()
-            .map(|r| MessageListRow {
-                chat_jid: r.get(0),
-                message_id: r.get(1),
-                sender_jid: r.get(2),
-                from_me: r.get::<_, i64>(3) != 0,
-                timestamp: r.get(4),
-                msg_type: r.get(5),
-                body_text: r.get(6),
-            })
+            .map(pg_row_to_msg_list)
             .collect())
     }
 
@@ -3476,7 +3497,7 @@ impl PgStore {
             .map(|r| r.get::<_, i64>(0));
         let Some(ts) = ts else { return Ok(vec![]) };
         const COLS: &str =
-            "chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text";
+            "chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json";
         let older_sql = format!(
             "SELECT {COLS} FROM messages WHERE session_id=$1 AND chat_jid=$2 \
              AND timestamp <= $3 ORDER BY timestamp DESC, message_id DESC LIMIT {}",
@@ -3922,8 +3943,7 @@ impl PgStore {
     }
 }
 
-/// Map a Postgres `egress_targets` row to `EgressTarget`.
-#[allow(dead_code)]
+/// Map a Postgres `messages` row (canonical column order) to `MessageListRow`.
 fn pg_row_to_msg_list(r: &postgres::Row) -> MessageListRow {
     MessageListRow {
         chat_jid: r.get(0),
@@ -3933,6 +3953,8 @@ fn pg_row_to_msg_list(r: &postgres::Row) -> MessageListRow {
         timestamp: r.get(4),
         msg_type: r.get(5),
         body_text: r.get(6),
+        // Column 7 is `payload_json`; pull the reply quote out of it (if present).
+        quoted: parse_quoted(&r.get::<_, String>(7)),
     }
 }
 

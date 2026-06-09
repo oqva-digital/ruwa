@@ -222,6 +222,18 @@ export function MessagingPage({ inst }: { inst: SessionMeta }) {
                       m.from_me ? "bg-primary/20" : "bg-secondary",
                     )}
                   >
+                    {m.quoted && (
+                      <div className="mb-1 border-l-2 border-primary/60 pl-1.5 text-[11px] opacity-80">
+                        {m.quoted.participant && (
+                          <div className="truncate font-medium">{nameOf(m.quoted.participant)}</div>
+                        )}
+                        <div className="truncate">
+                          {rows.find((r) => r.message_id === m.quoted?.stanza_id)?.body_text ??
+                            m.quoted.text ??
+                            "[message]"}
+                        </div>
+                      </div>
+                    )}
                     {MEDIA_TYPES.has(m.msg_type) ? (
                       <div className="flex flex-col gap-1">
                         <MediaBubble inst={inst} chat={sel} m={m} />
