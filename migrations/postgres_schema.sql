@@ -101,8 +101,12 @@ CREATE TABLE IF NOT EXISTS messages (
     payload_json TEXT NOT NULL,
     media_path   TEXT,
     status       TEXT NOT NULL DEFAULT 'received',
+    edited       BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, chat_jid, message_id)
 );
+-- Existing deploys: add the edit flag in place (CREATE above is a no-op once the
+-- table exists). Mirrors the body_tsv backfill pattern.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages (session_id, chat_jid, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages (session_id, sender_jid, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_status ON messages (session_id, status, timestamp);
@@ -222,3 +226,20 @@ CREATE TABLE IF NOT EXISTS log_ring (
 
 CREATE INDEX IF NOT EXISTS idx_log_ring_id ON log_ring (id DESC);
 CREATE INDEX IF NOT EXISTS idx_log_ring_sev ON log_ring (sev, id DESC);
+
+-- Per-message "message secret" (mirror of SQLite migration 0016): the 32-byte
+-- `messageContextInfo.messageSecret`, needed to unseal `SecretEncryptedMessage`
+-- edits (HKDF-derived AES-256-GCM key off the original message's secret).
+-- Keyed by stanza id; `secret` is sealed at rest via the vault. Pruned with
+-- messages.
+CREATE TABLE IF NOT EXISTS message_secrets (
+    session_id TEXT   NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id TEXT   NOT NULL,
+    chat_jid   TEXT   NOT NULL,
+    sender_jid TEXT   NOT NULL,
+    secret     BYTEA  NOT NULL,
+    created_at BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_secrets_created ON message_secrets (created_at);

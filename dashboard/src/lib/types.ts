@@ -56,6 +56,8 @@ export interface MessageRow {
   from_me: boolean
   msg_type: string
   body_text: string | null
+  /** True when the message was edited and the new text applied in place. */
+  edited?: boolean
   quoted?: QuotedRef | null
   timestamp: number
   [k: string]: unknown

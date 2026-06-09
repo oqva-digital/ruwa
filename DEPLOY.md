@@ -35,6 +35,16 @@ proven path; the Postgres backend exists but is far less exercised.
 service → **Settings → Source → Connect Repo** → pick `oqva-digital/ruwa`,
 branch `main`, enable **auto-deploy**. Every push to `main` then builds + deploys.
 
+**Zero-downtime deploys & session leasing:** Railway runs the old and new
+instances in parallel for a few seconds on each deploy. With a **shared
+(Postgres) store**, both would connect the same WhatsApp sockets and fight
+(`stream:error conflict=replaced`), leaving sessions parked Disconnected.
+**Cross-instance leasing** fixes this: the new instance waits for the old one to
+release its lease, then connects (a clean handoff). It now **defaults ON whenever
+`RUWA_STORE` is a `postgres://` URL** (override with `RUWA_LEASING=0`/`1`). On a
+single-instance SQLite+Volume setup there's no real overlap (the Volume attaches
+to one instance at a time), so it stays off.
+
 **Manual deploy (CLI):** from a repo clone linked to the project:
 ```sh
 railway up --service <service-id>

@@ -121,6 +121,8 @@ store_delegate! {
     lid_pn_put(session_id: &str, lid_user: &str, pn_user: &str, now: i64) -> rusqlite::Result<()>;
     lid_to_pn(session_id: &str, lid_user: &str) -> rusqlite::Result<Option<String>>;
     pn_to_lid(session_id: &str, pn_user: &str) -> rusqlite::Result<Option<String>>;
+    message_secret_put(session_id: &str, message_id: &str, chat_jid: &str, sender_jid: &str, secret: &[u8], now: i64) -> rusqlite::Result<()>;
+    message_secret_get(session_id: &str, message_id: &str) -> rusqlite::Result<Option<(String, Vec<u8>)>>;
     prekey_count_uploaded(session_id: &str) -> rusqlite::Result<i64>;
     prekeys_pending_upload(session_id: &str, limit: u32) -> rusqlite::Result<Vec<(u32, Vec<u8>)>>;
     prekeys_mark_uploaded(session_id: &str, up_to: u32) -> rusqlite::Result<()>;
@@ -129,6 +131,7 @@ store_delegate! {
     prekey_load_private(session_id: &str, key_id: u32) -> rusqlite::Result<Option<Vec<u8>>>;
     prekey_delete(session_id: &str, key_id: u32) -> rusqlite::Result<()>;
     message_insert(m: &NewMessage, ignore_conflict: bool) -> rusqlite::Result<()>;
+    message_mark_edited(session_id: &str, message_id: &str, new_body: Option<&str>) -> rusqlite::Result<bool>;
     messages_insert_batch(rows: &[NewMessage], ignore_conflict: bool) -> rusqlite::Result<usize>;
     prune(msg_age_cutoff: Option<i64>, messages_per_chat: Option<u32>, signal_age_cutoff: Option<i64>) -> rusqlite::Result<(usize, usize, usize)>;
     message_set_status(session_id: &str, message_id: &str, status: &str) -> rusqlite::Result<()>;
@@ -471,6 +474,58 @@ impl SqliteStore {
         })
     }
 
+    // ---- message secrets ----------------------------------------------------
+
+    /// Record the original message's secret so a later `SecretEncryptedMessage`
+    /// edit referencing it can be unsealed. First-writer-wins (a message id is
+    /// stable); the secret is sealed at rest. `sender_jid` is stored in `ToNonAD`
+    /// form because it feeds the HKDF use-case string at decrypt time.
+    pub fn message_secret_put(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        chat_jid: &str,
+        sender_jid: &str,
+        secret: &[u8],
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        let sealed = vault::seal(secret);
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO message_secrets \
+                 (session_id, message_id, chat_jid, sender_jid, secret, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                rusqlite::params![session_id, message_id, chat_jid, sender_jid, sealed, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The `(sender_jid, secret)` recorded for `message_id`, if any.
+    pub fn message_secret_get(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<Option<(String, Vec<u8>)>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT sender_jid, secret FROM message_secrets \
+                 WHERE session_id = ? AND message_id = ?",
+                rusqlite::params![session_id, message_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(e),
+            })
+        })
+        .and_then(|opt| match opt {
+            Some((sender, blob)) => Ok(Some((sender, unseal(blob)?))),
+            None => Ok(None),
+        })
+    }
+
     // ---- prekeys ------------------------------------------------------------
 
     /// Count of one-time prekeys still held by the server (`uploaded = 1`).
@@ -686,6 +741,13 @@ impl SqliteStore {
                     "DELETE FROM messages WHERE timestamp < ?",
                     rusqlite::params![cutoff],
                 )?;
+                // Message secrets age out on the same clock as messages — a
+                // secret is only useful while its original message is around to
+                // be edited.
+                tx.execute(
+                    "DELETE FROM message_secrets WHERE created_at > 0 AND created_at < ?",
+                    rusqlite::params![cutoff],
+                )?;
             }
             if let Some(keep) = messages_per_chat {
                 // Keep the newest N per (session, chat); trim the tail.
@@ -709,6 +771,33 @@ impl SqliteStore {
             }
             tx.commit()?;
             Ok((aged_out, over_cap, signal_pruned))
+        })
+    }
+
+    /// Apply an edit to the original message IN PLACE: set `edited = 1` and,
+    /// when `new_body` is `Some`, replace `body_text`. Matched by id across any
+    /// chat (ids are unique per session). Returns whether a row was updated —
+    /// `false` means we don't have the original (predates storage / pruned), so
+    /// the caller can fall back to surfacing a standalone edit marker.
+    pub fn message_mark_edited(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        new_body: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        self.with_conn(|conn| {
+            let n = match new_body {
+                Some(b) => conn.execute(
+                    "UPDATE messages SET body_text = ?, edited = 1 \
+                     WHERE session_id = ? AND message_id = ?",
+                    rusqlite::params![b, session_id, message_id],
+                )?,
+                None => conn.execute(
+                    "UPDATE messages SET edited = 1 WHERE session_id = ? AND message_id = ?",
+                    rusqlite::params![session_id, message_id],
+                )?,
+            };
+            Ok(n > 0)
         })
     }
 
@@ -1586,7 +1675,7 @@ impl SqliteStore {
                 };
                 let mut sql = String::from(
                     "SELECT m.chat_jid, m.message_id, m.sender_jid, m.from_me, m.timestamp, \
-                            m.msg_type, m.body_text, m.payload_json \
+                            m.msg_type, m.body_text, m.payload_json, m.edited \
                        FROM messages_fts \
                        JOIN messages m ON m.rowid = messages_fts.rowid \
                       WHERE messages_fts MATCH ?1 AND m.session_id = ?2 AND m.timestamp < ?3",
@@ -1608,7 +1697,7 @@ impl SqliteStore {
 
             // Plain listing (no query): newest-first, optionally chat-scoped.
             let mut sql = String::from(
-                "SELECT chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json \
+                "SELECT chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json, edited \
                    FROM messages WHERE session_id = ?1 AND timestamp < ?2",
             );
             let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id, &before];
@@ -1651,7 +1740,7 @@ impl SqliteStore {
                 })?;
             let Some(ts) = ts else { return Ok(vec![]) };
             const COLS: &str =
-                "chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json";
+                "chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json, edited";
             // target + `before` older, newest-first; then reverse to chronological.
             let older_sql = format!(
                 "SELECT {COLS} FROM messages WHERE session_id = ?1 AND chat_jid = ?2 \
@@ -1701,9 +1790,23 @@ impl SqliteStore {
 
     pub fn contacts_list(&self, session_id: &str) -> rusqlite::Result<Vec<ContactRow>> {
         self.with_conn(|conn| {
+            // Collapse a contact's `@lid` and PN rows into one: a contact created
+            // under its LID before we learned its LID↔PN mapping would otherwise
+            // show twice. Map each `@lid` jid to its PN via `lid_pn_map`, group by
+            // the canonical jid, and fold names (MAX picks a present value over
+            // NULL). Contacts with no known mapping pass through unchanged.
             let mut stmt = conn.prepare(
-                "SELECT jid, full_name, push_name, business_name FROM contacts \
-                  WHERE session_id = ? ORDER BY jid",
+                "SELECT canon AS jid, MAX(full_name), MAX(push_name), MAX(business_name) \
+                   FROM ( \
+                     SELECT CASE \
+                              WHEN c.jid LIKE '%@lid' AND m.pn_user IS NOT NULL \
+                              THEN m.pn_user || '@s.whatsapp.net' ELSE c.jid END AS canon, \
+                            c.full_name, c.push_name, c.business_name \
+                       FROM contacts c \
+                       LEFT JOIN lid_pn_map m \
+                         ON m.session_id = ?1 AND m.lid_user = replace(c.jid, '@lid', '') \
+                      WHERE c.session_id = ?1 \
+                   ) GROUP BY canon ORDER BY canon",
             )?;
             let out = stmt
                 .query_map([session_id], |r| {
@@ -2176,6 +2279,7 @@ fn row_to_msg_list(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageListRow> {
         timestamp: r.get(4)?,
         msg_type: r.get(5)?,
         body_text: r.get(6)?,
+        edited: r.get::<_, i64>(8)? != 0,
         quoted,
     })
 }
@@ -2249,6 +2353,10 @@ pub struct MessageListRow {
     pub timestamp: i64,
     pub msg_type: String,
     pub body_text: Option<String>,
+    /// True when this message was edited and the new text applied in place.
+    /// Omitted from JSON when false to keep payloads lean.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
     /// The quoted message this is a reply to, if any (`null` for non-replies).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedInfo>,
@@ -2519,6 +2627,52 @@ impl PgStore {
         Ok(row.map(|r| r.get::<_, String>(0)))
     }
 
+    // ---- message secrets ----
+    pub fn message_secret_put(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        chat_jid: &str,
+        sender_jid: &str,
+        secret: &[u8],
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        let sealed = vault::seal(secret);
+        self.conn()?
+            .execute(
+                "INSERT INTO message_secrets \
+                 (session_id, message_id, chat_jid, sender_jid, secret, created_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6) \
+                 ON CONFLICT (session_id, message_id) DO NOTHING",
+                &[&session_id, &message_id, &chat_jid, &sender_jid, &sealed, &now],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn message_secret_get(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<Option<(String, Vec<u8>)>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT sender_jid, secret FROM message_secrets \
+                 WHERE session_id=$1 AND message_id=$2",
+                &[&session_id, &message_id],
+            )
+            .map_err(pg_err)?;
+        match row {
+            Some(r) => {
+                let sender = r.get::<_, String>(0);
+                let blob = r.get::<_, Vec<u8>>(1);
+                Ok(Some((sender, unseal(blob)?)))
+            }
+            None => Ok(None),
+        }
+    }
+
     // ---- prekeys ----
     pub fn prekey_count_uploaded(&self, session_id: &str) -> rusqlite::Result<i64> {
         let row = self
@@ -2707,6 +2861,12 @@ impl PgStore {
             aged = tx
                 .execute("DELETE FROM messages WHERE timestamp < $1", &[&cutoff])
                 .map_err(pg_err)?;
+            // Secrets age out with their messages (see SQLite prune).
+            tx.execute(
+                "DELETE FROM message_secrets WHERE created_at > 0 AND created_at < $1",
+                &[&cutoff],
+            )
+            .map_err(pg_err)?;
         }
         if let Some(keep) = messages_per_chat {
             over = tx
@@ -2746,6 +2906,32 @@ impl PgStore {
             )
             .map_err(pg_err)?;
         Ok(())
+    }
+
+    pub fn message_mark_edited(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        new_body: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let n = match new_body {
+            Some(b) => self
+                .conn()?
+                .execute(
+                    "UPDATE messages SET body_text=$1, edited=1 \
+                     WHERE session_id=$2 AND message_id=$3",
+                    &[&b, &session_id, &message_id],
+                )
+                .map_err(pg_err)?,
+            None => self
+                .conn()?
+                .execute(
+                    "UPDATE messages SET edited=1 WHERE session_id=$1 AND message_id=$2",
+                    &[&session_id, &message_id],
+                )
+                .map_err(pg_err)?,
+        };
+        Ok(n > 0)
     }
 
     pub fn messages_mark_self_from_me(
@@ -3448,7 +3634,7 @@ impl PgStore {
         limit: u32,
     ) -> rusqlite::Result<Vec<MessageListRow>> {
         let mut sql = String::from(
-            "SELECT chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json \
+            "SELECT chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json,edited \
              FROM messages WHERE session_id=$1 AND timestamp < $2",
         );
         let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&session_id, &before];
@@ -3497,7 +3683,7 @@ impl PgStore {
             .map(|r| r.get::<_, i64>(0));
         let Some(ts) = ts else { return Ok(vec![]) };
         const COLS: &str =
-            "chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json";
+            "chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json,edited";
         let older_sql = format!(
             "SELECT {COLS} FROM messages WHERE session_id=$1 AND chat_jid=$2 \
              AND timestamp <= $3 ORDER BY timestamp DESC, message_id DESC LIMIT {}",
@@ -3550,11 +3736,22 @@ impl PgStore {
     }
 
     pub fn contacts_list(&self, session_id: &str) -> rusqlite::Result<Vec<ContactRow>> {
+        // Collapse each contact's `@lid` + PN rows into one canonical (PN) row
+        // via `lid_pn_map`; see the SQLite twin for the rationale.
         let rows = self
             .conn()?
             .query(
-                "SELECT jid,full_name,push_name,business_name FROM contacts \
-                 WHERE session_id=$1 ORDER BY jid",
+                "SELECT canon AS jid, MAX(full_name), MAX(push_name), MAX(business_name) \
+                   FROM ( \
+                     SELECT CASE \
+                              WHEN c.jid LIKE '%@lid' AND m.pn_user IS NOT NULL \
+                              THEN m.pn_user || '@s.whatsapp.net' ELSE c.jid END AS canon, \
+                            c.full_name, c.push_name, c.business_name \
+                       FROM contacts c \
+                       LEFT JOIN lid_pn_map m \
+                         ON m.session_id=$1 AND m.lid_user = replace(c.jid, '@lid', '') \
+                      WHERE c.session_id=$1 \
+                   ) sub GROUP BY canon ORDER BY canon",
                 &[&session_id],
             )
             .map_err(pg_err)?;
@@ -3955,6 +4152,7 @@ fn pg_row_to_msg_list(r: &postgres::Row) -> MessageListRow {
         body_text: r.get(6),
         // Column 7 is `payload_json`; pull the reply quote out of it (if present).
         quoted: parse_quoted(&r.get::<_, String>(7)),
+        edited: r.get::<_, i64>(8) != 0,
     }
 }
 
@@ -4051,6 +4249,8 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/0013_metrics_samples.sql")),
         M::up(include_str!("../migrations/0014_log_ring.sql")),
         M::up(include_str!("../migrations/0015_messages_fts.sql")),
+        M::up(include_str!("../migrations/0016_message_secrets.sql")),
+        M::up(include_str!("../migrations/0017_messages_edited.sql")),
     ])
 }
 
@@ -4336,6 +4536,109 @@ mod tests {
         );
         // Scoped per session.
         assert!(store.lid_to_pn("s2", "64000000000001").unwrap().is_none());
+    }
+
+    #[test]
+    fn message_secret_round_trips_first_writer_wins_and_prunes() {
+        let store = Store::open(":memory:").unwrap();
+        seed_session(&store, "s1");
+
+        assert!(store.message_secret_get("s1", "MID1").unwrap().is_none());
+
+        let secret = vec![0xABu8; 32];
+        store
+            .message_secret_put("s1", "MID1", "chat@s.whatsapp.net", "555@s.whatsapp.net", &secret, 100)
+            .unwrap();
+        let (sender, got) = store.message_secret_get("s1", "MID1").unwrap().unwrap();
+        assert_eq!(sender, "555@s.whatsapp.net");
+        assert_eq!(got, secret);
+
+        // First-writer-wins: a re-arrival with a different secret does not clobber.
+        store
+            .message_secret_put("s1", "MID1", "chat@s.whatsapp.net", "555@s.whatsapp.net", &[0u8; 32], 200)
+            .unwrap();
+        assert_eq!(store.message_secret_get("s1", "MID1").unwrap().unwrap().1, secret);
+
+        // Scoped per session.
+        assert!(store.message_secret_get("s2", "MID1").unwrap().is_none());
+
+        // Pruned on the message age clock (created_at < cutoff).
+        store.prune(Some(150), None, None).unwrap();
+        assert!(store.message_secret_get("s1", "MID1").unwrap().is_none());
+    }
+
+    #[test]
+    fn message_mark_edited_applies_in_place_and_surfaces_flag() {
+        let store = Store::open(":memory:").unwrap();
+        seed_session(&store, "s1");
+        let insert = |id: &str, body: &str| {
+            store
+                .message_insert(
+                    &NewMessage {
+                        session_id: "s1",
+                        chat_jid: "c@s",
+                        message_id: id,
+                        sender_jid: "x@s",
+                        from_me: false,
+                        timestamp: 100,
+                        msg_type: "text",
+                        body_text: Some(body),
+                        payload_json: "{}",
+                        status: None,
+                    },
+                    true,
+                )
+                .unwrap();
+        };
+        insert("M1", "original");
+        insert("M2", "keep me");
+
+        // Unknown target → false (caller falls back to a standalone row).
+        assert!(!store.message_mark_edited("s1", "NOPE", Some("x")).unwrap());
+
+        // In-place edit replaces body + sets the flag; no new row is created.
+        assert!(store.message_mark_edited("s1", "M1", Some("edited!")).unwrap());
+        // None body marks edited but keeps the text.
+        assert!(store.message_mark_edited("s1", "M2", None).unwrap());
+
+        let rows = store.messages_list("s1", Some("c@s"), None, i64::MAX, 50).unwrap();
+        assert_eq!(rows.len(), 2, "edit updates in place, no extra row");
+        let m1 = rows.iter().find(|r| r.message_id == "M1").unwrap();
+        assert_eq!(m1.body_text.as_deref(), Some("edited!"));
+        assert!(m1.edited);
+        let m2 = rows.iter().find(|r| r.message_id == "M2").unwrap();
+        assert_eq!(m2.body_text.as_deref(), Some("keep me"));
+        assert!(m2.edited);
+    }
+
+    #[test]
+    fn contacts_list_collapses_lid_into_pn_once_mapped() {
+        let store = Store::open(":memory:").unwrap();
+        seed_session(&store, "s1");
+        // Same person recorded under PN (no name) and LID (with push name).
+        store
+            .contact_upsert("s1", "5511990000001@s.whatsapp.net", None, None)
+            .unwrap();
+        store
+            .contact_upsert("s1", "64000000000001@lid", None, Some("Henry"))
+            .unwrap();
+        // No mapping yet → two separate contacts (the reported symptom).
+        assert_eq!(store.contacts_list("s1").unwrap().len(), 2);
+
+        // Learn LID↔PN → the two collapse into one, keeping the name.
+        store
+            .lid_pn_put("s1", "64000000000001", "5511990000001", 1)
+            .unwrap();
+        let list = store.contacts_list("s1").unwrap();
+        assert_eq!(list.len(), 1, "lid + pn merge into one contact");
+        assert_eq!(list[0].jid, "5511990000001@s.whatsapp.net");
+        assert_eq!(list[0].push_name.as_deref(), Some("Henry"));
+
+        // An unmapped @lid contact passes through unchanged.
+        store
+            .contact_upsert("s1", "70000000000009@lid", None, Some("Stranger"))
+            .unwrap();
+        assert_eq!(store.contacts_list("s1").unwrap().len(), 2);
     }
 
     #[test]
