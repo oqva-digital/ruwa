@@ -6344,6 +6344,16 @@ fn process_inbound_message(
                 text.clone(),
                 serde_json::json!({"type": kind, "text": text, "enc_type": enc_type}),
             ),
+            InboundContent::Contacts { display_name, cards } => (
+                "contact".to_string(),
+                display_name.clone(),
+                serde_json::json!({
+                    "type": "contact",
+                    "text": display_name,
+                    "contacts": cards,
+                    "enc_type": enc_type,
+                }),
+            ),
             InboundContent::Edited { target_id, text } => (
                 "edited".to_string(),
                 text.clone(),
@@ -6502,6 +6512,12 @@ fn process_inbound_message(
         body_obj.insert("text".into(), serde_json::json!(body_text));
         if let Some(m) = media_descriptor {
             body_obj.insert("media".into(), m);
+        }
+        // Surface shared-contact cards (name + phone numbers) so webhook/SSE
+        // consumers get the number without parsing the raw vCard. Sourced from
+        // the payload built above for `type:"contact"`.
+        if let Some(contacts) = payload.get("contacts") {
+            body_obj.insert("contacts".into(), contacts.clone());
         }
         body_obj.insert("push_name".into(), serde_json::json!(push_name));
         body_obj.insert("from_me".into(), serde_json::json!(store_from_me));
@@ -7103,7 +7119,22 @@ fn classify_e2e_message(
         return InboundContent::Typed { kind: "poll".into(), text: p.name.clone() };
     }
     if let Some(c) = msg.contact_message.as_ref() {
-        return InboundContent::Typed { kind: "contact".into(), text: c.display_name.clone() };
+        let card = parse_vcard(c.vcard.as_deref().unwrap_or(""), c.display_name.as_deref());
+        return InboundContent::Contacts {
+            display_name: c.display_name.clone(),
+            cards: vec![card],
+        };
+    }
+    if let Some(cam) = msg.contacts_array_message.as_ref() {
+        let cards = cam
+            .contacts
+            .iter()
+            .map(|c| parse_vcard(c.vcard.as_deref().unwrap_or(""), c.display_name.as_deref()))
+            .collect();
+        return InboundContent::Contacts {
+            display_name: cam.display_name.clone(),
+            cards,
+        };
     }
     if let Some(loc) = msg.location_message.as_ref() {
         let label = loc.name.clone().filter(|s| !s.is_empty()).or_else(|| loc.address.clone()).or_else(|| {
@@ -7150,6 +7181,12 @@ enum InboundContent {
     /// group_invite, template) — `kind` becomes `messages.msg_type` and `text`
     /// (if any) the human-readable body. Keeps these out of the "unknown" bucket.
     Typed { kind: String, text: Option<String> },
+    /// A shared contact card (`contactMessage`) or multiple cards
+    /// (`contactsArrayMessage`). `display_name` is the chat-list label (kept as
+    /// `text` for back-compat); `cards` carries each contact's name + phone
+    /// numbers parsed from its vCard so webhook consumers get the number(s)
+    /// without parsing the raw card.
+    Contacts { display_name: Option<String>, cards: Vec<ContactCard> },
     /// A message EDIT (modern `SecretEncryptedMessage` or legacy
     /// `protocolMessage{MESSAGE_EDIT}`). `target_id` is the ORIGINAL message's
     /// stanza id; `text` the new content (`None` when we couldn't unseal it).
@@ -7157,6 +7194,60 @@ enum InboundContent {
     /// storing a separate row.
     Edited { target_id: Option<String>, text: Option<String> },
     Other,
+}
+
+/// A single shared contact, surfaced in the webhook/SSE body as
+/// `contacts: [{ name, phones }]`. `phones` are the human-readable numbers
+/// parsed from the vCard's `TEL` lines (with the `waid=` param as a fallback).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct ContactCard {
+    name: String,
+    phones: Vec<String>,
+}
+
+/// Parse a shared contact's vCard into `{ name, phones }`. `display_name` (the
+/// `ContactMessage.displayName`) wins for the name; the vCard `FN` is the
+/// fallback. Phones come from each `TEL` line's value (the number after the
+/// `:`); when that value is empty we fall back to the WhatsApp `waid=` param
+/// rendered as `+<digits>`. Tolerates `item1.TEL`-style grouping and CRLF.
+fn parse_vcard(vcard: &str, display_name: Option<&str>) -> ContactCard {
+    let mut phones: Vec<String> = Vec::new();
+    let mut fn_name: Option<String> = None;
+    for line in vcard.lines() {
+        let line = line.trim();
+        let Some((head, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        // Property name = first token before any `;` param, with an optional
+        // `item1.`/`itemN.` group prefix stripped.
+        let prop = head.split(';').next().unwrap_or("");
+        let prop = prop.rsplit('.').next().unwrap_or(prop);
+        if prop.eq_ignore_ascii_case("TEL") {
+            let phone = if !value.is_empty() {
+                value.to_string()
+            } else {
+                head.split(';')
+                    .skip(1)
+                    .find_map(|p| {
+                        let (k, v) = p.split_once('=')?;
+                        k.eq_ignore_ascii_case("waid").then(|| format!("+{}", v.trim()))
+                    })
+                    .unwrap_or_default()
+            };
+            if !phone.is_empty() && !phones.contains(&phone) {
+                phones.push(phone);
+            }
+        } else if prop.eq_ignore_ascii_case("FN") && fn_name.is_none() && !value.is_empty() {
+            fn_name = Some(value.to_string());
+        }
+    }
+    let name = display_name
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(fn_name)
+        .unwrap_or_default();
+    ContactCard { name, phones }
 }
 
 /// Map a `MediaType` to the short string we store in `messages.msg_type`
@@ -11293,6 +11384,11 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
                             text.clone(),
                             serde_json::json!({"type":kind,"text":text,"source":"history_sync"}),
                         ),
+                        InboundContent::Contacts { display_name, cards } => (
+                            "contact".to_string(),
+                            display_name.clone(),
+                            serde_json::json!({"type":"contact","text":display_name,"contacts":cards,"source":"history_sync"}),
+                        ),
                         // History-sync edits are rare and the original may not be
                         // ingested yet, so just record the new text as an `edited`
                         // row rather than applying in place.
@@ -12115,6 +12211,69 @@ mod tests {
         let c = m.contact_message.expect("contact_message set");
         assert_eq!(c.display_name.as_deref(), Some("Alice"));
         assert_eq!(c.vcard.as_deref(), Some(vcard));
+    }
+
+    /// A shared contact decodes to `Contacts` with the phone number(s) pulled
+    /// from the vCard `TEL` lines — so the webhook body carries them. Covers the
+    /// `waid=` param fallback, `item1.TEL` grouping, and `displayName` winning
+    /// over `FN` for the name.
+    #[test]
+    fn contact_message_decodes_phones_from_vcard() {
+        let vcard = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Alice Cooper\r\n\
+                     item1.TEL;waid=5511988887777:+55 11 98888-7777\r\nEND:VCARD";
+        let bytes = build_contact_message("Alice", vcard);
+        match decode_e2e_message(&bytes) {
+            InboundContent::Contacts { display_name, cards } => {
+                assert_eq!(display_name.as_deref(), Some("Alice"));
+                assert_eq!(cards.len(), 1);
+                assert_eq!(cards[0].name, "Alice"); // displayName beats FN
+                assert_eq!(cards[0].phones, vec!["+55 11 98888-7777".to_string()]);
+            }
+            _ => panic!("expected Contacts"),
+        }
+
+        // TEL with no value → fall back to the waid param as +<digits>.
+        let waid_only = "BEGIN:VCARD\nVERSION:3.0\nFN:Bob\nTEL;waid=5511955554444:\nEND:VCARD";
+        match decode_e2e_message(&build_contact_message("", waid_only)) {
+            InboundContent::Contacts { cards, .. } => {
+                assert_eq!(cards[0].name, "Bob"); // empty displayName → FN
+                assert_eq!(cards[0].phones, vec!["+5511955554444".to_string()]);
+            }
+            _ => panic!("expected Contacts"),
+        }
+    }
+
+    /// A `contactsArrayMessage` (multiple cards in one message) surfaces every
+    /// card with its parsed phones.
+    #[test]
+    fn contacts_array_message_decodes_each_card() {
+        use crate::proto::wa_web_protobufs_e2e::{ContactMessage, ContactsArrayMessage, Message};
+        use prost::Message as _;
+
+        let card = |name: &str, num: &str| ContactMessage {
+            display_name: Some(name.into()),
+            vcard: Some(format!("BEGIN:VCARD\nVERSION:3.0\nFN:{name}\nTEL;type=CELL:{num}\nEND:VCARD")),
+            ..Default::default()
+        };
+        let msg = Message {
+            contacts_array_message: Some(Box::new(ContactsArrayMessage {
+                display_name: Some("2 contacts".into()),
+                contacts: vec![card("Alice", "+5511111111111"), card("Bob", "+5522222222222")],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        match decode_e2e_message(&msg.encode_to_vec()) {
+            InboundContent::Contacts { display_name, cards } => {
+                assert_eq!(display_name.as_deref(), Some("2 contacts"));
+                assert_eq!(cards.len(), 2);
+                assert_eq!(cards[0].name, "Alice");
+                assert_eq!(cards[0].phones, vec!["+5511111111111".to_string()]);
+                assert_eq!(cards[1].name, "Bob");
+                assert_eq!(cards[1].phones, vec!["+5522222222222".to_string()]);
+            }
+            _ => panic!("expected Contacts"),
+        }
     }
 
     #[test]
