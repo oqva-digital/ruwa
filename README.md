@@ -75,6 +75,22 @@ WhatsApp, n=12):
 | Evolution | 5.0 ms | 4.8 | 9.0 |
 
 ruwa is the lightest on every footprint axis and fastest on both send and receive.
+
+**Reliability (cloud soak)** — a continuous send↔receive probe between two live
+sessions on Railway (Postgres-backed, egress through a residential proxy), run
+for **83.5 h** straight:
+
+| Metric | Result |
+|---|---|
+| Round-trip delivery | **100%** (406/406, 0 failed) |
+| Connection uptime | **99.6%** per session |
+| Send→received latency | p50 **0.77 s** · p95 2.33 s |
+| Webhook deliveries | 3,624 · **0** bad HMAC signatures |
+
+End-to-end over the public internet + a residential proxy + WhatsApp's own
+servers — the honest production figure. It's an order higher than the controlled
+single-machine **send latency** above (which isolates ruwa's own overhead, not
+the network round-trip).
 Numbers are single-machine and point-in-time — see [`bench/`](bench/) for the rigs and
 caveats.
 

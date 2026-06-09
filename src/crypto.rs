@@ -2534,6 +2534,92 @@ pub mod hkdf {
     }
 }
 
+pub mod msg_secret {
+    //! Message-secret modifications (edits / poll-edits / event-edits).
+    //!
+    //! Modern WhatsApp delivers a message EDIT as a `SecretEncryptedMessage`
+    //! whose `encPayload` is AES-256-GCM-sealed under a key HKDF-derived from the
+    //! ORIGINAL message's 32-byte `messageContextInfo.messageSecret`. This mirrors
+    //! whatsmeow `generateMsgSecretKey` + `decryptMsgSecret` (msgsecret.go).
+
+    use super::hkdf;
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+
+    /// Use-case strings, byte-identical to whatsmeow's `MsgSecretType`. They are
+    /// appended to the HKDF `info`, so any drift silently breaks decryption.
+    pub const USE_CASE_MESSAGE_EDIT: &str = "Message Edit";
+    pub const USE_CASE_POLL_EDIT: &str = "Poll Edit";
+    pub const USE_CASE_EVENT_EDIT: &str = "Event Edit";
+
+    /// Derive the 32-byte AES key: `HKDF-SHA256(ikm = orig_secret, salt = nil,
+    /// info = orig_msg_id ++ orig_sender ++ mod_sender ++ use_case)`. The two
+    /// JIDs must be the `ToNonAD().String()` forms (device/agent stripped) the
+    /// sender used, or GCM authentication fails.
+    pub fn derive_key(
+        orig_secret: &[u8],
+        orig_msg_id: &str,
+        orig_sender: &str,
+        mod_sender: &str,
+        use_case: &str,
+    ) -> [u8; 32] {
+        let mut info = Vec::with_capacity(
+            orig_msg_id.len() + orig_sender.len() + mod_sender.len() + use_case.len(),
+        );
+        info.extend_from_slice(orig_msg_id.as_bytes());
+        info.extend_from_slice(orig_sender.as_bytes());
+        info.extend_from_slice(mod_sender.as_bytes());
+        info.extend_from_slice(use_case.as_bytes());
+        let okm = hkdf::expand(orig_secret, &info, 32);
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&okm);
+        k
+    }
+
+    /// AES-256-GCM decrypt with empty AAD (the case for every *edit* use-case;
+    /// poll-votes/reactions add AAD but aren't handled here). `iv` must be 12
+    /// bytes and `ct_with_tag` is ciphertext with the 16-byte tag appended.
+    /// Returns `None` on a wrong key / tampered input (GCM auth failure) so the
+    /// caller can try the next sender candidate.
+    pub fn decrypt(key: &[u8; 32], iv: &[u8], ct_with_tag: &[u8]) -> Option<Vec<u8>> {
+        if iv.len() != 12 {
+            return None;
+        }
+        let cipher = Aes256Gcm::new_from_slice(key).ok()?;
+        cipher.decrypt(Nonce::from_slice(iv), ct_with_tag).ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+
+        /// The derived key round-trips through AES-256-GCM, and a different
+        /// use-case (or sender) yields a key that fails authentication — the
+        /// exact property the edit-decrypt path relies on.
+        #[test]
+        fn derive_key_round_trips_and_is_use_case_bound() {
+            let secret = [0x42u8; 32];
+            let (mid, orig, mods) = ("ORIG123", "555@s.whatsapp.net", "555@s.whatsapp.net");
+            let key = derive_key(&secret, mid, orig, mods, USE_CASE_MESSAGE_EDIT);
+
+            let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+            let iv = [7u8; 12];
+            let pt = b"edited text payload";
+            let ct = cipher.encrypt(Nonce::from_slice(&iv), &pt[..]).unwrap();
+
+            assert_eq!(decrypt(&key, &iv, &ct).as_deref(), Some(&pt[..]));
+
+            // Wrong use-case → wrong key → auth failure (None), not garbage.
+            let wrong = derive_key(&secret, mid, orig, mods, USE_CASE_POLL_EDIT);
+            assert!(decrypt(&wrong, &iv, &ct).is_none());
+            // Non-12-byte IV is rejected outright.
+            assert!(decrypt(&key, &[7u8; 16], &ct).is_none());
+        }
+    }
+}
+
 pub mod linking {
     //! Phone-number ("Link with phone number") pairing crypto.
     //!

@@ -245,6 +245,7 @@ export function MessagingPage({ inst }: { inst: SessionMeta }) {
                   </div>
                   <div className="mono mt-0.5 flex max-w-full items-center gap-1.5 text-[10px] text-muted-foreground">
                     <span className="truncate">{m.from_me ? "me" : nameOf(m.sender_jid)}</span>·<span className="shrink-0">{fmtTs(m.timestamp)}</span>
+                    {(m.edited || m.msg_type === "edited") && <span className="shrink-0 italic">· edited</span>}
                     <span className="opacity-0 transition-opacity group-hover:opacity-100">
                       <button onClick={() => doReact(m)} className="ml-1 hover:text-foreground"><SmilePlus className="inline h-3 w-3" /></button>
                       {m.from_me && (

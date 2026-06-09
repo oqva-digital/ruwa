@@ -2322,13 +2322,22 @@ impl SessionManager {
     }
 }
 
-/// Whether cross-instance session leasing is enforced (`RUWA_LEASING=1`).
-/// Off by default so single-instance deploys behave exactly as before.
+/// Whether cross-instance session leasing is enforced.
+///
+/// `RUWA_LEASING` is an explicit override (`1`/`true`/`yes` on, `0`/`false`/`no`/
+/// `off` off). When unset, the default follows the store type: ON for a Postgres
+/// store (shared, multi-instance-capable — where a zero-downtime deploy overlap
+/// needs lease coordination so the new instance waits for the old one instead of
+/// fighting over the socket), OFF for SQLite (single instance — leasing can't
+/// share a lease there and would only add up-to-TTL crash-recovery latency).
 fn leasing_enabled() -> bool {
-    matches!(
-        std::env::var("RUWA_LEASING").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
+    match std::env::var("RUWA_LEASING").as_deref() {
+        Ok("1") | Ok("true") | Ok("yes") => true,
+        Ok("0") | Ok("false") | Ok("no") | Ok("off") => false,
+        _ => std::env::var("RUWA_STORE").is_ok_and(|s| {
+            s.starts_with("postgres://") || s.starts_with("postgresql://")
+        }),
+    }
 }
 
 /// Whether a session still wants boot-time revival: paired (has a jid) and
@@ -3294,6 +3303,19 @@ fn jid_user(jid: &str) -> &str {
 fn lid_user_part(jid: &str) -> &str {
     let end = jid.find(['.', ':', '@']).unwrap_or(jid.len());
     &jid[..end]
+}
+
+/// whatsmeow `JID.ToNonAD().String()`: the bare user part (agent `.N` + device
+/// `:N` stripped) joined to the server. This is the exact string WhatsApp feeds
+/// into the message-secret HKDF when sealing an edit, so it must match
+/// byte-for-byte. `"64000000000001.1:50@lid"` → `"64000000000001@lid"`;
+/// `"5511…:3@s.whatsapp.net"` → `"5511…@s.whatsapp.net"`.
+fn to_non_ad_jid(jid: &str) -> String {
+    let user = lid_user_part(jid);
+    match jid.rfind('@') {
+        Some(at) => format!("{user}@{}", &jid[at + 1..]),
+        None => user.to_string(),
+    }
 }
 
 /// Whether a device's user-part belongs to our own account. A retry receipt
@@ -6117,20 +6139,63 @@ fn process_inbound_message(
     let device_sent_dest: Option<String> =
         plain.as_ref().and_then(|p| device_sent_destination(p));
 
+    // Record this message's `messageContextInfo.messageSecret` (if any), keyed by
+    // its stanza id. A later edit of this message arrives as a
+    // `SecretEncryptedMessage` whose payload is sealed under a key derived from
+    // this secret — without it the edit can't be unsealed. = whatsmeow
+    // `storeMessageSecret`. First-writer-wins; pruned with the message.
+    if let Some(sec) = plain.as_ref().and_then(|p| message_secret_from_e2e(p)) {
+        let secret_sender = to_non_ad_jid(&participant);
+        let secret_chat = to_non_ad_jid(&from);
+        let _ = store.message_secret_put(
+            &session_id,
+            &msg_id,
+            &secret_chat,
+            &secret_sender,
+            &sec,
+            timestamp,
+        );
+    }
+
+    // Peek for a modern edit (`SecretEncryptedMessage`, possibly nested in our
+    // own `deviceSentMessage` fan-out). Used below to unseal the edit when plain
+    // classification yields nothing.
+    let secret_enc = plain.as_ref().and_then(|p| secret_encrypted_from_e2e(p));
+
     // Peek the proto for a reply quote (`contextInfo`) before `classify_e2e_message`
     // discards it, so the stored message carries what it was replying to. Same
     // cheap re-decode pattern as `device_sent_dest` above.
     let quoted_ctx: Option<QuotedContext> =
         plain.as_ref().and_then(|p| quoted_context_from_e2e(p));
 
+    // Decode content; when it's an unrecognized type that is really a modern
+    // `SecretEncryptedMessage` edit, unseal it with the original message's stored
+    // secret instead of letting it fall through to "unknown".
+    let decoded = plain.as_ref().map(|p| match decode_e2e_message(p) {
+        InboundContent::Other => match secret_enc.as_ref() {
+            Some(se) => decrypt_secret_encrypted(store, &session_id, se, &participant),
+            None => InboundContent::Other,
+        },
+        other => other,
+    });
+
+    // An edit targets an existing message: apply the new text onto the original
+    // IN PLACE (below) rather than storing a separate row. `edit_target` is the
+    // original's stanza id when the decode produced an `Edited`. Captured before
+    // the match below consumes `decoded`.
+    let edit_target: Option<String> = match &decoded {
+        Some(InboundContent::Edited { target_id, .. }) => target_id.clone(),
+        _ => None,
+    };
+
     // Decide msg_type + body_text + payload from the decoded InboundContent.
-    let (msg_type, body_text, mut payload) = match plain {
+    let (msg_type, body_text, mut payload) = match decoded {
         None => (
             "undecryptable".to_string(),
             None,
             serde_json::json!({"type": "undecryptable", "enc_type": enc_type}),
         ),
-        Some(plain) => match decode_e2e_message(&plain) {
+        Some(content) => match content {
             InboundContent::Text(t) => {
                 let body = Some(t.clone());
                 (
@@ -6279,6 +6344,11 @@ fn process_inbound_message(
                 text.clone(),
                 serde_json::json!({"type": kind, "text": text, "enc_type": enc_type}),
             ),
+            InboundContent::Edited { target_id, text } => (
+                "edited".to_string(),
+                text.clone(),
+                serde_json::json!({"type": "edited", "text": text, "edits": target_id, "enc_type": enc_type}),
+            ),
             InboundContent::Other => (
                 "unknown".to_string(),
                 None,
@@ -6357,7 +6427,37 @@ fn process_inbound_message(
         }
     }
 
-    if !is_protocol_only {
+    // A message EDIT applies onto the ORIGINAL message in place: update its
+    // body + set `edited`, and DON'T insert a separate row. This shows the edit
+    // where the original sits (WhatsApp's behaviour) and drops the old duplicate
+    // edit row — which carried the edit stanza's own routing and mislabeled
+    // `from_me`/chat. If we don't have the original (it predates this or was
+    // pruned), `edit_applied` stays false and we fall through to storing the edit
+    // as its own row so nothing is silently lost.
+    let edit_applied = match edit_target.as_deref() {
+        Some(target) => match store.message_mark_edited(&session_id, target, body_text.as_deref()) {
+            Ok(true) => {
+                let mut body_obj = serde_json::Map::new();
+                body_obj.insert("type".into(), serde_json::json!("edited"));
+                body_obj.insert("text".into(), serde_json::json!(body_text));
+                body_obj.insert("edits".into(), serde_json::json!(target));
+                body_obj.insert("from_me".into(), serde_json::json!(store_from_me));
+                body_obj.insert("push_name".into(), serde_json::json!(push_name));
+                let _ = session.events.send(SessionEvent::Message {
+                    id: msg_id.clone(),
+                    chat: chat_canon.clone(),
+                    from: sender_canon.clone(),
+                    body: serde_json::Value::Object(body_obj),
+                });
+                tracing::info!(target = %target, "applied edit onto original message in place");
+                true
+            }
+            _ => false,
+        },
+        None => false,
+    };
+
+    if !is_protocol_only && !edit_applied {
         let payload_json = payload.to_string();
         let _ = store.message_insert(
             &crate::store::NewMessage {
@@ -6547,6 +6647,182 @@ fn device_sent_destination(plaintext: &[u8]) -> Option<String> {
         .and_then(|m| m.device_sent_message)
         .and_then(|d| d.destination_jid)
         .filter(|j| !j.is_empty())
+}
+
+/// Peek a decrypted message for the 32-byte `messageContextInfo.messageSecret`,
+/// so a later `SecretEncryptedMessage` edit targeting this message can be
+/// unsealed. Checks the top level (where WhatsApp puts the context info even on
+/// wrapped messages) and one level into a `deviceSentMessage` / `ephemeralMessage`
+/// wrapper. = whatsmeow `storeMessageSecret`.
+fn message_secret_from_e2e(plaintext: &[u8]) -> Option<Vec<u8>> {
+    use crate::proto::wa_web_protobufs_e2e::Message;
+    use ::prost::Message as _;
+    fn ctx_secret(m: &Message) -> Option<Vec<u8>> {
+        m.message_context_info
+            .as_ref()
+            .and_then(|c| c.message_secret.clone())
+    }
+    let m = Message::decode(plaintext).ok()?;
+    ctx_secret(&m)
+        .or_else(|| {
+            m.device_sent_message
+                .as_ref()
+                .and_then(|d| d.message.as_ref())
+                .and_then(|im| ctx_secret(im))
+        })
+        .or_else(|| {
+            m.ephemeral_message
+                .as_ref()
+                .and_then(|f| f.message.as_ref())
+                .and_then(|im| ctx_secret(im))
+        })
+        .filter(|s| s.len() == 32)
+}
+
+/// Peek a decrypted message for a `SecretEncryptedMessage` (modern edits / poll
+/// edits), unwrapping the same wrappers `classify_e2e_message` does so an own
+/// edit nested in `deviceSentMessage` is found too.
+fn secret_encrypted_from_e2e(
+    plaintext: &[u8],
+) -> Option<crate::proto::wa_web_protobufs_e2e::SecretEncryptedMessage> {
+    use ::prost::Message as _;
+    let mut m = crate::proto::wa_web_protobufs_e2e::Message::decode(plaintext).ok()?;
+    for _ in 0..4 {
+        if let Some(se) = m.secret_encrypted_message.take() {
+            return Some(se);
+        }
+        // Unwrap one wrapper layer (taken one at a time to satisfy the borrow
+        // checker), mirroring the chain in `classify_e2e_message`.
+        let inner = if let Some(f) = m.ephemeral_message.take() {
+            f.message
+        } else if let Some(f) = m.view_once_message.take() {
+            f.message
+        } else if let Some(f) = m.view_once_message_v2.take() {
+            f.message
+        } else if let Some(f) = m.view_once_message_v2_extension.take() {
+            f.message
+        } else if let Some(f) = m.document_with_caption_message.take() {
+            f.message
+        } else if let Some(f) = m.edited_message.take() {
+            f.message
+        } else if let Some(d) = m.device_sent_message.take() {
+            d.message
+        } else {
+            return None;
+        };
+        match inner {
+            Some(b) => m = *b,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Unseal a `SecretEncryptedMessage` edit using the stored secret of the message
+/// it targets, and surface the new edited text. Falls back to a bare `"edited"`
+/// marker (no text) when the original message predates secret storage or GCM
+/// fails to authenticate — so the chat shows `[edited]` instead of `[unknown]`.
+/// `editor_jid` is the raw sender of the EDIT stanza (the `participant`).
+/// = whatsmeow `DecryptSecretEncryptedMessage`.
+fn decrypt_secret_encrypted(
+    store: &Arc<Store>,
+    session_id: &str,
+    se: &crate::proto::wa_web_protobufs_e2e::SecretEncryptedMessage,
+    editor_jid: &str,
+) -> InboundContent {
+    use crate::crypto::msg_secret;
+    use crate::proto::wa_web_protobufs_e2e::secret_encrypted_message::SecretEncType;
+
+    let target = match se.target_message_key.as_ref() {
+        Some(k) => k,
+        None => return InboundContent::Other,
+    };
+    let target_id = match target.id.as_deref() {
+        Some(id) if !id.is_empty() => id,
+        _ => return InboundContent::Other,
+    };
+    let (kind, use_case) = match se.secret_enc_type.and_then(|t| SecretEncType::try_from(t).ok()) {
+        Some(SecretEncType::MessageEdit) => ("edited", msg_secret::USE_CASE_MESSAGE_EDIT),
+        Some(SecretEncType::EventEdit) => ("edited", msg_secret::USE_CASE_EVENT_EDIT),
+        Some(SecretEncType::PollEdit) | Some(SecretEncType::PollAddOption) => {
+            ("poll_update", msg_secret::USE_CASE_POLL_EDIT)
+        }
+        // MESSAGE_SCHEDULE / UNKNOWN: nothing visible to surface.
+        _ => return InboundContent::Other,
+    };
+
+    // Edits carry the target id and apply in place; poll edits surface as a
+    // typed marker (no in-place target). `make` keeps the three exit points
+    // consistent.
+    let is_edit = kind == "edited";
+    let make = |text: Option<String>| -> InboundContent {
+        if is_edit {
+            InboundContent::Edited { target_id: Some(target_id.to_string()), text }
+        } else {
+            InboundContent::Typed { kind: kind.into(), text }
+        }
+    };
+
+    let (payload, iv) = match (se.enc_payload.as_deref(), se.enc_iv.as_deref()) {
+        (Some(p), Some(v)) => (p, v),
+        _ => return make(None),
+    };
+
+    // Need the original message's secret. Absent → it predates secret storage
+    // (e.g. an edit of a message received before this shipped); surface the
+    // marker so the row isn't "unknown".
+    let (stored_sender, secret) = match store.message_secret_get(session_id, target_id) {
+        Ok(Some(v)) => v,
+        _ => {
+            tracing::info!(
+                target = %target_id, kind,
+                "edit targets a message with no stored secret — surfacing [edited] marker"
+            );
+            return make(None);
+        }
+    };
+
+    // Candidate original senders in ToNonAD form. LID/PN migration means the JID
+    // the sender used to seal may differ from our canonical view, so try each and
+    // let GCM authentication pick the right one (whatsmeow does the same).
+    let editor = to_non_ad_jid(editor_jid);
+    let mut candidates: Vec<String> = Vec::new();
+    if target.from_me == Some(true) {
+        candidates.push(editor.clone()); // own edit: original sender IS the editor
+    }
+    if let Some(rj) = target.remote_jid.as_deref().filter(|s| !s.is_empty()) {
+        candidates.push(to_non_ad_jid(rj));
+    }
+    if let Some(p) = target.participant.as_deref().filter(|s| !s.is_empty()) {
+        candidates.push(to_non_ad_jid(p));
+    }
+    candidates.push(stored_sender); // the sender we recorded the secret under
+    candidates.dedup();
+
+    for orig_sender in &candidates {
+        let key = msg_secret::derive_key(&secret, target_id, orig_sender, &editor, use_case);
+        if let Some(pt) = msg_secret::decrypt(&key, iv, payload) {
+            // The plaintext is a serialized waE2E.Message holding the new content.
+            // It is itself usually a `protocolMessage{MESSAGE_EDIT}` (→ `Edited`),
+            // so pull the text out of that variant too — missing this arm dropped
+            // the new text and left the original showing unchanged.
+            let text = match decode_e2e_message(&pt) {
+                InboundContent::Text(t) => Some(t),
+                InboundContent::Typed { text, .. } => text,
+                InboundContent::Media { caption, .. } => caption,
+                InboundContent::Edited { text, .. } => text,
+                _ => None,
+            };
+            tracing::info!(target = %target_id, kind, "decrypted secret-encrypted edit");
+            return make(text);
+        }
+    }
+
+    tracing::warn!(
+        target = %target_id, kind, tried = candidates.len(),
+        "secret-encrypted edit failed to authenticate with any sender candidate"
+    );
+    make(None)
 }
 
 /// A captured reply reference from an INBOUND message's `contextInfo`. WhatsApp
@@ -6764,16 +7040,19 @@ fn classify_e2e_message(
         }
         let ptype = pm.r#type;
         // A message EDIT (`type=MESSAGE_EDIT`) carries the replacement content in
-        // `edited_message`; surface its visible text so the chat shows the new
-        // text instead of "unknown". Without this every edit lands as `Other`.
+        // `edited_message`, keyed (`pm.key`) to the ORIGINAL message. Surface it as
+        // an `Edited` so the receive path applies the new text onto the original in
+        // place instead of leaving it "unknown" / appending a separate row.
+        let edit_target = pm.key.as_ref().and_then(|k| k.id.clone());
         if let Some(edited) = pm.edited_message {
             let text = match classify_e2e_message(*edited, depth + 1) {
                 InboundContent::Text(t) => Some(t),
                 InboundContent::Typed { text, .. } => text,
                 InboundContent::Media { caption, .. } => caption,
+                InboundContent::Edited { text, .. } => text,
                 _ => None,
             };
-            return InboundContent::Typed { kind: "edited".into(), text };
+            return InboundContent::Edited { target_id: edit_target, text };
         }
         // A REVOKE (delete-for-everyone, `type=REVOKE`) has no body; surface a
         // typed marker so the row isn't "unknown" either.
@@ -6871,6 +7150,12 @@ enum InboundContent {
     /// group_invite, template) — `kind` becomes `messages.msg_type` and `text`
     /// (if any) the human-readable body. Keeps these out of the "unknown" bucket.
     Typed { kind: String, text: Option<String> },
+    /// A message EDIT (modern `SecretEncryptedMessage` or legacy
+    /// `protocolMessage{MESSAGE_EDIT}`). `target_id` is the ORIGINAL message's
+    /// stanza id; `text` the new content (`None` when we couldn't unseal it).
+    /// The receive path applies it onto the original IN PLACE rather than
+    /// storing a separate row.
+    Edited { target_id: Option<String>, text: Option<String> },
     Other,
 }
 
@@ -11008,6 +11293,14 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
                             text.clone(),
                             serde_json::json!({"type":kind,"text":text,"source":"history_sync"}),
                         ),
+                        // History-sync edits are rare and the original may not be
+                        // ingested yet, so just record the new text as an `edited`
+                        // row rather than applying in place.
+                        InboundContent::Edited { target_id, text } => (
+                            "edited".to_string(),
+                            text.clone(),
+                            serde_json::json!({"type":"edited","text":text,"edits":target_id,"source":"history_sync"}),
+                        ),
                         InboundContent::HistorySyncNotification(_)
                         | InboundContent::AppStateSyncKeyShare(_)
                         | InboundContent::Other => (
@@ -14685,11 +14978,11 @@ mod tests {
             ..Default::default()
         };
         match decode_e2e_message(&edit.encode_to_vec()) {
-            InboundContent::Typed { kind, text } => {
-                assert_eq!(kind, "edited");
+            InboundContent::Edited { target_id, text } => {
+                assert_eq!(target_id.as_deref(), Some("ORIG123"));
                 assert_eq!(text.as_deref(), Some("edited text"));
             }
-            _ => panic!("expected Typed/edited"),
+            _ => panic!("expected Edited"),
         }
 
         let revoke = e2e::Message {
@@ -14705,6 +14998,148 @@ mod tests {
                 assert!(text.is_none());
             }
             _ => panic!("expected Typed/revoked"),
+        }
+    }
+
+    #[test]
+    fn to_non_ad_jid_strips_agent_and_device() {
+        assert_eq!(to_non_ad_jid("64000000000001.1:50@lid"), "64000000000001@lid");
+        assert_eq!(to_non_ad_jid("64000000000001.1@lid"), "64000000000001@lid");
+        assert_eq!(to_non_ad_jid("5511999:3@s.whatsapp.net"), "5511999@s.whatsapp.net");
+        assert_eq!(to_non_ad_jid("5511999@s.whatsapp.net"), "5511999@s.whatsapp.net");
+    }
+
+    #[test]
+    fn secret_encrypted_from_e2e_unwraps_device_sent() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use prost::Message as _;
+        // An own edit echo nests the SecretEncryptedMessage inside deviceSentMessage.
+        let se = e2e::SecretEncryptedMessage {
+            target_message_key: Some(crate::proto::wa_common::MessageKey {
+                id: Some("T1".into()),
+                ..Default::default()
+            }),
+            secret_enc_type: Some(e2e::secret_encrypted_message::SecretEncType::MessageEdit as i32),
+            ..Default::default()
+        };
+        let wrapped = e2e::Message {
+            device_sent_message: Some(Box::new(e2e::DeviceSentMessage {
+                destination_jid: Some("5511999@s.whatsapp.net".into()),
+                message: Some(Box::new(e2e::Message {
+                    secret_encrypted_message: Some(se),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let found = secret_encrypted_from_e2e(&wrapped.encode_to_vec()).expect("unwrapped SE");
+        assert_eq!(found.target_message_key.unwrap().id.as_deref(), Some("T1"));
+    }
+
+    /// End-to-end: a modern `SecretEncryptedMessage` MESSAGE_EDIT decrypts to the
+    /// new text using the original message's stored secret — the exact path that
+    /// was landing as `[unknown]`. We seal the payload the way WhatsApp does
+    /// (HKDF key off the secret + AES-GCM) and assert the decoder recovers it.
+    #[test]
+    fn secret_encrypted_edit_decrypts_with_stored_secret() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use prost::Message as _;
+
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let session = "sess-edit";
+        let target_id = "ORIG-MSG-1";
+        let secret = [0x9au8; 32];
+        // Original sender / editor as WhatsApp would feed them (ToNonAD form).
+        let orig_sender = "5511990000001@s.whatsapp.net";
+        let editor_raw = "5511990000001:7@s.whatsapp.net"; // editor stanza sender (has device)
+        let editor_nonad = "5511990000001@s.whatsapp.net";
+
+        // We store the secret under a deliberately "wrong" sender string to prove
+        // the decoder falls back to the targetMessageKey-derived candidate.
+        store
+            .message_secret_put(session, target_id, "chat@s.whatsapp.net", "stale@s.whatsapp.net", &secret, 0)
+            .unwrap();
+
+        // Seal the new content exactly as the sender's client does.
+        let key = crate::crypto::msg_secret::derive_key(
+            &secret,
+            target_id,
+            orig_sender,
+            editor_nonad,
+            crate::crypto::msg_secret::USE_CASE_MESSAGE_EDIT,
+        );
+        let iv = [4u8; 12];
+        // WhatsApp seals the new content as a `protocolMessage{MESSAGE_EDIT}`
+        // (NOT a bare conversation) — decoding that yields `Edited`, so the text
+        // extraction must handle that variant. Using the real shape here guards
+        // the regression where the new text was silently dropped.
+        let inner = e2e::Message {
+            protocol_message: Some(Box::new(e2e::ProtocolMessage {
+                key: Some(crate::proto::wa_common::MessageKey {
+                    id: Some(target_id.into()),
+                    ..Default::default()
+                }),
+                r#type: Some(e2e::protocol_message::Type::MessageEdit as i32),
+                edited_message: Some(Box::new(e2e::Message {
+                    conversation: Some("corrected text".into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let ct = Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .encrypt(Nonce::from_slice(&iv), inner.encode_to_vec().as_slice())
+            .unwrap();
+
+        let se = e2e::SecretEncryptedMessage {
+            target_message_key: Some(crate::proto::wa_common::MessageKey {
+                id: Some(target_id.into()),
+                from_me: Some(false),
+                remote_jid: Some(orig_sender.into()),
+                ..Default::default()
+            }),
+            enc_payload: Some(ct),
+            enc_iv: Some(iv.to_vec()),
+            secret_enc_type: Some(e2e::secret_encrypted_message::SecretEncType::MessageEdit as i32),
+            ..Default::default()
+        };
+
+        match decrypt_secret_encrypted(&store, session, &se, editor_raw) {
+            InboundContent::Edited { target_id: tid, text } => {
+                assert_eq!(tid.as_deref(), Some(target_id));
+                assert_eq!(text.as_deref(), Some("corrected text"));
+            }
+            _ => panic!("expected edited text from secret-encrypted edit"),
+        }
+    }
+
+    /// An edit of a message we never recorded a secret for (e.g. received before
+    /// this shipped) surfaces an `[edited]` marker — NOT `[unknown]`.
+    #[test]
+    fn secret_encrypted_edit_without_secret_surfaces_marker() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let se = e2e::SecretEncryptedMessage {
+            target_message_key: Some(crate::proto::wa_common::MessageKey {
+                id: Some("UNKNOWN-ORIG".into()),
+                ..Default::default()
+            }),
+            enc_payload: Some(vec![1, 2, 3]),
+            enc_iv: Some(vec![0u8; 12]),
+            secret_enc_type: Some(e2e::secret_encrypted_message::SecretEncType::MessageEdit as i32),
+            ..Default::default()
+        };
+        match decrypt_secret_encrypted(&store, "s", &se, "x@s.whatsapp.net") {
+            InboundContent::Edited { target_id, text } => {
+                assert_eq!(target_id.as_deref(), Some("UNKNOWN-ORIG"));
+                assert!(text.is_none());
+            }
+            _ => panic!("expected [edited] marker for an edit with no stored secret"),
         }
     }
 
