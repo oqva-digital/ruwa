@@ -2303,6 +2303,14 @@ struct TypingReq {
     state: String,
 }
 
+/// WhatsApp only relays a `composing` indicator while the session is marked
+/// `available`. So when the user starts typing on a session that's running
+/// `unavailable` (the default), we announce `available` first. Not needed for
+/// `paused`, nor when the session is already online.
+fn typing_should_announce_available(state: &str, mark_online: bool) -> bool {
+    state == "composing" && !mark_online
+}
+
 async fn set_typing(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2323,6 +2331,18 @@ async fn set_typing(
         .clone()
         .ok_or_else(|| Error::BadRequest("not paired".into()))?;
     let chat_jid = normalize_recipient_jid(&chat);
+    // WhatsApp only relays a typing indicator while we're marked `available`.
+    // Sessions default to `unavailable` (to keep the phone notifying), so a bare
+    // `composing` is silently dropped. When the user starts typing and the
+    // session isn't already online, announce `available` first so it actually
+    // shows. Side effect (the cost of appearing online): WhatsApp silences the
+    // phone's notifications for this connection.
+    let online = state.manager.store.session_mark_online(&id).unwrap_or(false);
+    if typing_should_announce_available(&req.state, online) {
+        let push_name: Option<String> = state.manager.store.session_push_name(&id).ok().flatten();
+        let presence = crate::session::build_global_presence_node("available", push_name.as_deref());
+        let _ = session.enqueue_send(SendOp::RawNode(presence));
+    }
     let node = crate::session::build_chat_presence_node(&own_jid, &chat_jid, &req.state);
     let _ = session.enqueue_send(SendOp::RawNode(node));
     Ok((
@@ -2551,6 +2571,17 @@ mod tests {
         // The create path takes a proxy too — hardened the same way.
         assert!(serde_json::from_str::<CreateSessionReq>(r#"{"label":"x","url":"y"}"#).is_err());
         assert!(serde_json::from_str::<CreateSessionReq>(r#"{"label":"x","proxy":"y"}"#).is_ok());
+    }
+
+    /// Typing only reaches the peer while we're `available`. A `composing` on an
+    /// offline (default) session must first announce `available`; a session
+    /// that's already online, or a `paused`, must not.
+    #[test]
+    fn typing_announces_available_only_when_composing_and_offline() {
+        assert!(typing_should_announce_available("composing", false));
+        assert!(!typing_should_announce_available("composing", true)); // already online
+        assert!(!typing_should_announce_available("paused", false)); // stop typing
+        assert!(!typing_should_announce_available("paused", true));
     }
 
     #[test]
