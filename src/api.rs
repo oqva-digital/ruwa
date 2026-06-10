@@ -385,6 +385,7 @@ fn require_confirmation(action: &str, q: &ConfirmQuery, body: &[u8]) -> Result<(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // a typo'd key (e.g. `url`) must 400, not silently no-op
 struct CreateSessionReq {
     label: Option<String>,
     /// Optional egress proxy URL (socks5/socks5h/http). Validated on create.
@@ -436,6 +437,7 @@ struct SetPresenceReq {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // reject a typo'd key (e.g. `url`) instead of a silent no-op
 struct SetProxyReq {
     /// Proxy URL, or null to clear (direct connection).
     proxy: Option<String>,
@@ -2536,6 +2538,20 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
     use tower::ServiceExt;
+
+    /// The reported footgun: `POST /proxy {"url": "..."}` used to deserialize to
+    /// `proxy = None` and silently clear the proxy (200, no-op). `deny_unknown_fields`
+    /// turns a typo'd key into a loud deserialization error instead.
+    #[test]
+    fn proxy_body_rejects_unknown_field_no_silent_noop() {
+        assert!(serde_json::from_str::<SetProxyReq>(r#"{"url":"socks5://x"}"#).is_err());
+        assert!(serde_json::from_str::<SetProxyReq>(r#"{"proxy":"socks5://x"}"#).is_ok());
+        // Explicit clear (null) still works.
+        assert!(serde_json::from_str::<SetProxyReq>(r#"{"proxy":null}"#).is_ok());
+        // The create path takes a proxy too — hardened the same way.
+        assert!(serde_json::from_str::<CreateSessionReq>(r#"{"label":"x","url":"y"}"#).is_err());
+        assert!(serde_json::from_str::<CreateSessionReq>(r#"{"label":"x","proxy":"y"}"#).is_ok());
+    }
 
     #[test]
     fn mask_proxy_hides_credentials() {
