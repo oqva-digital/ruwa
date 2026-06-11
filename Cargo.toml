@@ -1,6 +1,6 @@
 [package]
 name = "ruwa"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 description = "API-first multi-tenant WhatsApp Web client in Rust (port of whatsmeow)"
 license = "MIT"

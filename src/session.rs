@@ -168,6 +168,12 @@ pub struct SessionMeta {
     pub status: SessionStatus,
     /// JID assigned by WhatsApp after pairing, e.g. "5511999999999.0:23@s.whatsapp.net".
     pub jid: Option<String>,
+    /// WhatsApp account display name (push name). Read-only: it's owned by the
+    /// primary phone and synced down to companions — ruwa can't durably change
+    /// it. Surfaced so the UI can show it (vs. the editable instance `label`).
+    /// Reflects the value as of session load; refreshes on reconnect/restart.
+    #[serde(default)]
+    pub push_name: Option<String>,
     /// Per-session egress proxy URL (socks5/socks5h/http). `None` = direct.
     /// The connection task routes the Noise WebSocket through it; media (reqwest)
     /// uses the same URL. Never serialized raw — it can contain credentials; the
@@ -1512,6 +1518,7 @@ impl SessionManager {
                     label: row.label,
                     status,
                     jid: row.jid,
+                    push_name: row.push_name,
                     created_at: row.created_at,
                     updated_at: row.updated_at,
                     proxy_url: row.proxy_url,
@@ -1657,6 +1664,7 @@ impl SessionManager {
             label,
             status: SessionStatus::Pending,
             jid: None,
+            push_name: None,
             proxy_url: None,
             mark_online: false,
             created_at: now,
@@ -1773,6 +1781,7 @@ impl SessionManager {
             label,
             status: SessionStatus::Disconnected,
             jid: Some(creds.jid),
+            push_name: creds.push_name.clone(),
             proxy_url: None,
             mark_online: false,
             created_at: now,
@@ -2176,6 +2185,20 @@ impl SessionManager {
         self.store.session_set_proxy(id, proxy_url.as_deref(), now)?;
         let mut m = session.meta.write();
         m.proxy_url = proxy_url;
+        m.updated_at = now;
+        Ok(())
+    }
+
+    /// Rename a session: set (or clear) its display label. Purely a ruwa-side
+    /// organizational name — no WhatsApp protocol effect. A blank label clears
+    /// it. Updates both the persisted row and the in-memory meta.
+    pub fn set_label(&self, id: &str, label: Option<String>) -> Result<()> {
+        let label = label.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let session = self.get(id)?;
+        let now = chrono::Utc::now().timestamp();
+        self.store.session_set_label(id, label.as_deref(), now)?;
+        let mut m = session.meta.write();
+        m.label = label;
         m.updated_at = now;
         Ok(())
     }
@@ -12715,6 +12738,7 @@ mod tests {
             label: None,
             status: SessionStatus::Connected,
             jid: None,
+            push_name: None,
             proxy_url: None,
             mark_online: false,
             created_at: 0,
@@ -13883,6 +13907,7 @@ mod tests {
             label: None,
             status: SessionStatus::Connected,
             jid: Some("5511999999999:7@s.whatsapp.net".into()),
+            push_name: None,
             proxy_url: None,
             mark_online: false,
             created_at: 0,

@@ -104,6 +104,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/connect", post(connect_session))
         .route("/sessions/:id/logout", post(logout_session))
         .route("/sessions/:id/proxy", post(set_session_proxy))
+        .route("/sessions/:id/label", post(set_session_label))
         .route("/sessions/:id/mark-online", post(set_session_presence))
         .route("/sessions/:id/messages", get(list_messages).post(send_message))
         .route("/sessions/:id/messages/media", post(send_media))
@@ -443,6 +444,14 @@ struct SetProxyReq {
     proxy: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // reject a typo'd key (e.g. `name`) instead of a silent no-op
+struct SetLabelReq {
+    /// New display label for the instance, or null/blank to clear it. This is a
+    /// ruwa-side organizational name only — it has no WhatsApp protocol effect.
+    label: Option<String>,
+}
+
 async fn list_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -549,6 +558,21 @@ async fn set_session_proxy(
 ) -> Result<Json<SessionResp>> {
     check_session_auth_write(&headers, &state, &id)?;
     state.manager.set_proxy(&id, req.proxy)?;
+    let meta = state.manager.get(&id)?.meta.read().clone();
+    Ok(Json(SessionResp::new(meta)))
+}
+
+/// Rename an instance: set or clear (`label: null`/blank) its display label.
+/// A purely organizational ruwa-side name — no WhatsApp protocol effect. Takes
+/// effect immediately; no reconnect needed.
+async fn set_session_label(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SetLabelReq>,
+) -> Result<Json<SessionResp>> {
+    check_session_auth_write(&headers, &state, &id)?;
+    state.manager.set_label(&id, req.label)?;
     let meta = state.manager.get(&id)?.meta.read().clone();
     Ok(Json(SessionResp::new(meta)))
 }
@@ -2172,7 +2196,15 @@ async fn set_profile(
     }
 
     if let Some(name) = req.name.as_deref() {
-        // Push name rides on a presence update (no reply); best-effort enqueue.
+        // The push name is the source of truth for the `name` attr WA stamps on
+        // every presence broadcast (reconnect, keepalive, mark-online). Persist
+        // it first so later presence rebroadcasts don't revert to the old name —
+        // then ship one presence update now so peers see the change immediately.
+        state
+            .manager
+            .store
+            .session_set_push_name(&id, name)
+            .map_err(|e| Error::Internal(anyhow::anyhow!(e)))?;
         let node = crate::session::build_global_presence_node("available", Some(name));
         let _ = session.enqueue_send(SendOp::RawNode(node));
         applied.push("name");
@@ -3085,6 +3117,94 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    /// Renaming the account (display name) must persist `push_name` so later
+    /// presence rebroadcasts carry the new name instead of reverting. The name
+    /// branch only enqueues a presence node (no IQ), so it succeeds offline.
+    #[tokio::test]
+    async fn set_profile_name_persists_push_name() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (_st, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(serde_json::json!({"label": "pn"})),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let (st, out) = send(
+            app.clone(),
+            "PUT",
+            &format!("/v1/sessions/{id}/profile"),
+            Some("test-token"),
+            Some(serde_json::json!({"name": "New Name"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(out["applied"], serde_json::json!(["name"]));
+        assert_eq!(
+            state.manager.store.session_push_name(&id).unwrap().as_deref(),
+            Some("New Name"),
+        );
+    }
+
+    /// Renaming an instance persists the new label and surfaces it on GET.
+    /// A blank label clears it back to null.
+    #[tokio::test]
+    async fn set_label_renames_instance() {
+        let app = router(test_state());
+        let (_st, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(serde_json::json!({"label": "old"})),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+
+        // Rename → 200, label reflected in the response.
+        let (st, out) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/label"),
+            Some("test-token"),
+            Some(serde_json::json!({"label": "  New Name  "})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(out["label"], "New Name"); // trimmed
+
+        // Persisted: GET returns the new label.
+        let (_st, got) = send(app.clone(), "GET", &format!("/v1/sessions/{id}"), Some("test-token"), None).await;
+        assert_eq!(got["label"], "New Name");
+
+        // Blank clears it to null.
+        let (st, out) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/label"),
+            Some("test-token"),
+            Some(serde_json::json!({"label": "   "})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(out["label"].is_null());
+
+        // Typo'd key is rejected (deny_unknown_fields → 422), not a silent no-op.
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/label"),
+            Some("test-token"),
+            Some(serde_json::json!({"name": "x"})),
+        )
+        .await;
+        assert!(st.is_client_error(), "unknown field must be rejected, got {st}");
     }
 
     #[tokio::test]

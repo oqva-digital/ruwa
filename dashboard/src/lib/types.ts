@@ -15,6 +15,9 @@ export interface SessionMeta {
   label: string | null
   status: SessionStatus
   jid: string | null
+  /** WhatsApp account display name (push name). Read-only — owned by the phone,
+   *  synced down to companions; ruwa can't change it. */
+  push_name?: string | null
   proxy_url: string | null
   /** true → announce "available" (online); WhatsApp then silences the phone's
    *  notifications. false (default) → phone keeps notifying. */
