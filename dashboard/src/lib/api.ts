@@ -134,6 +134,9 @@ export const api = {
     req<unknown>("POST", `/v1/sessions/${id}/logout`, { confirm: true }),
   setProxy: (id: string, proxy: string | null) =>
     req<unknown>("POST", `/v1/sessions/${id}/proxy`, { proxy }),
+  /** Rename an instance (ruwa-side label only; no WhatsApp effect). Blank clears it. */
+  setLabel: (id: string, label: string | null) =>
+    req<SessionMeta>("POST", `/v1/sessions/${id}/label`, { label }),
   getQr: (id: string) =>
     req<{ qr: string; svg_base64: string }>("GET", `/v1/sessions/${id}/qr`),
   /** Request an 8-char phone-number pairing code ("Link with phone number"),

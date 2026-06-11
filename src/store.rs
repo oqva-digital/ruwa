@@ -144,6 +144,7 @@ store_delegate! {
     session_delete(id: &str) -> rusqlite::Result<()>;
     session_api_key(id: &str) -> rusqlite::Result<Option<String>>;
     session_set_proxy(id: &str, proxy_url: Option<&str>, updated_at: i64) -> rusqlite::Result<()>;
+    session_set_label(id: &str, label: Option<&str>, updated_at: i64) -> rusqlite::Result<()>;
     session_proxy(id: &str) -> rusqlite::Result<Option<String>>;
     session_mark_online(id: &str) -> rusqlite::Result<bool>;
     session_set_mark_online(id: &str, on: bool) -> rusqlite::Result<()>;
@@ -1024,7 +1025,7 @@ impl SqliteStore {
     pub fn sessions_all(&self) -> rusqlite::Result<Vec<SessionRow>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, label, status, jid, created_at, updated_at, proxy_url, mark_online FROM sessions",
+                "SELECT id, label, status, jid, push_name, created_at, updated_at, proxy_url, mark_online FROM sessions",
             )?;
             let rows = stmt
                 .query_map([], |r| {
@@ -1033,10 +1034,11 @@ impl SqliteStore {
                         label: r.get(1)?,
                         status: r.get(2)?,
                         jid: r.get(3)?,
-                        created_at: r.get(4)?,
-                        updated_at: r.get(5)?,
-                        proxy_url: r.get(6)?,
-                        mark_online: r.get::<_, i64>(7)? != 0,
+                        push_name: r.get(4)?,
+                        created_at: r.get(5)?,
+                        updated_at: r.get(6)?,
+                        proxy_url: r.get(7)?,
+                        mark_online: r.get::<_, i64>(8)? != 0,
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -1100,6 +1102,22 @@ impl SqliteStore {
             conn.execute(
                 "UPDATE sessions SET proxy_url = ?, updated_at = ? WHERE id = ?",
                 rusqlite::params![proxy_url, updated_at, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Rename a session: set (or clear, with `None`) its display label.
+    pub fn session_set_label(
+        &self,
+        id: &str,
+        label: Option<&str>,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET label = ?, updated_at = ? WHERE id = ?",
+                rusqlite::params![label, updated_at, id],
             )?;
             Ok(())
         })
@@ -3100,7 +3118,7 @@ impl PgStore {
         let rows = self
             .conn()?
             .query(
-                "SELECT id,label,status,jid,created_at,updated_at,proxy_url,mark_online FROM sessions",
+                "SELECT id,label,status,jid,push_name,created_at,updated_at,proxy_url,mark_online FROM sessions",
                 &[],
             )
             .map_err(pg_err)?;
@@ -3111,10 +3129,11 @@ impl PgStore {
                 label: r.get(1),
                 status: r.get(2),
                 jid: r.get(3),
-                created_at: r.get(4),
-                updated_at: r.get(5),
-                proxy_url: r.get(6),
-                mark_online: r.get::<_, i32>(7) != 0,
+                push_name: r.get(4),
+                created_at: r.get(5),
+                updated_at: r.get(6),
+                proxy_url: r.get(7),
+                mark_online: r.get::<_, i32>(8) != 0,
             })
             .collect())
     }
@@ -3162,6 +3181,22 @@ impl PgStore {
             .execute(
                 "UPDATE sessions SET proxy_url=$1, updated_at=$2 WHERE id=$3",
                 &[&proxy_url, &updated_at, &id],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    /// Rename a session: set (or clear, with `None`) its display label.
+    pub fn session_set_label(
+        &self,
+        id: &str,
+        label: Option<&str>,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn()?
+            .execute(
+                "UPDATE sessions SET label=$1, updated_at=$2 WHERE id=$3",
+                &[&label, &updated_at, &id],
             )
             .map_err(pg_err)?;
         Ok(())
@@ -4174,6 +4209,7 @@ pub struct SessionRow {
     pub label: Option<String>,
     pub status: String,
     pub jid: Option<String>,
+    pub push_name: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub proxy_url: Option<String>,

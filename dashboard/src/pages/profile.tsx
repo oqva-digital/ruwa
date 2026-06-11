@@ -10,7 +10,6 @@ import { Textarea } from "@/components/ui/textarea"
 import { Button } from "@/components/ui/button"
 
 export function ProfilePage({ inst, readonly }: { inst: SessionMeta; readonly: boolean }) {
-  const [name, setName] = useState(inst.label ?? "")
   const [status, setStatus] = useState("")
   const [picture, setPicture] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -29,8 +28,7 @@ export function ProfilePage({ inst, readonly }: { inst: SessionMeta; readonly: b
   async function save() {
     setBusy(true)
     try {
-      const body: { name?: string; status?: string; picture?: string } = {}
-      if (name.trim()) body.name = name.trim()
+      const body: { status?: string; picture?: string } = {}
       if (status.trim()) body.status = status.trim()
       if (picture) body.picture = picture
       const res = await api.setProfile(inst.id, body)
@@ -64,14 +62,18 @@ export function ProfilePage({ inst, readonly }: { inst: SessionMeta; readonly: b
           </div>
           <div>
             <Label className="mb-1.5 block">Display name</Label>
-            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="My Business" />
+            <Input value={inst.push_name ?? ""} readOnly disabled placeholder="Set on your phone" />
+            <p className="mt-1.5 text-xs text-muted-foreground">
+              Your WhatsApp name is managed on your phone — linked devices like ruwa can't change it. To rename
+              this instance inside ruwa, use <span className="font-medium">Rename</span> on the Instances page.
+            </p>
           </div>
           <div>
             <Label className="mb-1.5 block">Status / about</Label>
             <Textarea value={status} onChange={(e) => setStatus(e.target.value)} placeholder="Available on WhatsApp" className="h-20" />
           </div>
           <div className="flex justify-end border-t pt-3">
-            <Button disabled={readonly || busy} onClick={save}><Save className="h-4 w-4" /> Save</Button>
+            <Button disabled={readonly || busy || (!status.trim() && !picture)} onClick={save}><Save className="h-4 w-4" /> Save</Button>
           </div>
         </div>
       </SectionCard>

@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import {
   Search, Plus, Upload, MoreHorizontal, ExternalLink, Plug, Power, Trash2,
-  Snowflake, Inbox, Copy, CheckCircle2, TriangleAlert, Loader2,
+  Snowflake, Inbox, Copy, CheckCircle2, TriangleAlert, Loader2, Pencil,
 } from "lucide-react"
 import { Textarea } from "@/components/ui/textarea"
 import { api, ApiError } from "@/lib/api"
@@ -227,6 +227,10 @@ function InstanceRow({
   const recon = health.data?.reconnect_count ?? 0
   const frozen = s.status === "connected" && lastRxSec != null && lastRxSec >= 75
 
+  const [renaming, setRenaming] = useState(false)
+  const [renameVal, setRenameVal] = useState(s.label ?? "")
+  const [renameBusy, setRenameBusy] = useState(false)
+
   // soft filter for "frozen" (needs health, resolved client-side)
   if (filter === "frozen" && !frozen) return null
 
@@ -240,7 +244,22 @@ function InstanceRow({
     }
   }
 
+  async function submitRename() {
+    setRenameBusy(true)
+    try {
+      await api.setLabel(s.id, renameVal.trim() || null)
+      toast.success("Renamed", { description: renameVal.trim() || "(no label)" })
+      setRenaming(false)
+      onChanged()
+    } catch (e) {
+      toast.error("Rename failed", { description: e instanceof Error ? e.message : "" })
+    } finally {
+      setRenameBusy(false)
+    }
+  }
+
   return (
+    <>
     <TableRow className="cursor-pointer" onClick={() => onOpen(s.id)}>
       <TableCell className="font-medium">{s.label || "(no label)"}</TableCell>
       <TableCell>
@@ -285,6 +304,12 @@ function InstanceRow({
             </DropdownMenuItem>
             <DropdownMenuItem
               disabled={readonly}
+              onClick={() => { setRenameVal(s.label ?? ""); setRenaming(true) }}
+            >
+              <Pencil className="h-4 w-4" /> Rename
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={readonly}
               onClick={() => act("Connect", () => api.connect(s.id), "Connecting…")}
             >
               <Plug className="h-4 w-4" /> Connect
@@ -314,6 +339,33 @@ function InstanceRow({
         </DropdownMenu>
       </TableCell>
     </TableRow>
+    <Dialog open={renaming} onOpenChange={(o) => !o && setRenaming(false)}>
+      <DialogContent onClick={(e) => e.stopPropagation()}>
+        <DialogHeader>
+          <DialogTitle>Rename instance</DialogTitle>
+          <DialogDescription>
+            A ruwa-side label to identify this instance. It has no effect on the WhatsApp account name.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="py-1">
+          <Label className="mb-1.5 block">Label</Label>
+          <Input
+            value={renameVal}
+            onChange={(e) => setRenameVal(e.target.value)}
+            placeholder="e.g. Main Account"
+            autoFocus
+            onKeyDown={(e) => { if (e.key === "Enter" && !renameBusy) submitRename() }}
+          />
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setRenaming(false)} disabled={renameBusy}>Cancel</Button>
+          <Button onClick={submitRename} disabled={renameBusy}>
+            {renameBusy && <Loader2 className="h-4 w-4 animate-spin" />} Save
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    </>
   )
 }
 

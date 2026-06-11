@@ -105,6 +105,18 @@ server.tool(
 )
 
 server.tool(
+  "rename_session",
+  "Rename an instance — sets its ruwa-side display label. This is purely an organizational name; it has no effect on the WhatsApp account/profile name (that's controlled by the phone). Pass an empty label to clear it.",
+  {
+    session_id: z.string(),
+    label: z.string().describe("new label for the instance (empty string clears it)"),
+  },
+  async ({ session_id, label }) => {
+    try { return ok(await call("POST", `/v1/sessions/${enc(session_id)}/label`, { label: label || null })) } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
   "logout_session",
   "Log out / unlink a session from WhatsApp (the linked device is removed; re-pairing needs a new QR).",
   { session_id: z.string() },
