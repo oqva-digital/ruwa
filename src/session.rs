@@ -214,7 +214,14 @@ pub enum SessionStatus {
     Connecting,
     /// Pairing in progress, QR available.
     AwaitingQr,
-    /// Paired and connected.
+    /// Logged in (socket up, `<success>` received) but still pulling the initial
+    /// app-state (contacts/chats/settings + LID↔PN maps) from WhatsApp. NOT yet
+    /// safe for consumers to send/receive — acting now races unsynced state (the
+    /// class of bug where a message lands before contacts/LID maps exist).
+    /// Flips to `Connected` once app-state sync completes (or a fallback timeout).
+    Syncing,
+    /// Paired, connected, AND initial app-state synced — READY to send/receive.
+    /// The `connected` event fires on entering this state, not on bare login.
     Connected,
     /// Paired but currently disconnected (will retry).
     Disconnected,
@@ -409,6 +416,11 @@ pub enum SessionEvent {
     /// hyphenated code the user types into their phone. Emitted by `pair_phone`.
     PairingCode { code: String },
     Paired { jid: String },
+    /// Logged in but pulling initial app-state — not yet safe to use. Mirrors
+    /// `SessionStatus::Syncing`. Emitted on `<success>`; followed by `Connected`
+    /// once sync completes.
+    Syncing,
+    /// READY: logged in AND initial app-state synced. Safe to send/receive.
     Connected,
     Disconnected { reason: String },
     Message { id: String, chat: String, from: String, body: serde_json::Value },
@@ -777,6 +789,40 @@ pub struct Session {
     /// so a burst of messages in a nameless group fires one metadata query, not N.
     /// In-memory; resets on restart (a re-fetch then just refreshes the name).
     group_name_fetched: PlMutex<HashSet<String>>,
+    /// Manual-reconnect ("rekey") signal. `SessionManager::reconnect` notifies
+    /// waiters; `run_connection` selects on it and bounces the live socket — sets
+    /// `restart_required` and exits non-clean so the reconnect loop re-logs-in
+    /// IMMEDIATELY (no QR; the identity is intact). Unlike `logout_notify` it does
+    /// NOT ship `<remove-companion-device>`, so the device stays paired. Used to
+    /// heal stuck-undecryptable sessions (imported from Baileys) the way a redeploy
+    /// does, without a redeploy.
+    reconnect_notify: Arc<tokio::sync::Notify>,
+    /// Set by `import_session` on a Baileys/Evolution import; consumed once by the
+    /// post-login-success handler, which fires a single delayed self-bounce so the
+    /// imported session re-establishes cleanly (fresh prekeys registered, pending
+    /// inbound re-delivered) without an operator clicking Reconnect. In-memory: a
+    /// process restart between import and first login just skips the auto-rekey
+    /// (the manual Reconnect button remains).
+    import_rekey_pending: std::sync::atomic::AtomicBool,
+    /// Set by `import_session`; consumed once when the imported session first
+    /// reaches READY (app-state synced, so the chat list exists). Triggers an
+    /// on-demand history-sync backfill of the most-recently-active chats so a
+    /// freshly-imported session pulls readable conversation content through the
+    /// history-sync channel — independent of the per-peer Signal sessions the
+    /// import didn't carry. In-memory: a restart before first READY just skips it.
+    import_history_pending: std::sync::atomic::AtomicBool,
+    /// App-state collection names applied so far THIS connection (reset on each
+    /// `<success>` by `begin_sync`). Once it covers all of `AppStateCollection::all`,
+    /// the session is READY and flips `Syncing → Connected`. See `mark_collection_synced`.
+    synced_collections: PlMutex<HashSet<String>>,
+    /// Latched true when the session reaches READY (app-state synced) this
+    /// connection, so `mark_ready` fires `Connected` exactly once. Reset by
+    /// `begin_sync`.
+    sync_ready: std::sync::atomic::AtomicBool,
+    /// Fallback timer that promotes `Syncing → Connected` if app-state sync never
+    /// signals completion (missing key share, stalled fetch, …) so a session can
+    /// never get stuck in `Syncing`. Armed by `begin_sync`, aborted by `mark_ready`.
+    sync_deadline_handle: PlMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// One entry in [`Session::recent_sends`] — enough to rebuild and resend a
@@ -852,6 +898,12 @@ impl Session {
             phone_linking: RwLock::new(None),
             requested_app_state_keys: PlMutex::new(HashSet::new()),
             group_name_fetched: PlMutex::new(HashSet::new()),
+            reconnect_notify: Arc::new(tokio::sync::Notify::new()),
+            import_rekey_pending: std::sync::atomic::AtomicBool::new(false),
+            import_history_pending: std::sync::atomic::AtomicBool::new(false),
+            synced_collections: PlMutex::new(HashSet::new()),
+            sync_ready: std::sync::atomic::AtomicBool::new(false),
+            sync_deadline_handle: PlMutex::new(None),
         }
     }
 
@@ -910,6 +962,25 @@ impl Session {
     /// now read it. Also keeps the map from growing once a message lands.
     fn take_message_retry(&self, msg_id: &str) -> Option<u32> {
         self.message_retries.lock().remove(msg_id)
+    }
+
+    /// Drop every in-flight inbound retry counter. Called by a manual reconnect
+    /// ("rekey") so messages that stalled mid-escalation get a fresh retry cycle
+    /// on the re-login (the same clean slate a process restart gives), instead of
+    /// resuming at a count that's one nudge from the give-up cap.
+    pub fn clear_message_retries(&self) {
+        self.message_retries.lock().clear();
+    }
+
+    /// Bounce the live socket without unpairing. Notifies the `run_connection`
+    /// select loop, which sets `restart_required` and exits non-clean so the
+    /// reconnect driver re-logs-in immediately (no QR; identity intact). No-op if
+    /// no connection task is parked on the notify (caller handles the offline case
+    /// by starting a fresh `connect`).
+    pub fn request_reconnect(&self) {
+        self.restart_required
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.reconnect_notify.notify_waiters();
     }
 
     /// Record a just-sent message so a later inbound retry receipt can resend
@@ -1190,6 +1261,108 @@ impl Session {
         }
     }
 
+    /// Abort every background task this session owns — the connection/reconnect
+    /// driver and all its sub-tasks (keepalive, prekey top-up, QR rotation).
+    /// Used by `SessionManager::delete`: the driver holds its OWN `Arc<Session>`
+    /// clone and loops reconnecting, so just removing the session from the
+    /// registry leaves it alive — it keeps the socket open and re-emits
+    /// `Connected`, resurrecting a deleted session as a zombie. Aborting the
+    /// driver here drops its Arc; once the registry entry is gone too, the last
+    /// strong ref drops, the event sender closes, and the egress worker exits.
+    pub fn abort_all_tasks(&self) {
+        if let Some(h) = self.task_handle.lock().take() {
+            h.abort();
+        }
+        if let Some(h) = self.sync_deadline_handle.lock().take() {
+            h.abort();
+        }
+        self.cancel_keepalive();
+        self.cancel_prekey_topup();
+        self.cancel_qr_rotation();
+    }
+
+    /// Enter the post-login SYNC phase. Called on every `<success>`: the socket
+    /// is up and we're logged in, but the initial app-state (contacts/chats/
+    /// settings + LID↔PN maps) hasn't landed, so consumers must NOT send/receive
+    /// yet. Sets status `Syncing`, emits the `Syncing` event, resets the
+    /// per-connection completion tracking, and arms a fallback timer so the
+    /// session can never get stuck in `Syncing` if a sync signal never arrives.
+    /// Readiness (`Syncing → Connected`) is reached via `mark_collection_synced`
+    /// once every app-state collection is applied.
+    pub fn begin_sync(self: &Arc<Self>) {
+        /// Hard cap on the SYNC phase. App-state usually lands in 1–3s; on a
+        /// first pair it can wait on a key-share. Past this we promote to READY
+        /// anyway (a consumer waiting forever is worse than possibly-incomplete
+        /// contact names, which the background sweeps keep reconciling).
+        const SYNC_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        self.sync_ready
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.synced_collections.lock().clear();
+        self.set_status(SessionStatus::Syncing);
+        let _ = self.events.send(SessionEvent::Syncing);
+
+        // Arm the fallback timer (only inside a runtime — sync unit tests that
+        // drive the <success> handler have none and just skip the backstop).
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let weak = Arc::downgrade(self);
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(SYNC_READY_TIMEOUT).await;
+                if let Some(s) = weak.upgrade() {
+                    if !s.sync_ready.load(std::sync::atomic::Ordering::SeqCst) {
+                        tracing::warn!(
+                            session = %s.meta.read().id,
+                            "app-state sync did not complete within timeout — marking READY (fallback)"
+                        );
+                        s.mark_ready();
+                    }
+                }
+            });
+            if let Some(prev) = self.sync_deadline_handle.lock().replace(handle) {
+                prev.abort();
+            }
+        }
+    }
+
+    /// Record that an app-state `collection` has been applied this connection.
+    /// Once every collection in [`AppStateCollection::all`] is present, the
+    /// initial sync is complete and the session flips to READY (`Connected`).
+    /// Idempotent — re-marking a collection (e.g. a re-fetch after a key share)
+    /// is harmless.
+    pub fn mark_collection_synced(&self, collection: &str) {
+        let complete = {
+            let mut set = self.synced_collections.lock();
+            set.insert(collection.to_string());
+            AppStateCollection::all()
+                .iter()
+                .all(|c| set.contains(c.name()))
+        };
+        if complete {
+            self.mark_ready();
+        }
+    }
+
+    /// Promote `Syncing → Connected` and fire the `Connected` event — exactly
+    /// once per connection (guarded by `sync_ready`). Called when app-state sync
+    /// completes, or by the fallback timer. Aborts the (now-moot) deadline timer.
+    pub fn mark_ready(&self) {
+        if self
+            .sync_ready
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return; // already READY this connection
+        }
+        if let Some(h) = self.sync_deadline_handle.lock().take() {
+            h.abort();
+        }
+        self.set_status(SessionStatus::Connected);
+        let _ = self.events.send(SessionEvent::Connected);
+        tracing::info!(
+            session = %self.meta.read().id,
+            "session READY — app-state synced, now Connected"
+        );
+    }
+
     /// Push outbound work onto the send queue. Returns BadRequest if the
     /// connection task has shut down without resetting the queue (callers
     /// can treat that as "session offline" — the persisted message row is
@@ -1467,7 +1640,10 @@ impl SessionManager {
             let st = s.meta.read().status;
             if matches!(
                 st,
-                SessionStatus::Connecting | SessionStatus::Connected | SessionStatus::AwaitingQr
+                SessionStatus::Connecting
+                    | SessionStatus::Connected
+                    | SessionStatus::Syncing
+                    | SessionStatus::AwaitingQr
             ) {
                 s.set_status(SessionStatus::Disconnected);
             }
@@ -1508,9 +1684,9 @@ impl SessionManager {
                 // those two) can actually revive a paired session after a
                 // restart. Pending / LoggedOut are preserved as-is.
                 let status = match row.status.parse_session_status() {
-                    SessionStatus::Connecting | SessionStatus::Connected => {
-                        SessionStatus::Disconnected
-                    }
+                    SessionStatus::Connecting
+                    | SessionStatus::Connected
+                    | SessionStatus::Syncing => SessionStatus::Disconnected,
                     other => other,
                 };
                 SessionMeta {
@@ -1788,6 +1964,22 @@ impl SessionManager {
             updated_at: now,
         };
         let session = Arc::new(Session::new(meta));
+        // Imported sessions carry the device identity but NOT the per-peer Signal
+        // ratchet/OTK store, so the first inbound from each existing peer fails to
+        // decrypt until the session re-establishes. Arm a one-shot self-bounce on
+        // first login (consumed by the post-login-success handler) so that
+        // re-establishment kicks off automatically instead of waiting for an
+        // operator to hit Reconnect.
+        session
+            .import_rekey_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Also pull readable history once synced — the import didn't carry the
+        // per-peer Signal sessions, so history sync (content via the history-sync
+        // key) is how an imported session gets conversation content that the
+        // still-healing Signal sessions would otherwise miss.
+        session
+            .import_history_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.sessions
             .write()
             .insert(session.meta.read().id.clone(), session.clone());
@@ -2080,8 +2272,15 @@ impl SessionManager {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
+        // Stop the live session BEFORE deleting its rows. Removing it from the
+        // registry only drops one `Arc`; the connection/reconnect driver holds
+        // its own and would keep the socket alive, reconnect, and re-emit
+        // `Connected` — resurrecting the deleted session as a zombie. Abort all
+        // its tasks first so it can't, then delete (cascades leases/messages/…).
+        if let Some(session) = self.sessions.write().remove(id) {
+            session.abort_all_tasks();
+        }
         self.store.session_delete(id)?;
-        self.sessions.write().remove(id);
         Ok(())
     }
 
@@ -2101,7 +2300,10 @@ impl SessionManager {
     pub fn connect(self: &Arc<Self>, id: &str) -> Result<()> {
         let session = self.get(id)?;
         let current = session.meta.read().status;
-        if matches!(current, SessionStatus::Connecting | SessionStatus::Connected) {
+        if matches!(
+            current,
+            SessionStatus::Connecting | SessionStatus::Connected | SessionStatus::Syncing
+        ) {
             return Ok(());
         }
 
@@ -2170,6 +2372,35 @@ impl SessionManager {
         });
         session.set_task_handle(handle);
         Ok(())
+    }
+
+    /// Force a real reconnect ("rekey"): bounce the live socket and re-login
+    /// without re-pairing. Unlike [`connect`], which is idempotent and a NO-OP on
+    /// an already-`Connected` session, this always bounces — that's the whole
+    /// point. It heals sessions stuck on undecryptable inbound (notably ones
+    /// imported from Baileys, which carry the device identity but not the per-peer
+    /// Signal ratchet) the way a redeploy does: the re-login re-uploads prekeys,
+    /// re-announces presence, and the server re-delivers pending inbound, while a
+    /// cleared retry map gives stalled messages a fresh retry cycle.
+    ///
+    /// Live sessions are signalled to bounce in place (the driver re-logs-in
+    /// instantly via `restart_required`); an offline session is simply started.
+    pub fn reconnect(self: &Arc<Self>, id: &str) -> Result<()> {
+        let session = self.get(id)?;
+        session.clear_message_retries();
+        let status = session.meta.read().status;
+        if matches!(
+            status,
+            SessionStatus::Connected | SessionStatus::Connecting | SessionStatus::Syncing
+        ) {
+            session.request_reconnect();
+            Ok(())
+        } else {
+            // Not live (Disconnected / Blocked / LoggedOut / ProxyError) — there's
+            // no socket to bounce, so just (re)start the driver. `connect` clears
+            // the WA-block/expect-disconnect flags for a deliberate retry.
+            self.connect(id)
+        }
     }
 
     /// Set (or clear, with `None`) the session's egress proxy. Validates the URL
@@ -2411,6 +2642,12 @@ const RX_IDLE_TIMEOUT_SECS: i64 = 75;
 /// so worst-case detection latency is `RX_IDLE_TIMEOUT_SECS + RX_WATCHDOG_TICK_SECS`.
 const RX_WATCHDOG_TICK_SECS: u64 = 10;
 
+/// Delay before an imported session's one-shot post-login auto-rekey fires.
+/// Long enough that the first login finished app-state sync + prekey upload (so
+/// the bounce re-logs-in against a server that already has our fresh keys), short
+/// enough that the heal happens within seconds of coming online.
+const POST_IMPORT_REKEY_DELAY_SECS: u64 = 8;
+
 /// True when the last inbound frame is older than `timeout` seconds — i.e. the
 /// keepalive pong stream has stalled and the socket should be torn down and
 /// reconnected. `None` (nothing received yet) is never stale: the caller only
@@ -2595,9 +2832,12 @@ async fn run_connection(
         )
         .await?;
 
-        // Successful Noise XX → ready to read server-pushed nodes.
+        // Successful Noise XX → ready to read server-pushed nodes. This is only
+        // the TRANSPORT coming up (pre-login, pre-sync), so emit `Connecting`,
+        // not `Connected` — the `connected` signal is reserved for READY (login
+        // + app-state synced), fired from `mark_ready`.
         session.set_status(SessionStatus::AwaitingQr);
-        let _ = session.events.send(SessionEvent::Connected);
+        let _ = session.events.send(SessionEvent::Connecting);
 
         let mut socket = connection::NoiseSocket::new(ws, write, read);
 
@@ -2715,8 +2955,22 @@ async fn run_connection(
         rx_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let logout_notify = session.logout_notify.clone();
+        let reconnect_notify = session.reconnect_notify.clone();
         loop {
             tokio::select! {
+                _ = reconnect_notify.notified() => {
+                    // Manual reconnect ("rekey"): bounce the socket WITHOUT
+                    // unpairing. `request_reconnect` already set `restart_required`
+                    // so the reconnect loop re-logs-in immediately. Close the WS
+                    // cleanly first so WhatsApp frees the device slot and the
+                    // re-login is a fresh login, not a race into <conflict>.
+                    tracing::info!(
+                        session = %session.meta.read().id,
+                        "manual reconnect requested — bouncing socket (no unpair)"
+                    );
+                    let _ = socket.send_close().await;
+                    return Err(anyhow::anyhow!("manual reconnect requested"));
+                }
                 _ = rx_watchdog.tick() => {
                     // Pre-`<success>` (handshake / QR-pairing) the stream is
                     // legitimately quiet and paced by its own IQs — don't arm.
@@ -4907,11 +5161,15 @@ fn process_inbound_node(
     // messages + notifications to us. Without this, our linked-device
     // socket sees nothing.
     if node.tag == "success" {
-        session.set_status(SessionStatus::Connected);
+        // Logged in, but the initial app-state hasn't landed yet. Enter SYNC
+        // (status `Syncing` + `syncing` event) rather than declaring `Connected`
+        // immediately — the `connected` signal is deferred until app-state is
+        // applied (see `begin_sync` / `mark_collection_synced`) so consumers
+        // don't send/receive against unsynced contacts/chats/LID maps.
         session
             .reached_success
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = session.events.send(SessionEvent::Connected);
+        session.begin_sync();
         if let Some(d) = dispatcher {
             use crate::protocol::binary::{Attrs, Content, Node};
             // 1. SetPassive(false) — registers us as the active recipient.
@@ -5021,6 +5279,56 @@ fn process_inbound_node(
                 presence,
                 "shipped presence",
             );
+
+            // 3b. One-shot post-import auto-rekey. An imported session
+            //     (Baileys/Evolution) just logged in for the first time with
+            //     prekeys now registered server-side but no per-peer Signal
+            //     ratchet — so a short bounce re-triggers re-delivery + a clean
+            //     retry cycle, healing the first wave of undecryptable inbound
+            //     without an operator hitting Reconnect. `swap` makes it fire
+            //     exactly once: the bounce's own re-login sees the flag cleared,
+            //     so it doesn't loop.
+            if session
+                .import_rekey_pending
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                let s = session.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(POST_IMPORT_REKEY_DELAY_SECS))
+                        .await;
+                    tracing::info!(
+                        session = %s.meta.read().id,
+                        "post-import auto-rekey: bouncing once to flush initial desync"
+                    );
+                    s.clear_message_retries();
+                    s.request_reconnect();
+                });
+            }
+
+            // 3c. One-shot post-import history backfill. Once the imported session
+            //     reaches READY (app-state synced → the chat list exists), pull
+            //     on-demand history for the most-recently-active chats so readable
+            //     conversation content arrives via the history-sync key, regardless
+            //     of how the per-peer Signal sessions (which the import didn't
+            //     carry) are healing. Waits for READY off the recv loop; bounded.
+            if session
+                .import_history_pending
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                let s = session.clone();
+                let st = Arc::clone(store);
+                let sid = session_id.clone();
+                tokio::spawn(async move {
+                    // Wait up to ~30s for app-state sync to land the chat list.
+                    for _ in 0..60 {
+                        if matches!(s.meta.read().status, SessionStatus::Connected) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    backfill_recent_chats_on_import(&st, &s, &sid);
+                });
+            }
 
             // 4. Kick off app-state sync. The strong working hypothesis
             //    in INBOUND_HANDOVER.md (git history) is that WA's server gates inbound
@@ -5571,13 +5879,17 @@ fn apply_pair_success(
     {
         let mut m = session.meta.write();
         m.jid = jid.clone();
-        m.status = SessionStatus::Connected;
         m.updated_at = now;
     }
     if let Some(j) = jid {
         let _ = session.events.send(SessionEvent::Paired { jid: j });
     }
-    let _ = session.events.send(SessionEvent::Connected);
+    // Pairing succeeded, but app-state isn't synced and a 515 restart + re-login
+    // is imminent (which runs `begin_sync` again via `<success>`). Enter SYNC
+    // now rather than declaring `Connected` — readiness is reserved for after
+    // app-state lands, so a consumer doesn't act on a just-paired-but-empty
+    // session.
+    session.begin_sync();
     session.cancel_qr_rotation();
 
     // 8. Build the self-signed identity for the wire: clone, drop the
@@ -6383,6 +6695,16 @@ fn process_inbound_message(
                     "enc_type": enc_type,
                 }),
             ),
+            InboundContent::Template { text, buttons } => (
+                "template".to_string(),
+                text.clone(),
+                serde_json::json!({
+                    "type": "template",
+                    "text": text,
+                    "buttons": buttons,
+                    "enc_type": enc_type,
+                }),
+            ),
             InboundContent::Edited { target_id, text } => (
                 "edited".to_string(),
                 text.clone(),
@@ -6407,8 +6729,10 @@ fn process_inbound_message(
     // in the match arms above). They are NOT chat content: persisting/emitting
     // them dumped "sync notif" rows into the self-chat. Still ack them below
     // (the receipt path runs regardless); just don't store or surface them.
-    let is_protocol_only =
-        matches!(msg_type.as_str(), "history_sync_notification" | "app_state_sync_key_share");
+    let is_protocol_only = matches!(
+        msg_type.as_str(),
+        "history_sync_notification" | "app_state_sync_key_share" | "protocol"
+    );
 
     // Route + label for storage. A deviceSentMessage is OUR outbound from
     // another device: the conversation is its destinationJid and from_me=true —
@@ -6548,6 +6872,14 @@ fn process_inbound_message(
         if let Some(contacts) = payload.get("contacts") {
             body_obj.insert("contacts".into(), contacts.clone());
         }
+        // Surface a template message's tappable button labels (when any) so an
+        // agent can see the available replies. Sourced from the payload built
+        // above for `type:"template"`; omitted when there are no buttons.
+        if let Some(buttons) =
+            payload.get("buttons").filter(|b| b.as_array().is_some_and(|a| !a.is_empty()))
+        {
+            body_obj.insert("buttons".into(), buttons.clone());
+        }
         body_obj.insert("push_name".into(), serde_json::json!(push_name));
         body_obj.insert("from_me".into(), serde_json::json!(store_from_me));
         let _ = session.events.send(SessionEvent::Message {
@@ -6586,7 +6918,15 @@ fn process_inbound_message(
             // storm that also starved real traffic).
             // A real, permanent decrypt failure — the only one worth flagging.
             metrics::incr(&metrics::DECRYPT_FAILURES);
-            tracing::warn!(id = %msg_id, "giving up after 5 retries — acking as delivered to stop redelivery");
+            tracing::warn!(
+                session = %session_id,
+                id = %msg_id,
+                participant = %participant,
+                from_me = is_from_me,
+                enc_type = %enc_type,
+                retries = count,
+                "decrypt PERMANENTLY failed (gave up after 5 retries) — acking delivered; this message is LOST. from_me=true means own-device fan-out (another of our devices / WhatsApp Web)"
+            );
             return Some(build_receipt(&msg_id, &from, &participant, is_from_me, &msg_type_attr));
         }
         // On the FIRST failure, also ask our own phone to resend the message
@@ -6615,13 +6955,15 @@ fn process_inbound_message(
         }
         let keys_node = build_retry_keys_node(store, &session_id, keys);
         tracing::info!(
+            session = %session_id,
             id = %msg_id,
             to = %from,
             participant = %participant,
+            from_me = is_from_me,
             count,
             has_keys = keys_node.is_some(),
             enc_type = %enc_type,
-            "sending retry receipt (asking sender to re-establish + resend)"
+            "decrypt failed — sending retry receipt (asking sender to re-establish + resend); from_me=true is own-device fan-out"
         );
         Some(build_retry_receipt(
             &msg_id,
@@ -6631,6 +6973,9 @@ fn process_inbound_message(
             keys.registration_id,
             count,
             keys_node,
+            // Own-account fan-out → tag the retry `category="peer"` so the phone
+            // actually receives the re-request and resends.
+            category.as_deref() == Some("peer"),
         ))
     } else {
         // If we'd previously asked this sender to retry this exact id (its
@@ -7106,6 +7451,20 @@ fn classify_e2e_message(
         {
             return InboundContent::Typed { kind: "revoked".into(), text: None };
         }
+        // Any OTHER protocolMessage subtype (ephemeral/disappearing-timer
+        // setting, peer-data operation, key-request, …) is a control message
+        // with NO chat-visible content. Earlier this stringified the numeric
+        // `type` into `text`, so an EPHEMERAL_SETTING (type 3) surfaced as a chat
+        // bubble reading "3" — bots replied to it as if it were a user message.
+        // Label it "protocol" with no text; the receive path treats "protocol" as
+        // protocol-only (ack but don't store/emit). The subtype is logged for
+        // diagnostics. `msg.protocol_message` is consumed here, so this catch MUST
+        // live inside the block — by the `Other` tail it's already None.
+        tracing::debug!(
+            protocol_type = %protocol_message_type_name(ptype),
+            "ignoring control protocolMessage (no chat-visible content)"
+        );
+        return InboundContent::Typed { kind: "protocol".into(), text: None };
     }
 
     // ── Interactive / business / reply messages: surface their visible text as
@@ -7174,10 +7533,96 @@ fn classify_e2e_message(
     if let Some(gi) = msg.group_invite_message.as_ref() {
         return InboundContent::Typed { kind: "group_invite".into(), text: gi.group_name.clone() };
     }
-    if msg.template_message.is_some() {
-        return InboundContent::Typed { kind: "template".into(), text: None };
+    if let Some(tpl) = msg.template_message.as_deref() {
+        let (text, buttons) = extract_template(tpl);
+        return InboundContent::Template { text, buttons };
     }
 
+    // ── Newer content types that were falling through to "unknown". ──
+    // A round video note ("PTV") is a VideoMessage under its own field — same
+    // transport keys, so surface it as downloadable Video media.
+    if let Some(ptv) = msg.ptv_message.as_ref() {
+        return InboundContent::Media {
+            kind: crate::media::MediaType::Video,
+            url: ptv.url.clone(),
+            direct_path: ptv.direct_path.clone(),
+            mimetype: ptv.mimetype.clone(),
+            media_key: ptv.media_key.clone(),
+            caption: ptv.caption.clone(),
+            file_length: ptv.file_length,
+        };
+    }
+    // Encrypted reaction / poll vote / poll result / event / album / pin / keep:
+    // the emoji or vote is separately sealed (no plaintext here), so text stays
+    // None — but a typed marker keeps them out of the "unknown" bucket.
+    if msg.enc_reaction_message.is_some() {
+        return InboundContent::Typed { kind: "reaction".into(), text: None };
+    }
+    if msg.poll_update_message.is_some() {
+        return InboundContent::Typed { kind: "poll_vote".into(), text: None };
+    }
+    if msg.poll_result_snapshot_message.is_some() {
+        return InboundContent::Typed { kind: "poll_result".into(), text: None };
+    }
+    if let Some(ev) = msg.event_message.as_ref() {
+        return InboundContent::Typed { kind: "event".into(), text: ev.name.clone() };
+    }
+    if msg.album_message.is_some() {
+        return InboundContent::Typed { kind: "album".into(), text: None };
+    }
+    if msg.pin_in_chat_message.is_some() {
+        return InboundContent::Typed { kind: "pin".into(), text: None };
+    }
+    if msg.keep_in_chat_message.is_some() {
+        return InboundContent::Typed { kind: "keep".into(), text: None };
+    }
+
+    // Still nothing recognized: log WHICH field was actually set so the
+    // remaining "unknown" rows are diagnosable from prod logs (field NAME only,
+    // never content — no PII). Inlined rather than a `&msg` helper because by
+    // here `msg` is partially moved, so only per-field borrows are allowed.
+    // `protocol_*` is handled above, so it won't appear here.
+    let hint: &str = if msg.sender_key_distribution_message.is_some() {
+        "sender_key_distribution_message"
+    } else if msg.secret_encrypted_message.is_some() {
+        "secret_encrypted_message"
+    } else if msg.message_context_info.is_some() {
+        "message_context_info"
+    } else if msg.spoiler_message.is_some() {
+        "spoiler_message"
+    } else if msg.group_mentioned_message.is_some() {
+        "group_mentioned_message"
+    } else if msg.comment_message.is_some() {
+        "comment_message"
+    } else if msg.enc_comment_message.is_some() {
+        "enc_comment_message"
+    } else if msg.product_message.is_some() {
+        "product_message"
+    } else if msg.order_message.is_some() {
+        "order_message"
+    } else if msg.invoice_message.is_some() {
+        "invoice_message"
+    } else if msg.live_location_message.is_some() {
+        "live_location_message"
+    } else if msg.bot_invoke_message.is_some() {
+        "bot_invoke_message"
+    } else if msg.call_log_messsage.is_some() {
+        "call_log_message"
+    } else if msg.lottie_sticker_message.is_some() {
+        "lottie_sticker_message"
+    } else if msg.sticker_pack_message.is_some() {
+        "sticker_pack_message"
+    } else if msg.question_message.is_some() {
+        "question_message"
+    } else if msg.interactive_response_message.is_some() {
+        "interactive_response_message"
+    } else {
+        "unmapped"
+    };
+    tracing::info!(
+        field = hint,
+        "classify: unrecognized message content — stored as unknown"
+    );
     InboundContent::Other
 }
 
@@ -7216,6 +7661,12 @@ enum InboundContent {
     /// numbers parsed from its vCard so webhook consumers get the number(s)
     /// without parsing the raw card.
     Contacts { display_name: Option<String>, cards: Vec<ContactCard> },
+    /// A business `TemplateMessage` (HSM): a structured title/body/footer with
+    /// tappable buttons, sent by business/notification accounts (order updates,
+    /// OTPs, reminders, …). `text` is the visible content (title + body + footer,
+    /// newline-joined); `buttons` the tappable labels, surfaced separately so an
+    /// agent can see the available replies without parsing the body.
+    Template { text: Option<String>, buttons: Vec<String> },
     /// A message EDIT (modern `SecretEncryptedMessage` or legacy
     /// `protocolMessage{MESSAGE_EDIT}`). `target_id` is the ORIGINAL message's
     /// stanza id; `text` the new content (`None` when we couldn't unseal it).
@@ -7322,6 +7773,88 @@ fn media_webhook_descriptor(
     }
 }
 
+/// Map a `ProtocolMessage.type` enum value to a stable, human-readable name for
+/// diagnostics. These are control messages (no chat-visible content); we only log
+/// which subtype arrived. Unknown/absent values fall back to the numeric form so
+/// new WhatsApp control types are still identifiable in logs.
+fn protocol_message_type_name(t: Option<i32>) -> std::borrow::Cow<'static, str> {
+    use crate::proto::wa_web_protobufs_e2e::protocol_message::Type;
+    match t.and_then(|v| Type::try_from(v).ok()) {
+        Some(Type::Revoke) => "revoke".into(),
+        Some(Type::EphemeralSetting) => "ephemeral_setting".into(),
+        Some(Type::EphemeralSyncResponse) => "ephemeral_sync_response".into(),
+        Some(Type::HistorySyncNotification) => "history_sync_notification".into(),
+        Some(Type::AppStateSyncKeyShare) => "app_state_sync_key_share".into(),
+        Some(Type::AppStateSyncKeyRequest) => "app_state_sync_key_request".into(),
+        Some(Type::MsgFanoutBackfillRequest) => "msg_fanout_backfill_request".into(),
+        Some(Type::InitialSecurityNotificationSettingSync) => {
+            "initial_security_notification_setting_sync".into()
+        }
+        Some(Type::AppStateFatalExceptionNotification) => {
+            "app_state_fatal_exception_notification".into()
+        }
+        Some(Type::SharePhoneNumber) => "share_phone_number".into(),
+        Some(Type::MessageEdit) => "message_edit".into(),
+        Some(Type::PeerDataOperationRequestMessage) => "peer_data_operation_request".into(),
+        Some(Type::PeerDataOperationRequestResponseMessage) => {
+            "peer_data_operation_request_response".into()
+        }
+        Some(other) => format!("{other:?}").into(),
+        None => t.map(|v| v.to_string()).unwrap_or_else(|| "none".into()).into(),
+    }
+}
+
+/// Pull the human-readable text (title + body + footer, newline-joined) and the
+/// button labels out of a business `TemplateMessage`. WhatsApp delivers these to
+/// companions in "hydrated" form — either the explicit `hydratedTemplate` field
+/// or the hydrated variant of the `format` oneof. The legacy non-hydrated
+/// `FourRowTemplate` carries its text as `HighlyStructuredMessage` params we
+/// don't unpack here, so it yields `(None, [])`.
+fn extract_template(
+    tpl: &crate::proto::wa_web_protobufs_e2e::TemplateMessage,
+) -> (Option<String>, Vec<String>) {
+    use crate::proto::wa_web_protobufs_e2e::hydrated_template_button::HydratedButton;
+    use crate::proto::wa_web_protobufs_e2e::template_message::{
+        hydrated_four_row_template::Title, Format, HydratedFourRowTemplate,
+    };
+
+    let hydrated: Option<&HydratedFourRowTemplate> =
+        tpl.hydrated_template.as_deref().or_else(|| match tpl.format.as_ref() {
+            Some(Format::HydratedFourRowTemplate(h)) => Some(h.as_ref()),
+            _ => None,
+        });
+    let Some(h) = hydrated else {
+        return (None, Vec::new());
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(Title::HydratedTitleText(t)) = h.title.as_ref() {
+        if !t.is_empty() {
+            lines.push(t.clone());
+        }
+    }
+    if let Some(c) = h.hydrated_content_text.as_ref().filter(|s| !s.is_empty()) {
+        lines.push(c.clone());
+    }
+    if let Some(f) = h.hydrated_footer_text.as_ref().filter(|s| !s.is_empty()) {
+        lines.push(f.clone());
+    }
+    let text = (!lines.is_empty()).then(|| lines.join("\n"));
+
+    let buttons = h
+        .hydrated_buttons
+        .iter()
+        .filter_map(|b| match b.hydrated_button.as_ref()? {
+            HydratedButton::QuickReplyButton(q) => q.display_text.clone(),
+            HydratedButton::UrlButton(u) => u.display_text.clone(),
+            HydratedButton::CallButton(c) => c.display_text.clone(),
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    (text, buttons)
+}
+
 fn media_kind_str(kind: crate::media::MediaType) -> &'static str {
     use crate::media::MediaType;
     match kind {
@@ -7380,6 +7913,7 @@ fn build_receipt(
 /// `<keys>` re-establishment bundle so the sender can rebuild a desynced Signal
 /// session. `count` escalates per message id (see
 /// [`Session::bump_message_retry`]).
+#[allow(clippy::too_many_arguments)]
 fn build_retry_receipt(
     msg_id: &str,
     from: &str,
@@ -7388,6 +7922,7 @@ fn build_retry_receipt(
     registration_id: u32,
     count: u32,
     keys_node: Option<crate::protocol::binary::Node>,
+    peer_category: bool,
 ) -> crate::protocol::binary::Node {
     use crate::protocol::binary::{Attrs, Content, Node};
     let mut top = Attrs::new();
@@ -7396,6 +7931,15 @@ fn build_retry_receipt(
     top.insert("to".into(), from.into());
     if !participant.is_empty() && participant != from {
         top.insert("participant".into(), participant.into());
+    }
+    // Own-device fan-out (a `category="peer"` message from ourselves, e.g. an
+    // operator typing on the phone / WhatsApp Web) must carry `category="peer"`
+    // on the retry receipt too — otherwise the server doesn't route the re-request
+    // to our own account and the phone never re-encrypts/resends, leaving the
+    // message permanently undecryptable. Mirrors whatsmeow's
+    // `if info.Type == "peer_msg" && info.IsFromMe { attrs["category"] = "peer" }`.
+    if peer_category {
+        top.insert("category".into(), "peer".into());
     }
 
     let mut retry_attrs = Attrs::new();
@@ -8041,6 +8585,52 @@ async fn request_message_from_phone(
 
 /// Marshal an on-demand history-sync request: a `waE2E.Message` whose
 /// `ProtocolMessage` is a `PEER_DATA_OPERATION_REQUEST_MESSAGE` of type
+/// Post-import one-shot (armed by `import_session`, fired once at first READY):
+/// request on-demand history for the most-recently-active chats so a freshly
+/// imported session pulls readable conversation content through the history-sync
+/// key — independent of the per-peer Signal sessions the import didn't carry.
+/// Bounded to the top `MAX_CHATS` non-archived chats with `PER_CHAT` messages
+/// each; best-effort (each request is enqueued like any peer message and survives
+/// a reconnect). Anchors at each chat's oldest stored message and pulls the
+/// window before it (on-demand history sync only goes older-than-anchor).
+fn backfill_recent_chats_on_import(store: &Arc<Store>, session: &Arc<Session>, session_id: &str) {
+    const MAX_CHATS: usize = 20;
+    const PER_CHAT: u32 = 50;
+    let mut chats = match store.chats_list(session_id) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(session = %session_id, error = %e, "post-import backfill: chats_list failed");
+            return;
+        }
+    };
+    chats.retain(|c| !c.archived);
+    chats.sort_by_key(|c| std::cmp::Reverse(c.last_msg_ts.unwrap_or(0)));
+    let mut fired = 0usize;
+    for ch in chats.into_iter().take(MAX_CHATS) {
+        if let Ok(Some((oldest_id, oldest_from_me, oldest_ts))) =
+            store.message_oldest_for_chat(session_id, &ch.jid)
+        {
+            if session
+                .enqueue_send(SendOp::PeerHistoryRequest {
+                    chat: ch.jid.clone(),
+                    oldest_id,
+                    oldest_from_me,
+                    oldest_ts,
+                    count: PER_CHAT,
+                })
+                .is_ok()
+            {
+                fired += 1;
+            }
+        }
+    }
+    tracing::info!(
+        session = %session_id,
+        chats = fired,
+        "post-import history backfill: requested on-demand history for recent chats"
+    );
+}
+
 /// `HISTORY_SYNC_ON_DEMAND`, asking the phone to resend `count` messages
 /// immediately before the given oldest message in `chat`. Mirrors whatsmeow's
 /// `BuildHistorySyncRequest`. NOTE: `oldestMsgTimestampMS` is, despite its
@@ -8216,7 +8806,7 @@ fn store_save_record(
 /// real WA Web app rolls; the server soft-rejects very old versions. This is
 /// the compiled-in default; `RUWA_WA_VERSION` overrides it at runtime via
 /// [`wa_version`] so a server-side version bump can be chased without a rebuild.
-pub const WA_VERSION: [u32; 3] = [2, 3000, 1040390703];
+pub const WA_VERSION: [u32; 3] = [2, 3000, 1041871181];
 
 /// Effective WA Web version: `RUWA_WA_VERSION` (`"a.b.c"`, all-numeric) if set
 /// and parseable, else the compiled-in [`WA_VERSION`]. Read + parsed once and
@@ -10001,7 +10591,14 @@ async fn run_lid_pn_sweep(store: Arc<Store>, session_id: String, dispatcher: Con
     const MAX_TOTAL: u32 = 400;
     const BATCH: usize = 50;
 
-    let targets = match store.chat_pns_without_name(&session_id, MAX_TOTAL) {
+    // Resolve the LID for every PN contact/chat we still lack a mapping for —
+    // NOT just unnamed chats. The read-side collapse folds a contact's `@lid`
+    // duplicate into their PN row only once `lid_pn_map` holds the pair, so a
+    // NAMED contact keeps showing up twice (LID + PN) until its LID is resolved.
+    // The server is authoritative for the pairing; usync asks it directly.
+    // Bounded by MAX_TOTAL per connect, so a large book converges over a few
+    // reconnects (resolved pairs drop out of the query next time).
+    let targets = match store.pns_without_lid_mapping(&session_id, MAX_TOTAL) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "lid-pn sweep: target query failed");
@@ -10011,7 +10608,7 @@ async fn run_lid_pn_sweep(store: Arc<Store>, session_id: String, dispatcher: Con
     if targets.is_empty() {
         return;
     }
-    tracing::info!(count = targets.len(), "lid-pn sweep: resolving LIDs for unnamed chats");
+    tracing::info!(count = targets.len(), "lid-pn sweep: resolving LIDs for unmapped PN contacts/chats");
 
     let now = chrono::Utc::now().timestamp();
     let mut learned = 0usize;
@@ -10028,7 +10625,20 @@ async fn run_lid_pn_sweep(store: Arc<Store>, session_id: String, dispatcher: Con
             Err(e) => tracing::warn!(error = %e, "lid-pn sweep: usync batch failed"),
         }
     }
-    tracing::info!(learned, "lid-pn sweep: complete (names resolve on next chats fetch)");
+    // Re-run chat consolidation now that we hold the freshly-learned mappings, so
+    // a contact's `@lid` chat folds into their PN chat this pass instead of
+    // waiting for the next connect. (Contacts collapse at READ time, so they need
+    // no write-side step — the new mappings take effect on the next list fetch.)
+    if learned > 0 {
+        match store.consolidate_lid_chats(&session_id) {
+            Ok(n) if n > 0 => {
+                tracing::info!(session = %session_id, rekeyed = n, "consolidated @lid chats into PN (post-sweep)")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(session = %session_id, error = %e, "post-sweep lid chat consolidation failed"),
+        }
+    }
+    tracing::info!(learned, "lid-pn sweep: complete (LID×PN duplicates now collapse on next list fetch)");
 }
 
 pub fn build_app_state_fetch_iq(
@@ -10751,10 +11361,16 @@ async fn handle_app_state_sync_iq(
 
     for collection in collections.iter().filter(|c| c.tag == "collection") {
         let name = collection.attrs.get("name").cloned().unwrap_or_default();
+        // Track per-collection key gaps so we only count a collection toward
+        // READY once all its records actually decoded (see end of loop).
+        let missing_before = missing_keys.len();
         let children = match &collection.content {
             Content::Nodes(ns) => ns.as_slice(),
             _ => {
                 tracing::info!(collection = %name, attrs = ?collection.attrs, "app-state collection has no child nodes");
+                // No snapshot/patches => already at the server's version for this
+                // collection. Counts toward initial-sync completion.
+                session.mark_collection_synced(&name);
                 continue;
             }
         };
@@ -10870,6 +11486,14 @@ async fn handle_app_state_sync_iq(
                 }
                 _ => {}
             }
+        }
+
+        // Collection fully walked. If nothing was held back for a missing key,
+        // it's synced; otherwise a key-share + re-fetch will complete it later
+        // (and re-mark it then). Once all collections are marked, the session
+        // flips Syncing → Connected (READY).
+        if missing_keys.len() == missing_before {
+            session.mark_collection_synced(&name);
         }
     }
 
@@ -11444,6 +12068,11 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
                             text.clone(),
                             serde_json::json!({"type":kind,"text":text,"source":"history_sync"}),
                         ),
+                        InboundContent::Template { text, buttons } => (
+                            "template".to_string(),
+                            text.clone(),
+                            serde_json::json!({"type":"template","text":text,"buttons":buttons,"source":"history_sync"}),
+                        ),
                         InboundContent::Contacts { display_name, cards } => (
                             "contact".to_string(),
                             display_name.clone(),
@@ -11706,6 +12335,7 @@ impl SessionStatus {
             SessionStatus::Pending => "pending",
             SessionStatus::Connecting => "connecting",
             SessionStatus::AwaitingQr => "awaiting_qr",
+            SessionStatus::Syncing => "syncing",
             SessionStatus::Connected => "connected",
             SessionStatus::Disconnected => "disconnected",
             SessionStatus::ProxyError => "proxy_error",
@@ -11723,6 +12353,7 @@ impl ParseStatus for String {
         match self.as_str() {
             "connecting" => SessionStatus::Connecting,
             "awaiting_qr" => SessionStatus::AwaitingQr,
+            "syncing" => SessionStatus::Syncing,
             "connected" => SessionStatus::Connected,
             "disconnected" => SessionStatus::Disconnected,
             "proxy_error" => SessionStatus::ProxyError,
@@ -12562,6 +13193,83 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_bounces_live_session_clearing_retries() {
+        // A real reconnect ("rekey") on an already-connected session must clear
+        // the in-flight retry map AND flag an immediate restart, so the live
+        // driver bounces the socket and re-logs-in (vs `connect`, which no-ops
+        // when already connected). This is the heal path for stuck-undecryptable
+        // imported sessions.
+        let mgr = std::sync::Arc::new(manager());
+        let sid = mgr.create(None).unwrap().meta.read().id.clone();
+        let session = mgr.get(&sid).unwrap();
+        let ord = std::sync::atomic::Ordering::Relaxed;
+
+        session.set_status(SessionStatus::Connected);
+        session.bump_message_retry("M1");
+        session.bump_message_retry("M2");
+        assert_eq!(session.message_retries.lock().len(), 2);
+        assert!(!session.restart_required.load(ord));
+
+        mgr.reconnect(&sid).unwrap();
+
+        assert!(
+            session.message_retries.lock().is_empty(),
+            "reconnect clears the in-flight retry map"
+        );
+        assert!(
+            session.restart_required.load(ord),
+            "reconnect on a live session flags an immediate restart (socket bounce)"
+        );
+    }
+
+    #[test]
+    fn import_session_arms_one_shot_post_import_rekey() {
+        // An imported (Baileys) session carries identity but no per-peer ratchet,
+        // so it's armed for a one-shot post-login self-bounce. Verify import sets
+        // the flag and that the post-login `swap` consumes it exactly once (so the
+        // bounce's own re-login doesn't re-arm into a loop).
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let mgr = manager();
+        let b32 = B64.encode([7u8; 32]);
+        let b64sig = B64.encode([9u8; 64]);
+        let creds = serde_json::json!({
+            "registrationId": 42,
+            "noiseKey": { "private": b32, "public": b32 },
+            "signedIdentityKey": { "private": b32, "public": b32 },
+            "signedPreKey": {
+                "keyId": 1,
+                "keyPair": { "private": b32, "public": b32 },
+                "signature": b64sig
+            },
+            "advSecretKey": b32,
+            "account": {
+                "details": B64.encode([1u8, 2, 3]),
+                "accountSignatureKey": b32,
+                "accountSignature": b64sig,
+                "deviceSignature": b64sig
+            },
+            "me": { "id": "5511999999999:4@s.whatsapp.net", "name": "Tester" },
+            "platform": "android"
+        });
+        let imported = ImportedCreds::from_baileys_json(&creds).unwrap();
+        let (session, _key) = mgr.import_session(None, imported).unwrap();
+        let ord = std::sync::atomic::Ordering::Relaxed;
+
+        assert!(
+            session.import_rekey_pending.load(ord),
+            "import arms the one-shot post-import auto-rekey"
+        );
+        assert!(
+            session.import_rekey_pending.swap(false, ord),
+            "first consume returns true"
+        );
+        assert!(
+            !session.import_rekey_pending.swap(false, ord),
+            "auto-rekey fires only once — no reconnect loop"
+        );
+    }
+
+    #[test]
     fn jittered_backoff_stays_in_upper_half() {
         // frac=0 keeps exactly half; frac=1 reaches the full base; mid is between.
         assert_eq!(jittered_backoff_ms(1000, 0.0), 500);
@@ -13098,6 +13806,115 @@ mod tests {
         assert_eq!(remaining, 0, "ON DELETE CASCADE should drop prekeys");
     }
 
+    #[tokio::test]
+    async fn delete_aborts_live_session_tasks() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let mgr = manager();
+        let session = mgr.create(None).unwrap();
+        let id = session.meta.read().id.clone();
+
+        // Stand in for the connection/reconnect driver: a task that loops
+        // forever bumping a counter. If delete() fails to abort it, it keeps
+        // running after the session is gone — exactly the zombie that re-emits
+        // `Connected` and resurrects a deleted session.
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticks_task = Arc::clone(&ticks);
+        let handle = tokio::spawn(async move {
+            loop {
+                ticks_task.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        session.set_task_handle(handle);
+        // Keep only the registry's reference, so delete() owns the last live Arc
+        // path through the driver handle (mirrors production).
+        drop(session);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(ticks.load(Ordering::SeqCst) > 0, "driver should be ticking before delete");
+
+        mgr.delete(&id).unwrap();
+
+        // Let any in-flight iteration reach its await point and get cancelled,
+        // then confirm the counter is frozen — the driver is truly dead.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after_delete = ticks.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            ticks.load(Ordering::SeqCst),
+            after_delete,
+            "delete() must abort the connection driver — it kept ticking (zombie)"
+        );
+        assert!(mgr.get(&id).is_err(), "deleted session must be gone from the registry");
+    }
+
+    #[tokio::test]
+    async fn sync_phase_holds_until_all_collections_then_connects() {
+        let mgr = manager();
+        let session = mgr.create(None).unwrap();
+        let mut rx = session.events.subscribe();
+
+        // <success> → SYNC (not Connected). A `syncing` event is emitted.
+        session.begin_sync();
+        assert_eq!(session.meta.read().status, SessionStatus::Syncing);
+        assert!(
+            matches!(rx.try_recv(), Ok(SessionEvent::Syncing)),
+            "begin_sync emits Syncing"
+        );
+
+        // Marking all-but-one collection keeps it in SYNC — consumers must wait.
+        let all = AppStateCollection::all();
+        for c in &all[..all.len() - 1] {
+            session.mark_collection_synced(c.name());
+        }
+        assert_eq!(
+            session.meta.read().status,
+            SessionStatus::Syncing,
+            "still syncing until EVERY collection lands"
+        );
+
+        // The final collection flips to READY (Connected) and fires `connected`.
+        session.mark_collection_synced(all[all.len() - 1].name());
+        assert_eq!(session.meta.read().status, SessionStatus::Connected);
+        let mut saw_connected = false;
+        while let Ok(ev) = rx.try_recv() {
+            saw_connected |= matches!(ev, SessionEvent::Connected);
+        }
+        assert!(saw_connected, "Connected event fires exactly when READY");
+
+        // Idempotent: a redundant mark_ready does not re-fire Connected.
+        session.mark_ready();
+        assert!(
+            rx.try_recv().is_err(),
+            "no duplicate Connected after readiness"
+        );
+    }
+
+    #[test]
+    fn retry_receipt_tags_peer_category_only_for_own_fanout() {
+        use crate::protocol::binary::Content;
+        // Own-device fan-out (the inbound carried category="peer") → the retry
+        // receipt MUST carry category="peer" so the server routes the re-request
+        // to our own phone, which re-encrypts and resends. Without it the message
+        // stays permanently undecryptable.
+        let own = build_retry_receipt("MID", "me@s.whatsapp.net", "", 1234, 7, 1, None, true);
+        assert_eq!(own.attrs.get("category").map(String::as_str), Some("peer"));
+        assert_eq!(own.attrs.get("type").map(String::as_str), Some("retry"));
+        // An ordinary peer message (not own fan-out) gets no category tag.
+        let peer = build_retry_receipt("MID", "x@s.whatsapp.net", "", 1234, 7, 1, None, false);
+        assert_eq!(peer.attrs.get("category"), None);
+        // The retry child + count are still present in both.
+        match &own.content {
+            Content::Nodes(ns) => {
+                let retry = ns.iter().find(|n| n.tag == "retry").expect("retry child");
+                assert_eq!(retry.attrs.get("count").map(String::as_str), Some("1"));
+            }
+            _ => panic!("expected receipt child nodes"),
+        }
+    }
+
     #[test]
     fn version_hash_matches_md5_of_dotted_string() {
         // The known MD5 of "2.3000.1038187123" — generated independently as
@@ -13298,10 +14115,10 @@ mod tests {
         );
         assert!(reply.is_none(), "success returns no synchronous ack");
 
-        // Status flips to Connected.
+        // <success> enters SYNC (not Connected) — readiness waits on app-state.
         assert!(matches!(
             session.meta.read().status,
-            SessionStatus::Connected
+            SessionStatus::Syncing
         ));
 
         // 1. SetPassive(false) IQ.
@@ -13814,9 +14631,10 @@ mod tests {
         assert_eq!(ack.attrs.get("type").map(String::as_str), Some("result"));
         assert_eq!(ack.attrs.get("id").map(String::as_str), Some("ps-iq-1"));
 
-        // In-memory meta updated.
+        // In-memory meta updated. Pair-success now enters SYNC (a 515 restart +
+        // re-login + app-state sync follows before READY/Connected).
         let m = session.meta.read();
-        assert_eq!(m.status, SessionStatus::Connected);
+        assert_eq!(m.status, SessionStatus::Syncing);
         assert_eq!(
             m.jid.as_deref(),
             Some("5511999999999:23@s.whatsapp.net")
@@ -13944,7 +14762,7 @@ mod tests {
             "ps",
         );
         process_inbound_node(&session, &mgr.store, &keys, None, &iq).unwrap();
-        assert_eq!(session.meta.read().status, SessionStatus::Connected);
+        assert_eq!(session.meta.read().status, SessionStatus::Syncing);
 
         mgr.logout(&id).unwrap();
         let m = session.meta.read();
@@ -15102,6 +15920,157 @@ mod tests {
             InboundContent::Text(t) => assert_eq!(t, "Yes"),
             _ => panic!("button reply"),
         }
+    }
+
+    /// A business template message (HSM) surfaces its visible text (the
+    /// newline-joined title, body and footer) and the tappable button labels —
+    /// instead of the old bare template marker with a null text.
+    #[test]
+    fn decode_e2e_message_extracts_template_text_and_buttons() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use e2e::hydrated_template_button::{HydratedButton, HydratedQuickReplyButton, HydratedUrlButton};
+        use e2e::template_message::hydrated_four_row_template::Title;
+        use e2e::template_message::HydratedFourRowTemplate;
+        use prost::Message as _;
+
+        let tpl = e2e::Message {
+            template_message: Some(Box::new(e2e::TemplateMessage {
+                hydrated_template: Some(Box::new(HydratedFourRowTemplate {
+                    title: Some(Title::HydratedTitleText("Order #123".into())),
+                    hydrated_content_text: Some("Your order has shipped.".into()),
+                    hydrated_footer_text: Some("Reply STOP to opt out".into()),
+                    hydrated_buttons: vec![
+                        e2e::HydratedTemplateButton {
+                            hydrated_button: Some(HydratedButton::QuickReplyButton(
+                                HydratedQuickReplyButton { display_text: Some("Confirm".into()), ..Default::default() },
+                            )),
+                            ..Default::default()
+                        },
+                        e2e::HydratedTemplateButton {
+                            hydrated_button: Some(HydratedButton::UrlButton(HydratedUrlButton {
+                                display_text: Some("Track order".into()),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        match decode_e2e_message(&tpl.encode_to_vec()) {
+            InboundContent::Template { text, buttons } => {
+                assert_eq!(text.as_deref(), Some("Order #123\nYour order has shipped.\nReply STOP to opt out"));
+                assert_eq!(buttons, vec!["Confirm".to_string(), "Track order".to_string()]);
+            }
+            _ => panic!("expected Template"),
+        }
+
+        // An empty/legacy template (no hydrated content) stays a typed marker
+        // with no text and no buttons — not classified as "unknown".
+        let bare = e2e::Message {
+            template_message: Some(Box::new(e2e::TemplateMessage::default())),
+            ..Default::default()
+        };
+        match decode_e2e_message(&bare.encode_to_vec()) {
+            InboundContent::Template { text, buttons } => {
+                assert!(text.is_none());
+                assert!(buttons.is_empty());
+            }
+            _ => panic!("expected Template"),
+        }
+    }
+
+    /// Newer content types that used to fall through to "unknown" now classify:
+    /// PTV (round video note) as downloadable video media; encrypted reactions,
+    /// poll votes and events as typed markers; any other protocolMessage subtype
+    /// as a "protocol" marker carrying its numeric type. A genuinely empty
+    /// message still lands as Other (the diagnosable "unknown").
+    #[test]
+    fn decode_e2e_message_classifies_newer_and_protocol_types() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use prost::Message as _;
+
+        // PTV (round video note) → downloadable Video media.
+        let ptv = e2e::Message {
+            ptv_message: Some(Box::new(e2e::VideoMessage {
+                url: Some("https://x/ptv".into()),
+                media_key: Some(vec![1, 2, 3]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        match decode_e2e_message(&ptv.encode_to_vec()) {
+            InboundContent::Media { kind, url, .. } => {
+                assert_eq!(kind, crate::media::MediaType::Video);
+                assert_eq!(url.as_deref(), Some("https://x/ptv"));
+            }
+            _ => panic!("ptv should be video media"),
+        }
+
+        // Encrypted reaction (the emoji is separately sealed) → typed marker.
+        let enc_react = e2e::Message {
+            enc_reaction_message: Some(e2e::EncReactionMessage::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_e2e_message(&enc_react.encode_to_vec()),
+            InboundContent::Typed { kind, .. } if kind == "reaction"
+        ));
+
+        // Poll vote → typed marker.
+        let vote = e2e::Message {
+            poll_update_message: Some(e2e::PollUpdateMessage::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_e2e_message(&vote.encode_to_vec()),
+            InboundContent::Typed { kind, .. } if kind == "poll_vote"
+        ));
+
+        // Event → typed marker carrying the event name.
+        let event = e2e::Message {
+            event_message: Some(Box::new(e2e::EventMessage {
+                name: Some("Haircut 3pm".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        match decode_e2e_message(&event.encode_to_vec()) {
+            InboundContent::Typed { kind, text } => {
+                assert_eq!(kind, "event");
+                assert_eq!(text.as_deref(), Some("Haircut 3pm"));
+            }
+            _ => panic!("event"),
+        }
+
+        // A non-revoke/non-edit control protocolMessage (here EPHEMERAL_SETTING,
+        // the disappearing-messages timer change) → "protocol" with NO text. It
+        // carries no chat-visible content; surfacing the numeric type as text made
+        // it land as a chat bubble reading "3" that bots replied to. The receive
+        // path treats "protocol" as protocol-only (ack but don't store/emit).
+        let proto = e2e::Message {
+            protocol_message: Some(Box::new(e2e::ProtocolMessage {
+                r#type: Some(3), // EPHEMERAL_SETTING — not edit/revoke/history/keyshare
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        match decode_e2e_message(&proto.encode_to_vec()) {
+            InboundContent::Typed { kind, text } => {
+                assert_eq!(kind, "protocol");
+                assert_eq!(text, None);
+            }
+            _ => panic!("protocol catch-all"),
+        }
+
+        // A genuinely empty message is still Other (logged + stored "unknown").
+        assert!(matches!(
+            decode_e2e_message(&e2e::Message::default().encode_to_vec()),
+            InboundContent::Other
+        ));
     }
 
     /// A received reply (an `extendedTextMessage` whose `contextInfo` carries the

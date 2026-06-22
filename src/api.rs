@@ -102,6 +102,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/qr", get(get_qr))
         .route("/sessions/:id/pair-phone", post(pair_phone_session))
         .route("/sessions/:id/connect", post(connect_session))
+        .route("/sessions/:id/reconnect", post(reconnect_session))
         .route("/sessions/:id/logout", post(logout_session))
         .route("/sessions/:id/proxy", post(set_session_proxy))
         .route("/sessions/:id/label", post(set_session_label))
@@ -667,6 +668,22 @@ async fn connect_session(
 ) -> Result<(StatusCode, Json<SessionResp>)> {
     check_session_auth_write(&headers, &state, &id)?;
     state.manager.connect(&id)?;
+    let session = state.manager.get(&id)?;
+    let meta = session.meta.read().clone();
+    Ok((StatusCode::ACCEPTED, Json(SessionResp::new(meta))))
+}
+
+/// Force a real reconnect ("rekey"): bounce the live socket and re-login without
+/// re-pairing. Unlike `/connect` (idempotent — a no-op when already connected),
+/// this always bounces, so it heals sessions stuck on undecryptable inbound
+/// (e.g. imported from Baileys). Clears the in-flight retry map too.
+async fn reconnect_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<SessionResp>)> {
+    check_session_auth_write(&headers, &state, &id)?;
+    state.manager.reconnect(&id)?;
     let session = state.manager.get(&id)?;
     let meta = session.meta.read().clone();
     Ok((StatusCode::ACCEPTED, Json(SessionResp::new(meta))))
@@ -3205,6 +3222,33 @@ mod tests {
         )
         .await;
         assert!(st.is_client_error(), "unknown field must be rejected, got {st}");
+    }
+
+    /// `POST /reconnect` on a live (Connected) session returns 202 and echoes the
+    /// session — the real-bounce path (request_reconnect), distinct from `/connect`
+    /// which would no-op. We pre-set Connected so the handler takes the in-place
+    /// bounce branch instead of spawning a real WhatsApp connection.
+    #[tokio::test]
+    async fn reconnect_route_accepts_live_session() {
+        let state = test_state();
+        let id = state.manager.create(None).unwrap().meta.read().id.clone();
+        state
+            .manager
+            .get(&id)
+            .unwrap()
+            .set_status(crate::session::SessionStatus::Connected);
+        let app = router(state);
+
+        let (st, body) = send(
+            app,
+            "POST",
+            &format!("/v1/sessions/{id}/reconnect"),
+            Some("test-token"),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        assert_eq!(body["id"], id);
     }
 
     #[tokio::test]

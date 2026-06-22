@@ -180,7 +180,7 @@ store_delegate! {
     message_oldest_for_chat(session_id: &str, chat: &str) -> rusqlite::Result<Option<(String, bool, i64)>>;
     contacts_list(session_id: &str) -> rusqlite::Result<Vec<ContactRow>>;
     chats_list(session_id: &str) -> rusqlite::Result<Vec<ChatRow>>;
-    chat_pns_without_name(session_id: &str, limit: u32) -> rusqlite::Result<Vec<String>>;
+    pns_without_lid_mapping(session_id: &str, limit: u32) -> rusqlite::Result<Vec<String>>;
     groups_list(session_id: &str) -> rusqlite::Result<Vec<GroupRow>>;
     event_log_insert(session_id: &str, ts: i64, event_type: &str, payload_json: &str) -> rusqlite::Result<()>;
     event_log_list(session_id: &str, before_id: i64, type_filter: Option<&str>, limit: u32) -> rusqlite::Result<Vec<EventLogRow>>;
@@ -1906,31 +1906,32 @@ impl SqliteStore {
         })
     }
 
-    /// Phone-number JIDs of 1:1 message-chats that currently resolve to NO
-    /// contact name and have NO `lid_pn_map` entry yet — the work-list for the
-    /// connect-time usync LID sweep (so we only round-trip the chats that would
-    /// actually benefit). Capped at `limit`.
-    pub fn chat_pns_without_name(
+    /// PN jids (from chats AND contacts) that don't yet have a LID↔PN mapping.
+    /// The lid-pn sweep resolves these via usync so the read-side contact/chat
+    /// collapse can fold a contact's `@lid` duplicate into their PN row. Covers
+    /// NAMED contacts too — a named contact still shows up twice (LID + PN) until
+    /// its LID is mapped, which is the "same person appears as two contacts"
+    /// symptom.
+    pub fn pns_without_lid_mapping(
         &self,
         session_id: &str,
         limit: u32,
     ) -> rusqlite::Result<Vec<String>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT m.chat_jid \
-                   FROM messages m \
-                  WHERE m.session_id = ?1 AND m.chat_jid LIKE '%@s.whatsapp.net' \
-                    AND NOT EXISTS ( \
-                      SELECT 1 FROM contacts ct \
-                       WHERE ct.session_id = ?1 AND ct.jid = m.chat_jid \
-                         AND COALESCE(ct.full_name, ct.push_name, ct.first_name) IS NOT NULL) \
-                    AND NOT EXISTS ( \
+                "SELECT DISTINCT u.jid FROM ( \
+                     SELECT chat_jid AS jid FROM messages \
+                      WHERE session_id = ?1 AND chat_jid LIKE '%@s.whatsapp.net' \
+                     UNION \
+                     SELECT jid FROM contacts \
+                      WHERE session_id = ?1 AND jid LIKE '%@s.whatsapp.net') u \
+                  WHERE NOT EXISTS ( \
                       SELECT 1 FROM lid_pn_map lm \
                        WHERE lm.session_id = ?1 \
-                         AND lm.pn_user = substr(m.chat_jid, 1, (min( \
-                              CASE WHEN instr(m.chat_jid,'.')=0 THEN 1000000 ELSE instr(m.chat_jid,'.') END, \
-                              CASE WHEN instr(m.chat_jid,':')=0 THEN 1000000 ELSE instr(m.chat_jid,':') END, \
-                              instr(m.chat_jid,'@')) - 1))) \
+                         AND lm.pn_user = substr(u.jid, 1, (min( \
+                              CASE WHEN instr(u.jid,'.')=0 THEN 1000000 ELSE instr(u.jid,'.') END, \
+                              CASE WHEN instr(u.jid,':')=0 THEN 1000000 ELSE instr(u.jid,':') END, \
+                              instr(u.jid,'@')) - 1))) \
                   LIMIT ?2",
             )?;
             let out = stmt
@@ -3844,7 +3845,8 @@ impl PgStore {
             .collect())
     }
 
-    pub fn chat_pns_without_name(
+
+    pub fn pns_without_lid_mapping(
         &self,
         session_id: &str,
         limit: u32,
@@ -3852,17 +3854,16 @@ impl PgStore {
         let rows = self
             .conn()?
             .query(
-                "SELECT DISTINCT m.chat_jid \
-                   FROM messages m \
-                  WHERE m.session_id=$1 AND m.chat_jid LIKE '%@s.whatsapp.net' \
-                    AND NOT EXISTS ( \
-                      SELECT 1 FROM contacts ct \
-                       WHERE ct.session_id=$1 AND ct.jid=m.chat_jid \
-                         AND COALESCE(ct.full_name, ct.push_name, ct.first_name) IS NOT NULL) \
-                    AND NOT EXISTS ( \
+                "SELECT DISTINCT u.jid FROM ( \
+                     SELECT chat_jid AS jid FROM messages \
+                      WHERE session_id=$1 AND chat_jid LIKE '%@s.whatsapp.net' \
+                     UNION \
+                     SELECT jid FROM contacts \
+                      WHERE session_id=$1 AND jid LIKE '%@s.whatsapp.net') u \
+                  WHERE NOT EXISTS ( \
                       SELECT 1 FROM lid_pn_map lm \
                        WHERE lm.session_id=$1 \
-                         AND lm.pn_user = substring(m.chat_jid from '^[^.:@]+')) \
+                         AND lm.pn_user = substring(u.jid from '^[^.:@]+')) \
                   LIMIT $2",
                 &[&session_id, &(limit as i64)],
             )
@@ -4675,6 +4676,43 @@ mod tests {
             .contact_upsert("s1", "70000000000009@lid", None, Some("Stranger"))
             .unwrap();
         assert_eq!(store.contacts_list("s1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pns_without_lid_mapping_targets_named_and_unmapped_pns_only() {
+        let store = Store::open(":memory:").unwrap();
+        seed_session(&store, "s1");
+        // A NAMED PN contact with no LID mapping — must be a sweep target (the
+        // whole point of broadening past the old unnamed-chats-only query; a
+        // named contact still duplicates until its LID is resolved).
+        store
+            .contact_upsert("s1", "5511990000001@s.whatsapp.net", Some("Maria"), None)
+            .unwrap();
+        // A PN contact that already has a mapping — excluded.
+        store
+            .contact_upsert("s1", "5511990000002@s.whatsapp.net", None, None)
+            .unwrap();
+        store
+            .lid_pn_put("s1", "64000000000002", "5511990000002", 1)
+            .unwrap();
+        // An @lid contact is not a PN target (usync resolves BY phone number).
+        store
+            .contact_upsert("s1", "64000000000003@lid", None, Some("X"))
+            .unwrap();
+
+        let targets = store.pns_without_lid_mapping("s1", 100).unwrap();
+        assert!(
+            targets.contains(&"5511990000001@s.whatsapp.net".to_string()),
+            "named-but-unmapped PN contact must be a target"
+        );
+        assert!(
+            !targets.iter().any(|j| j.contains("5511990000002")),
+            "already-mapped PN must be excluded"
+        );
+        assert!(
+            !targets.iter().any(|j| j.ends_with("@lid")),
+            "@lid contacts are not PN sweep targets"
+        );
     }
 
     #[test]

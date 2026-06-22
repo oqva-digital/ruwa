@@ -95,7 +95,8 @@ function App() {
   const goGlobal = (p: GlobalPage) => { setLevel("global"); setGpage(p) }
 
   const connected = list.filter((s) => s.status === "connected").length
-  const down = list.filter((s) => s.status !== "connected" && s.status !== "connecting").length
+  const PROGRESS = ["connecting", "syncing"]
+  const down = list.filter((s) => s.status !== "connected" && !PROGRESS.includes(s.status)).length
   const clusterBase = {
     healthy: connected, total: list.length, frozen: 0, down,
     readonly, theme, version: healthQ.data?.version ?? null, onToggleTheme: toggleTheme,

@@ -130,6 +130,11 @@ export const api = {
   sessionHealth: (id: string) =>
     req<SessionHealth>("GET", `/v1/sessions/${id}/health`),
   connect: (id: string) => req<unknown>("POST", `/v1/sessions/${id}/connect`),
+  // Force a real reconnect ("rekey"): bounces the live socket and re-logs-in
+  // without re-pairing. Unlike `connect` (a no-op when already connected), this
+  // always bounces — used to heal sessions stuck on undecryptable inbound.
+  reconnect: (id: string) =>
+    req<unknown>("POST", `/v1/sessions/${id}/reconnect`),
   logout: (id: string) =>
     req<unknown>("POST", `/v1/sessions/${id}/logout`, { confirm: true }),
   setProxy: (id: string, proxy: string | null) =>

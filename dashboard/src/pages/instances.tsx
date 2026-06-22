@@ -58,7 +58,7 @@ export function InstancesPage({ onOpen, readonly }: { onOpen: (id: string) => vo
       const matchesFilter =
         filter === "all" ||
         (filter === "connected" && s.status === "connected") ||
-        (filter === "down" && s.status !== "connected" && s.status !== "connecting") ||
+        (filter === "down" && s.status !== "connected" && s.status !== "connecting" && s.status !== "syncing") ||
         filter === "frozen" // frozen needs per-row health; we don't hard-filter it here
       return matchesTerm && matchesFilter
     })

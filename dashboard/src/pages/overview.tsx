@@ -60,7 +60,7 @@ export function OverviewPage({
           <Button size="sm" variant="outline" disabled={readonly} onClick={() => act("Connect", () => api.connect(inst.id), "Connecting…")}>
             <Plug className="h-3.5 w-3.5" /> Connect
           </Button>
-          <Button size="sm" variant="outline" disabled={readonly} onClick={() => act("Reconnect", () => api.connect(inst.id), "Reconnect queued")}>
+          <Button size="sm" variant="outline" disabled={readonly} onClick={() => act("Reconnect", () => api.reconnect(inst.id), "Reconnect queued")}>
             <RefreshCw className="h-3.5 w-3.5" /> Reconnect
           </Button>
           <Button size="sm" variant="outline" disabled={readonly} onClick={async () => {

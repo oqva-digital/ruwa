@@ -4,6 +4,7 @@ export type SessionStatus =
   | "pending"
   | "connecting"
   | "awaiting_qr"
+  | "syncing"
   | "connected"
   | "disconnected"
   | "proxy_error"

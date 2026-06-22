@@ -18,6 +18,7 @@ export function statusMeta(status: SessionStatus | string): StatusMeta {
     case "connecting": return { st: "progress", label: "connecting", icon: "refresh" }
     case "pending": return { st: "progress", label: "pending", icon: "clock" }
     case "awaiting_qr": return { st: "progress", label: "awaiting qr", icon: "qr" }
+    case "syncing": return { st: "progress", label: "syncing", icon: "refresh" }
     case "disconnected": return { st: "down", label: "disconnected", icon: "wifiOff" }
     case "logged_out": return { st: "down", label: "logged out", icon: "power" }
     case "proxy_error": return { st: "down", label: "proxy error", icon: "alert" }
@@ -38,8 +39,12 @@ export interface Liveness {
 export function liveness(status: SessionStatus | string, lastRxSec: number | null): Liveness {
   if (status === "disconnected" || status === "logged_out" || status === "proxy_error" || status === "blocked")
     return { kind: "down", label: "down", cls: "chip-down" }
-  if (status === "connecting" || status === "pending" || status === "awaiting_qr")
-    return { kind: "progress", label: status === "awaiting_qr" ? "awaiting qr" : "connecting", cls: "chip-progress" }
+  if (status === "connecting" || status === "pending" || status === "awaiting_qr" || status === "syncing")
+    return {
+      kind: "progress",
+      label: status === "awaiting_qr" ? "awaiting qr" : status === "syncing" ? "syncing" : "connecting",
+      cls: "chip-progress",
+    }
   const frozen = lastRxSec != null && lastRxSec >= FROZEN_AFTER_SEC
   if (frozen) return { kind: "frozen", label: "frozen · " + fmtAgeShort(lastRxSec), cls: "chip-frozen" }
   return { kind: "live", label: "live · " + fmtAgeShort(lastRxSec), cls: "chip-live" }
