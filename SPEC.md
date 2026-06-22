@@ -139,7 +139,18 @@ References:
       QR string and an SVG base64 (PNG dropped — qrcode's PNG path needs the
       `image` feature whose deps require rustc 1.88+).
 - [ ] On QR scan: receive `<pair-success>` `<iq>`, persist server-issued
-      account proto, business name, push name, platform. Status → Connected.
+      account proto, business name, push name, platform. Status → Syncing
+      (see below), then → Connected once initial app-state syncs.
+
+  Session status lifecycle (the `status` field + matching SSE/webhook events):
+  `pending → connecting → awaiting_qr → syncing → connected`, with
+  `disconnected` / `logged_out` / `blocked` / `proxy_error` as exits.
+  **`syncing`** is entered on login (`<success>`): the socket is up but the
+  initial app-state (contacts/chats/settings + LID↔PN maps) hasn't landed, so
+  consumers must NOT send/receive yet. **`connected` means READY** — it (and the
+  `connected` event) fire only once every app-state collection is applied
+  (or a fallback timeout elapses, so a session never hangs in `syncing`).
+  History-sync backfill continues after `connected`.
 - [ ] Reconnect after pairing without re-QR; persists across process restart.
 - [ ] `POST /v1/sessions/:id/logout`: sends `<remove-companion-device>` IQ,
       clears credentials, status → LoggedOut.

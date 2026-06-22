@@ -13,7 +13,7 @@ import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
 
-const EVENT_TYPES = ["message", "message_sent", "message_delivered", "connected", "disconnected", "qr", "paired"]
+const EVENT_TYPES = ["message", "message_sent", "message_delivered", "syncing", "connected", "disconnected", "qr", "paired"]
 
 export function WebhooksPage({ inst, readonly }: { inst: SessionMeta; readonly: boolean }) {
   const [url, setUrl] = useState("")
