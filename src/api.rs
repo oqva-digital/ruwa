@@ -359,12 +359,18 @@ fn check_auth(headers: &HeaderMap, expected: &str) -> Result<()> {
 #[derive(Deserialize, Default)]
 struct ConfirmQuery {
     force: Option<String>,
+    /// Logout only: `?fresh=1` regenerates the device identity + clears stale
+    /// crypto so the next pairing is a brand-new device (recovers a session
+    /// WhatsApp/peers have stopped trusting). Default re-pairs the same identity.
+    fresh: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ConfirmBody {
     #[serde(default)]
     confirm: bool,
+    #[serde(default)]
+    fresh: bool,
 }
 
 /// Footgun guard for irreversible actions (logout, delete). The caller must
@@ -698,7 +704,13 @@ async fn logout_session(
 ) -> Result<Json<SessionResp>> {
     check_session_auth_write(&headers, &state, &id)?;
     require_confirmation("logging out a session", &q, &body)?;
-    state.manager.logout(&id)?;
+    // `?fresh=1` or body `{"fresh":true}` → regenerate the device identity.
+    let fresh = matches!(q.fresh.as_deref(), Some("1") | Some("true") | Some("yes"))
+        || (!body.is_empty())
+            .then(|| serde_json::from_slice::<ConfirmBody>(&body).ok())
+            .flatten()
+            .is_some_and(|b| b.fresh);
+    state.manager.logout(&id, fresh)?;
     let session = state.manager.get(&id)?;
     let meta = session.meta.read().clone();
     Ok(Json(SessionResp::new(meta)))

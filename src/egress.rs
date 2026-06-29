@@ -223,6 +223,13 @@ pub async fn deliver_event(
     let etype = event_type(ev);
     let payload = event_to_payload(session_id, ev, ts);
     let body = serde_json::to_vec(&payload).unwrap_or_default();
+    // Message id, when this is a chat message — logged on delivery so a
+    // "did this message reach the webhook?" question is answerable by grep
+    // instead of deduced from the absence of a failure.
+    let msg_id = match ev {
+        SessionEvent::Message { id, .. } => Some(id.as_str()),
+        _ => None,
+    };
 
     for target in targets {
         if !should_fire(&target, &etype) {
@@ -240,10 +247,20 @@ pub async fn deliver_event(
                 Ok(())
             }
         };
-        if let Err(e) = result {
-            if !matches!(e, DeliverError::BadConfig) {
+        match result {
+            Ok(()) => {
+                // Log SUCCESSFUL delivery (previously only a metric counter, so
+                // "was it delivered?" was invisible in the logs). INFO so it lands
+                // in the persisted ring.
+                tracing::info!(
+                    session = %session_id, kind = %target.kind, event = %etype, msg_id = ?msg_id,
+                    "egress delivered"
+                );
+            }
+            Err(DeliverError::BadConfig) => {}
+            Err(e) => {
                 tracing::warn!(
-                    session = %session_id, kind = %target.kind, error = %e,
+                    session = %session_id, kind = %target.kind, event = %etype, msg_id = ?msg_id, error = %e,
                     "egress delivery failed (isolated)"
                 );
             }
@@ -304,7 +321,17 @@ pub fn spawn_egress_worker(
                         tracing::warn!(session = %session_id, error = %e, "egress target lookup failed");
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // The worker fell behind and the channel dropped `n` events
+                    // before this one — those were NEVER delivered to any target.
+                    // Was silent; now surfaced so a webhook gap traces to a real
+                    // cause instead of a mystery.
+                    tracing::warn!(
+                        session = %session_id, dropped = n,
+                        "egress broadcast lagged — events DROPPED (not delivered to webhook/redis)"
+                    );
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             }
         }
