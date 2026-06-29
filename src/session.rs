@@ -786,6 +786,12 @@ pub struct Session {
     /// this message" bug). We reuse the established session and only recreate when
     /// none exists, or after repeated retries and at most once per hour. In-memory.
     session_recreate_history: PlMutex<HashMap<String, i64>>,
+    /// How many times we've already honored an inbound retry re-request for a
+    /// given `(device_jid, msg_id)`. Mirrors whatsmeow's
+    /// `incomingRetryRequestCounter`: past [`MAX_INCOMING_RETRIES`] a device that
+    /// keeps re-requesting the same message is dropped rather than resent forever.
+    /// In-memory.
+    incoming_retry_counter: PlMutex<HashMap<(String, String), u32>>,
     /// In-flight phone-code pairing, set by `pair_phone` and consumed by the
     /// code-pair notification handler. `None` outside a code-pairing attempt.
     phone_linking: RwLock<Option<PhoneLinkingState>>,
@@ -904,6 +910,7 @@ impl Session {
             message_retries: PlMutex::new(HashMap::new()),
             recent_sends: PlMutex::new(VecDeque::new()),
             session_recreate_history: PlMutex::new(HashMap::new()),
+            incoming_retry_counter: PlMutex::new(HashMap::new()),
             phone_linking: RwLock::new(None),
             requested_app_state_keys: PlMutex::new(HashSet::new()),
             group_name_fetched: PlMutex::new(HashSet::new()),
@@ -1031,6 +1038,18 @@ impl Session {
     ///   only if we haven't recreated this device's session within the last hour
     ///   (rate-limited via `session_recreate_history`).
     ///
+    /// Count this inbound retry re-request for `(device, msg_id)` and return the
+    /// running total. Mirrors whatsmeow's `incomingRetryRequestCounter`: a device
+    /// that keeps re-requesting the SAME message is in a pathological loop, and
+    /// past [`MAX_INCOMING_RETRIES`] we stop resending rather than churn forever.
+    /// In-memory; resets on restart (matching whatsmeow).
+    fn bump_incoming_retry(&self, device: &str, msg_id: &str) -> u32 {
+        let mut m = self.incoming_retry_counter.lock();
+        let n = m.entry((device.to_string(), msg_id.to_string())).or_insert(0);
+        *n += 1;
+        *n
+    }
+
     /// Records `now` as the last-recreate time whenever it returns `true`.
     fn should_recreate_session(&self, device: &str, has_session: bool, count: u32, now: i64) -> bool {
         /// Mirrors whatsmeow's `recreateSessionTimeout = 1 * time.Hour`.
@@ -8548,6 +8567,20 @@ async fn handle_inbound_retry_receipt(
     let session_id = session.meta.read().id.clone();
     let device = req.device_jid.clone();
 
+    // Pathological-loop guard: a device that keeps re-requesting the SAME message
+    // is never going to decrypt it (it's not a transient desync), so past
+    // `MAX_INCOMING_RETRIES` we stop resending rather than churn forever. Mirrors
+    // whatsmeow's `incomingRetryRequestCounter >= 10` drop.
+    const MAX_INCOMING_RETRIES: u32 = 10;
+    let internal = session.bump_incoming_retry(&device, &req.msg_id);
+    if internal >= MAX_INCOMING_RETRIES {
+        tracing::warn!(
+            id = %req.msg_id, device = %device, internal_count = internal,
+            "dropping retry re-request — internal retry counter exhausted (pathological loop)"
+        );
+        return;
+    }
+
     // Re-establish — but DON'T blindly overwrite a working session. whatsmeow
     // (`handleRetryReceipt` + `shouldRecreateSession`) only re-bootstraps from a
     // bundle when the peer advertised fresh `<keys>`, when no session exists, or
@@ -14197,6 +14230,23 @@ mod tests {
             !session.should_recreate_session(dev, true, 3, t0 + 3602),
             "recreate is rate-limited to once per hour"
         );
+    }
+
+    #[test]
+    fn incoming_retry_counter_is_per_device_and_message() {
+        // Mirrors whatsmeow's incomingRetryRequestCounter: counts re-requests for
+        // a (device, msg) pair so the caller can drop pathological loops at 10.
+        let mgr = manager();
+        let session = mgr.create(None).unwrap();
+        let dev = "64000000000001.1:5@lid";
+        // Same (device, msg) escalates.
+        assert_eq!(session.bump_incoming_retry(dev, "MSG_A"), 1);
+        assert_eq!(session.bump_incoming_retry(dev, "MSG_A"), 2);
+        assert_eq!(session.bump_incoming_retry(dev, "MSG_A"), 3);
+        // A different message for the same device is counted independently.
+        assert_eq!(session.bump_incoming_retry(dev, "MSG_B"), 1);
+        // A different device for the same message is counted independently.
+        assert_eq!(session.bump_incoming_retry("64000000000001.1:6@lid", "MSG_A"), 1);
     }
 
     #[test]
