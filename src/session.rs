@@ -778,6 +778,14 @@ pub struct Session {
     /// keyed by message id. Bounded FIFO ring (mirrors whatsmeow's
     /// `recentMessages`); in-memory only.
     recent_sends: PlMutex<VecDeque<RecentSend>>,
+    /// Last time we re-bootstrapped (recreated from a fresh prekey bundle) the
+    /// Signal session for a device while honoring an inbound retry receipt, keyed
+    /// by the device JID. Mirrors whatsmeow's `sessionRecreateHistory`: a keyless
+    /// retry must NOT blindly overwrite a working session every time (that churns
+    /// the ratchet so neither side ever converges — the own-device "Waiting for
+    /// this message" bug). We reuse the established session and only recreate when
+    /// none exists, or after repeated retries and at most once per hour. In-memory.
+    session_recreate_history: PlMutex<HashMap<String, i64>>,
     /// In-flight phone-code pairing, set by `pair_phone` and consumed by the
     /// code-pair notification handler. `None` outside a code-pairing attempt.
     phone_linking: RwLock<Option<PhoneLinkingState>>,
@@ -895,6 +903,7 @@ impl Session {
             device_cache: RwLock::new(HashMap::new()),
             message_retries: PlMutex::new(HashMap::new()),
             recent_sends: PlMutex::new(VecDeque::new()),
+            session_recreate_history: PlMutex::new(HashMap::new()),
             phone_linking: RwLock::new(None),
             requested_app_state_keys: PlMutex::new(HashSet::new()),
             group_name_fetched: PlMutex::new(HashSet::new()),
@@ -1007,6 +1016,40 @@ impl Session {
             .rev()
             .find(|r| r.msg_id == msg_id)
             .map(|r| (r.chat_jid.clone(), r.inner_proto.clone()))
+    }
+
+    /// Decide whether to re-bootstrap (recreate from a fresh prekey bundle) the
+    /// Signal session for `device` while honoring a keyless inbound retry receipt,
+    /// instead of reusing the established session. Mirrors whatsmeow's
+    /// `shouldRecreateSession` (retry.go) exactly:
+    ///
+    /// - No session exists yet → recreate (there's nothing to reuse).
+    /// - A session exists and this is an early retry (`count < 2`) → REUSE it;
+    ///   blindly overwriting churns the ratchet so neither side ever converges
+    ///   (the own-device "Waiting for this message" bug).
+    /// - A session exists and the retry has escalated (`count >= 2`) → recreate
+    ///   only if we haven't recreated this device's session within the last hour
+    ///   (rate-limited via `session_recreate_history`).
+    ///
+    /// Records `now` as the last-recreate time whenever it returns `true`.
+    fn should_recreate_session(&self, device: &str, has_session: bool, count: u32, now: i64) -> bool {
+        /// Mirrors whatsmeow's `recreateSessionTimeout = 1 * time.Hour`.
+        const RECREATE_SESSION_TIMEOUT_SECS: i64 = 3600;
+        let mut hist = self.session_recreate_history.lock();
+        if !has_session {
+            hist.insert(device.to_string(), now);
+            return true;
+        }
+        if count < 2 {
+            return false;
+        }
+        match hist.get(device) {
+            Some(&prev) if now.saturating_sub(prev) < RECREATE_SESSION_TIMEOUT_SECS => false,
+            _ => {
+                hist.insert(device.to_string(), now);
+                true
+            }
+        }
     }
 
     /// Install the live dispatcher so HTTP handlers can issue IQs. Called by
@@ -2459,11 +2502,49 @@ impl SessionManager {
     /// same session id is a separate flow. The connection task (if running)
     /// is signalled via `logout_notify`; it ships a best-effort
     /// `<remove-companion-device>` IQ over the live socket and exits.
-    pub fn logout(&self, id: &str) -> Result<()> {
+    pub fn logout(&self, id: &str, fresh: bool) -> Result<()> {
         let session = self.get(id)?;
         let prev_jid = session.meta.read().jid.clone();
         let now = chrono::Utc::now().timestamp();
-        self.store.session_mark_logged_out(id, now)?;
+        if fresh {
+            // Regenerate the device identity + one-time prekeys and clear stale
+            // crypto so the next pairing registers a BRAND-NEW device (mirrors a
+            // fresh WhatsApp-Web link / whatsmeow `NewDevice`). Re-pairing reuses
+            // the existing identity, which can't recover a device WhatsApp/peers
+            // have stopped trusting (server-acked sends silently dropped); a
+            // fresh identity can. id/label/api_key/proxy/webhooks are preserved.
+            let keys = DeviceKeys::generate();
+            let prekeys = PreKey::generate_batch(1, INITIAL_PREKEY_COUNT);
+            let batch: Vec<(u32, &[u8], &[u8])> = prekeys
+                .iter()
+                .map(|pk| {
+                    (
+                        pk.key_id,
+                        pk.keypair.private.as_slice(),
+                        pk.keypair.public.as_slice(),
+                    )
+                })
+                .collect();
+            self.store.reset_device_keys(
+                &crate::store::DeviceKeyReset {
+                    id,
+                    registration_id: keys.registration_id,
+                    noise_priv: keys.noise.private.as_slice(),
+                    noise_pub: keys.noise.public.as_slice(),
+                    identity_priv: keys.identity.private.as_slice(),
+                    identity_pub: keys.identity.public.as_slice(),
+                    spk_id: keys.signed_prekey.key_id,
+                    spk_priv: keys.signed_prekey.keypair.private.as_slice(),
+                    spk_pub: keys.signed_prekey.keypair.public.as_slice(),
+                    spk_sig: keys.signed_prekey.signature.as_slice(),
+                    adv_secret: keys.adv_secret.as_slice(),
+                    updated_at: now,
+                },
+                &batch,
+            )?;
+        } else {
+            self.store.session_mark_logged_out(id, now)?;
+        }
         {
             let mut m = session.meta.write();
             m.jid = None;
@@ -3562,6 +3643,26 @@ async fn encrypt_per_device(
         };
         record.current = Some(state);
         store_save_record(store, session_id, enc, &record)?;
+        // DIAGNOSTIC (send-delivery desync): record the per-device addressing
+        // decision so a PN<->LID flip or repeated re-establishment is visible in
+        // the log ring. `msg_type` PreKey = fresh session (pkmsg); Whisper =
+        // continuing ratchet (msg). `sibling` flags a session record under the
+        // OTHER (PN/LID) address for the same device — two divergent ratchets is
+        // the desync smoking gun. Temporary; remove once the root cause is fixed.
+        let sibling = lid_pn_alternates(store, session_id, enc).into_iter().find_map(|alt| {
+            store_load_record(store, session_id, &alt)
+                .ok()
+                .flatten()
+                .map(|r| format!("{alt}={}", if r.current.is_some() { "session" } else { "empty" }))
+        });
+        tracing::info!(
+            wire = %d,
+            enc = %enc,
+            redirected = enc != d,
+            msg_type = ?cipher.message_type,
+            sibling = ?sibling,
+            "send-diag: per-device encryption addressing"
+        );
         out.push(EncryptedRecipient {
             jid: d.clone(),
             ciphertext: cipher.serialized,
@@ -3731,28 +3832,68 @@ fn lid_pn_alternates(store: &Arc<Store>, session_id: &str, addr: &str) -> Vec<St
 }
 
 /// Resolve the address to load the Signal session under, applying LID<->PN
-/// aliasing. If a session already exists under `addr`, use it. Otherwise, if we
-/// have one under the mapped alternate addressing (same device, different
-/// PN/LID form), migrate it to `addr` and use that — so the established ratchet
-/// is reused instead of re-running X3DH. Mirrors whatsmeow's MigratePNToLID.
-/// On no hit, returns `addr` unchanged (the pkmsg path bootstraps a new one).
+/// aliasing. Resolves to the SAME canonical (LID-when-known) address the send
+/// path uses (`canonical_session_address`), so exactly ONE session record lives
+/// per device and both directions agree on it.
+///
+/// If a session already lives under any non-canonical alias (a different PN/LID
+/// form for the same device), MOVE it onto the canonical address — copy then
+/// delete the source. Copying without deleting (the old behaviour) left a PN
+/// *and* LID copy whenever the inbound addressing form differed from where the
+/// session was filed; `encryption_address` then saw two copies, treated it as a
+/// forked ratchet, and deleted BOTH on the next send — a rekey storm that
+/// desynced the peer (server-acked sends dropped + inbound `[undecryptable]`).
+/// Moving keeps a single record, so the send path never sees a phantom fork.
+/// Mirrors whatsmeow's MigratePNToLID. On no hit, returns canonical unchanged
+/// (the pkmsg path bootstraps a new one there).
 fn resolve_session_address(store: &Arc<Store>, session_id: &str, addr: &str) -> String {
-    if let Ok(Some(_)) = store_load_record(store, session_id, addr) {
-        return addr.to_string();
-    }
-    for alt in lid_pn_alternates(store, session_id, addr) {
-        if let Ok(Some(rec)) = store_load_record(store, session_id, &alt) {
-            if store_save_record(store, session_id, addr, &rec).is_ok() {
+    let canonical = canonical_session_address(store, session_id, addr);
+
+    // Every addressing form this device's session could be filed under.
+    let mut aliases = vec![addr.to_string(), canonical.clone()];
+    aliases.extend(lid_pn_alternates(store, session_id, addr));
+    aliases.extend(lid_pn_alternates(store, session_id, &canonical));
+    aliases.sort();
+    aliases.dedup();
+
+    // Canonical already holds the session: drop any non-canonical duplicate so
+    // the send path never sees a fork (the decrypt-side counterpart to
+    // `encryption_address`'s one-session-per-device invariant).
+    if matches!(store_load_record(store, session_id, &canonical), Ok(Some(_))) {
+        for a in &aliases {
+            if a != &canonical
+                && matches!(store_load_record(store, session_id, a), Ok(Some(_)))
+            {
+                store_delete_record(store, session_id, a);
                 tracing::info!(
-                    from_addr = %alt,
-                    to_addr = %addr,
-                    "migrated Signal session across LID<->PN addressing"
+                    dup = %a, canonical = %canonical,
+                    "dropped non-canonical Signal session duplicate (decrypt)"
                 );
-                return addr.to_string();
+            }
+        }
+        return canonical;
+    }
+
+    // No canonical record yet: MOVE the single existing copy onto canonical
+    // (copy + delete source), so the established ratchet is reused without
+    // leaving a duplicate behind.
+    for a in &aliases {
+        if a == &canonical {
+            continue;
+        }
+        if let Ok(Some(rec)) = store_load_record(store, session_id, a) {
+            if store_save_record(store, session_id, &canonical, &rec).is_ok() {
+                store_delete_record(store, session_id, a);
+                tracing::info!(
+                    from_addr = %a,
+                    to_addr = %canonical,
+                    "migrated Signal session onto canonical LID address (decrypt)"
+                );
+                return canonical;
             }
         }
     }
-    addr.to_string()
+    canonical
 }
 
 /// The Signal session address to ENCRYPT a device's copy under (whatsmeow's
@@ -3765,21 +3906,95 @@ fn resolve_session_address(store: &Arc<Store>, session_id: &str, addr: &str) -> 
 /// PN ratchet can be migrated onto it via `resolve_session_address`); otherwise
 /// stay PN so the establish-via-prekey path is unchanged. The wire jid is kept by
 /// the caller; only the session key changes. Mirrors send.go `encryptMessageForDevices`.
+/// The single CANONICAL Signal session address for a device: its LID form when a
+/// LID<->PN mapping is known, else the wire address. Exactly one session per
+/// device must live here — keeping PN and LID copies lets their ratchets fork,
+/// and the recipient (which tracks one session) silently drops ciphertext from
+/// the copy it isn't following. `@lid` inputs are already canonical.
+fn canonical_session_address(store: &Arc<Store>, session_id: &str, addr: &str) -> String {
+    if addr.ends_with("@s.whatsapp.net") {
+        if let Some(lid) = lid_pn_alternates(store, session_id, addr).into_iter().next() {
+            return lid;
+        }
+    }
+    addr.to_string()
+}
+
+/// Whether an established Signal session (a record with `current` ratchet state)
+/// exists for `device` under ANY of its addressing forms (the wire address, its
+/// canonical LID form, or any PN/LID alternate). Read-only — unlike
+/// `encryption_address` it never deletes or migrates records, so it's safe to
+/// call from the retry path before deciding whether to reuse or recreate.
+/// Mirrors the intent of whatsmeow's `Store.ContainsSession`.
+fn has_signal_session(store: &Arc<Store>, session_id: &str, device: &str) -> bool {
+    let canonical = canonical_session_address(store, session_id, device);
+    let mut candidates: Vec<String> = vec![device.to_string(), canonical.clone()];
+    candidates.extend(lid_pn_alternates(store, session_id, device));
+    candidates.extend(lid_pn_alternates(store, session_id, &canonical));
+    candidates.sort();
+    candidates.dedup();
+    candidates.iter().any(|a| {
+        store_load_record(store, session_id, a)
+            .ok()
+            .flatten()
+            .is_some_and(|r| r.current.is_some())
+    })
+}
+
+/// Pick the Signal session address to ENCRYPT a device's copy under, enforcing
+/// ONE session per device on the canonical (LID-when-known) address.
+///
+/// - Two-or-more PN/LID copies hold a session: the ratchet has forked (the bug
+///   behind "server-acked but recipient never receives"). Delete every copy so
+///   the send bootstraps a single fresh, decryptable session.
+/// - Exactly one copy, under a non-canonical form: legitimate first migration —
+///   move it onto the canonical address and drop the source.
+/// - Canonical already holds the only copy, or none exist: use canonical.
+///
+/// The wire `to` jid is unchanged; only the local session key is.
 fn encryption_address(store: &Arc<Store>, session_id: &str, d: &str) -> String {
-    if d.ends_with("@s.whatsapp.net") {
-        if let Some(lid_addr) = lid_pn_alternates(store, session_id, d).into_iter().next() {
-            let resolved = resolve_session_address(store, session_id, &lid_addr);
-            let has_lid_session = store_load_record(store, session_id, &resolved)
+    let canonical = canonical_session_address(store, session_id, d);
+    // Every addressing form this device's session could be stored under.
+    let mut candidates: Vec<String> = vec![d.to_string(), canonical.clone()];
+    candidates.extend(lid_pn_alternates(store, session_id, d));
+    candidates.extend(lid_pn_alternates(store, session_id, &canonical));
+    candidates.sort();
+    candidates.dedup();
+    let with_session: Vec<String> = candidates
+        .into_iter()
+        .filter(|a| {
+            store_load_record(store, session_id, a)
                 .ok()
                 .flatten()
-                .map(|r| r.current.is_some())
-                .unwrap_or(false);
-            if has_lid_session {
-                return resolved;
+                .is_some_and(|r| r.current.is_some())
+        })
+        .collect();
+    let canonical_has = with_session.iter().any(|a| a == &canonical);
+
+    if with_session.len() > 1 {
+        for a in &with_session {
+            store_delete_record(store, session_id, a);
+        }
+        tracing::warn!(
+            device = %d, canonical = %canonical, copies = with_session.len(),
+            "send: reset diverged PN/LID Signal session (forked ratchet) — re-establishing fresh"
+        );
+        return canonical;
+    }
+    if !canonical_has {
+        if let Some(src) = with_session.into_iter().next() {
+            if let Ok(Some(rec)) = store_load_record(store, session_id, &src) {
+                if store_save_record(store, session_id, &canonical, &rec).is_ok() {
+                    store_delete_record(store, session_id, &src);
+                    tracing::info!(
+                        from_addr = %src, to_addr = %canonical,
+                        "migrated Signal session onto canonical LID address"
+                    );
+                }
             }
         }
     }
-    resolve_session_address(store, session_id, d)
+    canonical
 }
 
 /// Record any LID<->PN correspondences advertised in an inbound message's
@@ -8333,25 +8548,46 @@ async fn handle_inbound_retry_receipt(
     let session_id = session.meta.read().id.clone();
     let device = req.device_jid.clone();
 
-    // Re-establish: prefer the keys the peer just advertised; else fetch a
-    // fresh bundle. Either upserts the session, so the resend is a pkmsg.
-    let bundle = match req.bundle {
-        Some(b) => Some(b),
-        None => fetch_one_bundle(&dispatcher, &device).await,
-    };
-    match bundle {
-        Some(b) => {
-            if let Err(e) = install_session_from_bundle(&store, &keys, &session_id, &device, &b) {
-                tracing::warn!(error = %e, device = %device, "retry: failed to install session");
-                return;
+    // Re-establish — but DON'T blindly overwrite a working session. whatsmeow
+    // (`handleRetryReceipt` + `shouldRecreateSession`) only re-bootstraps from a
+    // bundle when the peer advertised fresh `<keys>`, when no session exists, or
+    // when retries have escalated (`count >= 2`, at most once/hour). Reusing the
+    // established ratchet otherwise is what lets an own-device fan-out copy
+    // converge: the old code fetched a fresh bundle and OVERWROTE the session on
+    // EVERY keyless retry, churning the ratchet so the phone / WhatsApp Web never
+    // caught up → permanent "Waiting for this message" on our own devices.
+    let now = chrono::Utc::now().timestamp();
+    if let Some(b) = req.bundle {
+        // Peer advertised keys → re-establish toward the identity it gave us.
+        if let Err(e) = install_session_from_bundle(&store, &keys, &session_id, &device, &b) {
+            tracing::warn!(error = %e, device = %device, "retry: failed to install session");
+            return;
+        }
+    } else {
+        let has_session = has_signal_session(&store, &session_id, &device);
+        let recreate = session.should_recreate_session(&device, has_session, req.count, now);
+        tracing::info!(
+            device = %device, count = req.count, has_session, recreate,
+            "retry: keyless re-request — reuse vs recreate decision"
+        );
+        if recreate {
+            match fetch_one_bundle(&dispatcher, &device).await {
+                Some(b) => {
+                    if let Err(e) =
+                        install_session_from_bundle(&store, &keys, &session_id, &device, &b)
+                    {
+                        tracing::warn!(error = %e, device = %device, "retry: failed to install session");
+                        return;
+                    }
+                }
+                None => tracing::warn!(
+                    device = %device,
+                    "retry: recreate wanted but no prekey bundle available; reusing existing session if any"
+                ),
             }
         }
-        None => {
-            tracing::warn!(
-                device = %device,
-                "retry: no prekey bundle available; reusing existing session if any"
-            );
-        }
+        // else: reuse the established session — `encrypt_per_device` re-encrypts
+        // under the existing ratchet (a continuing `msg`, not a fresh `pkmsg`).
     }
 
     // Own-device resends must carry the DeviceSentMessage wrapper, exactly like
@@ -8401,7 +8637,6 @@ async fn handle_inbound_retry_receipt(
         return;
     };
 
-    let now = chrono::Utc::now().timestamp();
     let account_pb = store.session_account_pb(&session_id).ok().flatten();
     let node = build_retry_resend_node(&req.msg_id, &device, &rec, req.count, now, account_pb);
     // Register an ack slot (best-effort; we don't block on it here).
@@ -8799,6 +9034,15 @@ fn store_save_record(
     let now = chrono::Utc::now().timestamp();
     store.signal_session_save(session_id, address, &bytes, now)?;
     Ok(())
+}
+
+/// Drop the Signal session record at one address (best-effort; logs on error).
+/// Used by `encryption_address` to consolidate PN/LID duplicates onto a single
+/// canonical address and to reset a forked session.
+fn store_delete_record(store: &Store, session_id: &str, address: &str) {
+    if let Err(e) = store.signal_session_delete(session_id, address) {
+        tracing::warn!(address = %address, error = %e, "signal session delete failed");
+    }
 }
 
 /// WhatsApp Web client version we identify as. Mirrored from whatsmeow
@@ -13916,6 +14160,46 @@ mod tests {
     }
 
     #[test]
+    fn keyless_retry_reuses_session_until_escalation() {
+        // Regression for the own-device "Waiting for this message" bug: a keyless
+        // retry must NOT re-bootstrap (overwrite) a working session every time.
+        // Mirrors whatsmeow's shouldRecreateSession.
+        let mgr = manager();
+        let session = mgr.create(None).unwrap();
+        let dev = "64000000000001.1:5@lid";
+        let t0 = 1_700_000_000i64;
+
+        // No session yet → recreate (nothing to reuse).
+        assert!(
+            session.should_recreate_session(dev, false, 1, t0),
+            "no existing session must recreate"
+        );
+
+        // Session exists + early retry (count < 2) → REUSE, never overwrite.
+        assert!(
+            !session.should_recreate_session(dev, true, 1, t0 + 1),
+            "established session + count<2 must be reused, not recreated"
+        );
+
+        // Escalated retry (count >= 2): the no-session branch already stamped the
+        // history at t0, so a recreate within the hour is rate-limited away...
+        assert!(
+            !session.should_recreate_session(dev, true, 3, t0 + 60),
+            "count>=2 within an hour of last recreate must be rate-limited"
+        );
+        // ...but once an hour has passed, an escalated retry may recreate again.
+        assert!(
+            session.should_recreate_session(dev, true, 3, t0 + 3601),
+            "count>=2 after an hour may recreate"
+        );
+        // Immediately after that recreate, it's rate-limited again.
+        assert!(
+            !session.should_recreate_session(dev, true, 3, t0 + 3602),
+            "recreate is rate-limited to once per hour"
+        );
+    }
+
+    #[test]
     fn version_hash_matches_md5_of_dotted_string() {
         // The known MD5 of "2.3000.1038187123" — generated independently as
         // a regression guard against accidental WA_VERSION drift in this
@@ -14764,7 +15048,7 @@ mod tests {
         process_inbound_node(&session, &mgr.store, &keys, None, &iq).unwrap();
         assert_eq!(session.meta.read().status, SessionStatus::Syncing);
 
-        mgr.logout(&id).unwrap();
+        mgr.logout(&id, false).unwrap();
         let m = session.meta.read();
         assert_eq!(m.status, SessionStatus::LoggedOut);
         assert!(m.jid.is_none());
@@ -14784,6 +15068,51 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// `logout(fresh=true)` must REGENERATE the device identity and CLEAR stale
+    /// peer sessions (so the next pairing is a brand-new device that WhatsApp
+    /// and peers will trust), while keeping the same session id. The default
+    /// `logout(false)` leaves the identity intact (covered above).
+    #[test]
+    fn logout_fresh_regenerates_identity_and_clears_sessions() {
+        let mgr = manager();
+        let session = mgr.create(None).unwrap();
+        let id = session.meta.read().id.clone();
+
+        let keys = mgr.load_device_keys(&id).unwrap();
+        let old_identity = keys.identity.public;
+        let bundle = build_signed_pair_success_bundle(&keys.adv_secret, &keys.identity.public);
+        let iq = pair_success_iq(&bundle, "Biz", "5511999999999:23@s.whatsapp.net", "android", "ps");
+        process_inbound_node(&session, &mgr.store, &keys, None, &iq).unwrap();
+
+        // Seed a peer Signal session so we can prove it's cleared.
+        store_save_record(
+            &mgr.store,
+            &id,
+            "5511990000000@s.whatsapp.net",
+            &crate::crypto::signal::SessionRecord::new(),
+        )
+        .unwrap();
+        assert!(store_load_record(&mgr.store, &id, "5511990000000@s.whatsapp.net")
+            .unwrap()
+            .is_some());
+
+        mgr.logout(&id, true).unwrap();
+
+        let new_keys = mgr.load_device_keys(&id).unwrap();
+        assert_ne!(
+            new_keys.identity.public, old_identity,
+            "fresh logout must regenerate the identity key (not reuse it)"
+        );
+        assert_eq!(session.meta.read().status, SessionStatus::LoggedOut);
+        assert!(session.meta.read().jid.is_none());
+        assert!(
+            store_load_record(&mgr.store, &id, "5511990000000@s.whatsapp.net")
+                .unwrap()
+                .is_none(),
+            "fresh logout must clear stale peer sessions"
+        );
     }
 
     // -- prekey-fetch IQ ---------------------------------------------------
@@ -17512,6 +17841,54 @@ mod tests {
         );
     }
 
+    /// When the SAME device has BOTH a PN and a LID session (a forked ratchet —
+    /// the cause of "server-acked but recipient never receives"), encryption_address
+    /// must DELETE every copy and return the canonical LID so the next send
+    /// bootstraps a single fresh, decryptable session.
+    #[test]
+    fn encryption_address_resets_diverged_pn_lid_sessions() {
+        let mgr = manager();
+        let s = mgr.create(Some("div".into())).unwrap();
+        let id = s.meta.read().id.clone();
+        let store = mgr.store.clone();
+        store.lid_pn_put(&id, "64000000000001", "5511990000001", 1).unwrap();
+
+        let mk = || {
+            let mut rec = crate::crypto::signal::SessionRecord::new();
+            rec.current = Some(crate::crypto::signal::SessionState {
+                session_version: 3,
+                local_identity_pub: [0u8; 32],
+                remote_identity_pub: [0u8; 32],
+                root_key: [0u8; 32],
+                sender_chain: None,
+                sender_ratchet_priv: None,
+                sender_ratchet_pub: None,
+                previous_counter: 0,
+                receiver_chains: Vec::new(),
+                pending_pre_key: None,
+                local_registration_id: 0,
+                remote_registration_id: 0,
+            });
+            rec
+        };
+        // Divergence: one device, two session copies (PN + LID).
+        store_save_record(&store, &id, "5511990000001@s.whatsapp.net", &mk()).unwrap();
+        store_save_record(&store, &id, "64000000000001.1@lid", &mk()).unwrap();
+
+        assert_eq!(
+            encryption_address(&store, &id, "5511990000001@s.whatsapp.net"),
+            "64000000000001.1@lid"
+        );
+        assert!(
+            store_load_record(&store, &id, "5511990000001@s.whatsapp.net").unwrap().is_none(),
+            "diverged PN copy must be deleted"
+        );
+        assert!(
+            store_load_record(&store, &id, "64000000000001.1@lid").unwrap().is_none(),
+            "diverged LID copy must be deleted (forces a fresh bootstrap)"
+        );
+    }
+
     /// `sender_is_self` must recognise our own messages whether the sender is
     /// addressed by our PN or our `@lid`, and reject other people — even when
     /// the real sender is `participant` (a group `from` is the group jid, which
@@ -17572,6 +17949,103 @@ mod tests {
         assert!(store_load_record(&store, &id, "64000000000001.1@lid")
             .unwrap()
             .is_some());
+    }
+
+    /// Regression: the decrypt/send rekey-storm loop. An inbound message under
+    /// the PN form must NOT leave a PN *and* LID copy — otherwise the next send
+    /// sees a phantom fork, deletes BOTH sessions, and the peer desyncs
+    /// (server-acked sends silently dropped + inbound `[undecryptable]`). The
+    /// decrypt path must converge onto the single canonical LID address, and the
+    /// following send must reuse it without resetting.
+    #[test]
+    fn resolve_then_send_does_not_rekey_storm() {
+        let mgr = manager();
+        let s = mgr.create(Some("storm".into())).unwrap();
+        let id = s.meta.read().id.clone();
+        let store = mgr.store.clone();
+        store.lid_pn_put(&id, "64000000000001", "5511990000001", 1).unwrap();
+
+        let mk = || {
+            let mut rec = crate::crypto::signal::SessionRecord::new();
+            rec.current = Some(crate::crypto::signal::SessionState {
+                session_version: 3,
+                local_identity_pub: [0u8; 32],
+                remote_identity_pub: [0u8; 32],
+                root_key: [0u8; 32],
+                sender_chain: None,
+                sender_ratchet_priv: None,
+                sender_ratchet_pub: None,
+                previous_counter: 0,
+                receiver_chains: Vec::new(),
+                pending_pre_key: None,
+                local_registration_id: 0,
+                remote_registration_id: 0,
+            });
+            rec
+        };
+
+        // Steady state: the single canonical LID session.
+        store_save_record(&store, &id, "64000000000001.1@lid", &mk()).unwrap();
+
+        // Inbound message addressed under the PN form. The old code COPIED the
+        // session to the PN address, leaving a PN+LID duplicate.
+        let decrypt_addr =
+            resolve_session_address(&store, &id, "5511990000001@s.whatsapp.net");
+        assert_eq!(
+            decrypt_addr, "64000000000001.1@lid",
+            "decrypt must resolve onto the canonical LID address"
+        );
+        assert!(
+            store_load_record(&store, &id, "5511990000001@s.whatsapp.net")
+                .unwrap()
+                .is_none(),
+            "decrypt must NOT leave a PN duplicate (that is what forked the ratchet)"
+        );
+
+        // The following send must see ONE canonical session and reuse it — no
+        // destructive forked-ratchet reset.
+        assert_eq!(
+            encryption_address(&store, &id, "5511990000001@s.whatsapp.net"),
+            "64000000000001.1@lid"
+        );
+        assert!(
+            store_load_record(&store, &id, "64000000000001.1@lid")
+                .unwrap()
+                .is_some(),
+            "send must reuse the canonical session, not delete it"
+        );
+    }
+
+    /// A pre-existing PN+LID duplicate (left by the old copy-not-move decrypt, or
+    /// a deploy carrying legacy state) is cleaned up to the single canonical LID
+    /// on the next inbound, so the send path stops seeing a fork.
+    #[test]
+    fn resolve_cleans_up_legacy_pn_lid_duplicate() {
+        let mgr = manager();
+        let s = mgr.create(Some("legacy".into())).unwrap();
+        let id = s.meta.read().id.clone();
+        let store = mgr.store.clone();
+        store.lid_pn_put(&id, "64000000000001", "5511990000001", 1).unwrap();
+
+        let rec = crate::crypto::signal::SessionRecord::new();
+        store_save_record(&store, &id, "5511990000001@s.whatsapp.net", &rec).unwrap();
+        store_save_record(&store, &id, "64000000000001.1@lid", &rec).unwrap();
+
+        assert_eq!(
+            resolve_session_address(&store, &id, "5511990000001@s.whatsapp.net"),
+            "64000000000001.1@lid"
+        );
+        assert!(
+            store_load_record(&store, &id, "5511990000001@s.whatsapp.net")
+                .unwrap()
+                .is_none(),
+            "the PN duplicate must be dropped, leaving only canonical LID"
+        );
+        assert!(
+            store_load_record(&store, &id, "64000000000001.1@lid")
+                .unwrap()
+                .is_some()
+        );
     }
 }
 

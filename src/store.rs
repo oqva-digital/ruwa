@@ -116,6 +116,7 @@ macro_rules! store_delegate {
 store_delegate! {
     signal_session_load(session_id: &str, address: &str) -> rusqlite::Result<Option<Vec<u8>>>;
     signal_session_save(session_id: &str, address: &str, record: &[u8], now: i64) -> rusqlite::Result<()>;
+    signal_session_delete(session_id: &str, address: &str) -> rusqlite::Result<()>;
     sender_key_load(session_id: &str, group_id: &str, sender: &str) -> rusqlite::Result<Option<Vec<u8>>>;
     sender_key_save(session_id: &str, group_id: &str, sender: &str, record: &[u8]) -> rusqlite::Result<()>;
     lid_pn_put(session_id: &str, lid_user: &str, pn_user: &str, now: i64) -> rusqlite::Result<()>;
@@ -138,6 +139,7 @@ store_delegate! {
     messages_mark_self_from_me(session_id: &str, own_pn_user: &str, own_lid_user: Option<&str>) -> rusqlite::Result<usize>;
     consolidate_lid_chats(session_id: &str) -> rusqlite::Result<usize>;
     create_session(s: &NewSession, prekeys: &[(u32, &[u8], &[u8])]) -> rusqlite::Result<()>;
+    reset_device_keys(r: &DeviceKeyReset, prekeys: &[(u32, &[u8], &[u8])]) -> rusqlite::Result<()>;
     device_keys_load(id: &str) -> rusqlite::Result<Option<DeviceKeyRow>>;
     device_keys_set_adv_secret(id: &str, adv_secret: &[u8]) -> rusqlite::Result<()>;
     sessions_all() -> rusqlite::Result<Vec<SessionRow>>;
@@ -369,6 +371,20 @@ impl SqliteStore {
                 "INSERT OR REPLACE INTO signal_sessions (session_id, address, record, updated_at) \
                  VALUES (?, ?, ?, ?)",
                 rusqlite::params![session_id, address, record, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Drop the Signal session record for one (session, address). Used to
+    /// consolidate PN/LID duplicates onto a single canonical address and to
+    /// reset a diverged session so the next send bootstraps a fresh, decryptable
+    /// ratchet. No-op if absent.
+    pub fn signal_session_delete(&self, session_id: &str, address: &str) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM signal_sessions WHERE session_id = ? AND address = ?",
+                rusqlite::params![session_id, address],
             )?;
             Ok(())
         })
@@ -951,6 +967,67 @@ impl SqliteStore {
                 for (key_id, priv_, pub_) in prekeys {
                     let sealed_priv = vault::seal(priv_);
                     stmt.execute(rusqlite::params![s.id, key_id, sealed_priv, pub_])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Replace a session's device keys with a fresh set and clear all paired +
+    /// crypto state, IN PLACE (id/label/api_key/proxy/webhooks survive). Used by
+    /// logout `fresh=true` so the next pairing registers a genuinely NEW device
+    /// — like whatsmeow's `NewDevice` / a fresh WhatsApp-Web link — instead of
+    /// re-pairing the same (possibly degraded) identity. Clears peer sessions,
+    /// sender keys, one-time prekeys, app-state and the remote-identity cache;
+    /// user data (messages/chats/contacts) is left untouched.
+    pub fn reset_device_keys(
+        &self,
+        r: &DeviceKeyReset,
+        prekeys: &[(u32, &[u8], &[u8])],
+    ) -> rusqlite::Result<()> {
+        let noise_priv = vault::seal(r.noise_priv);
+        let identity_priv = vault::seal(r.identity_priv);
+        let spk_priv = vault::seal(r.spk_priv);
+        let adv_secret = vault::seal(r.adv_secret);
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE sessions SET \
+                    registration_id = ?, \
+                    noise_key_priv = ?, noise_key_pub = ?, \
+                    identity_key_priv = ?, identity_key_pub = ?, \
+                    signed_prekey_id = ?, signed_prekey_priv = ?, signed_prekey_pub = ?, signed_prekey_sig = ?, \
+                    adv_secret_key = ?, \
+                    jid = NULL, account_pb = NULL, business_name = NULL, platform = NULL, \
+                    push_name = NULL, server_token = NULL, client_token = NULL, \
+                    status = 'logged_out', updated_at = ? \
+                 WHERE id = ?",
+                rusqlite::params![
+                    r.registration_id,
+                    noise_priv, r.noise_pub,
+                    identity_priv, r.identity_pub,
+                    r.spk_id, spk_priv, r.spk_pub, r.spk_sig,
+                    adv_secret, r.updated_at, r.id,
+                ],
+            )?;
+            for table in [
+                "signal_sessions", "sender_keys", "prekeys",
+                "app_state_versions", "app_state_mac_keys", "remote_identities",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session_id = ?"),
+                    rusqlite::params![r.id],
+                )?;
+            }
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO prekeys (session_id, key_id, private_key, public_key, uploaded) \
+                     VALUES (?, ?, ?, ?, 0)",
+                )?;
+                for (key_id, priv_, pub_) in prekeys {
+                    let sealed_priv = vault::seal(priv_);
+                    stmt.execute(rusqlite::params![r.id, key_id, sealed_priv, pub_])?;
                 }
             }
             tx.commit()?;
@@ -2562,6 +2639,16 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn signal_session_delete(&self, session_id: &str, address: &str) -> rusqlite::Result<()> {
+        self.conn()?
+            .execute(
+                "DELETE FROM signal_sessions WHERE session_id=$1 AND address=$2",
+                &[&session_id, &address],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
     // ---- Group sender keys ----
     pub fn sender_key_load(
         &self,
@@ -3069,6 +3156,66 @@ impl PgStore {
                 "INSERT INTO prekeys (session_id,key_id,private_key,public_key,uploaded) \
                  VALUES ($1,$2,$3,$4,0)",
                 &[&s.id, &(i64::from(*key_id)), &sealed, pub_],
+            )
+            .map_err(pg_err)?;
+        }
+        tx.commit().map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn reset_device_keys(
+        &self,
+        r: &DeviceKeyReset,
+        prekeys: &[(u32, &[u8], &[u8])],
+    ) -> rusqlite::Result<()> {
+        let noise_priv = vault::seal(r.noise_priv);
+        let identity_priv = vault::seal(r.identity_priv);
+        let spk_priv = vault::seal(r.spk_priv);
+        let adv_secret = vault::seal(r.adv_secret);
+        let mut c = self.conn()?;
+        let mut tx = c.transaction().map_err(pg_err)?;
+        tx.execute(
+            "UPDATE sessions SET \
+                registration_id=$1, \
+                noise_key_priv=$2, noise_key_pub=$3, identity_key_priv=$4, identity_key_pub=$5, \
+                signed_prekey_id=$6, signed_prekey_priv=$7, signed_prekey_pub=$8, signed_prekey_sig=$9, \
+                adv_secret_key=$10, \
+                jid=NULL, account_pb=NULL, business_name=NULL, platform=NULL, \
+                push_name=NULL, server_token=NULL, client_token=NULL, \
+                status='logged_out', updated_at=$11 \
+             WHERE id=$12",
+            &[
+                &(i64::from(r.registration_id)),
+                &noise_priv,
+                &r.noise_pub,
+                &identity_priv,
+                &r.identity_pub,
+                &(i64::from(r.spk_id)),
+                &spk_priv,
+                &r.spk_pub,
+                &r.spk_sig,
+                &adv_secret,
+                &r.updated_at,
+                &r.id,
+            ],
+        )
+        .map_err(pg_err)?;
+        for table in [
+            "signal_sessions", "sender_keys", "prekeys",
+            "app_state_versions", "app_state_mac_keys", "remote_identities",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE session_id=$1"),
+                &[&r.id],
+            )
+            .map_err(pg_err)?;
+        }
+        for (key_id, priv_, pub_) in prekeys {
+            let sealed = vault::seal(priv_);
+            tx.execute(
+                "INSERT INTO prekeys (session_id,key_id,private_key,public_key,uploaded) \
+                 VALUES ($1,$2,$3,$4,0)",
+                &[&r.id, &(i64::from(*key_id)), &sealed, pub_],
             )
             .map_err(pg_err)?;
         }
@@ -4236,6 +4383,25 @@ pub struct NewSession<'a> {
     pub adv_secret: &'a [u8],
     pub api_key: &'a str,
     pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Fresh device keys for a `reset_device_keys` (logout `fresh=true`). Carries
+/// the same key material as a `NewSession` but UPDATES an existing row in place
+/// — preserving id/label/api_key/proxy/webhooks — while clearing the paired
+/// state and stale crypto so the next pairing is a genuinely new device.
+pub struct DeviceKeyReset<'a> {
+    pub id: &'a str,
+    pub registration_id: u32,
+    pub noise_priv: &'a [u8],
+    pub noise_pub: &'a [u8],
+    pub identity_priv: &'a [u8],
+    pub identity_pub: &'a [u8],
+    pub spk_id: u32,
+    pub spk_priv: &'a [u8],
+    pub spk_pub: &'a [u8],
+    pub spk_sig: &'a [u8],
+    pub adv_secret: &'a [u8],
     pub updated_at: i64,
 }
 
