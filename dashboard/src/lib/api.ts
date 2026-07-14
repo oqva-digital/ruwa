@@ -186,6 +186,8 @@ export const api = {
     req<unknown>("POST", `/v1/sessions/${id}/messages/react`, { to, msg_id, from_me, emoji, participant }),
   revoke: (id: string, to: string, msg_id: string) =>
     req<unknown>("POST", `/v1/sessions/${id}/messages/revoke`, { to, msg_id, from_me: true }),
+  edit: (id: string, to: string, msg_id: string, text: string) =>
+    req<unknown>("POST", `/v1/sessions/${id}/messages/edit`, { to, msg_id, text, from_me: true }),
   sendLocation: (id: string, to: string, body: { latitude: number; longitude: number; name?: string; address?: string }) =>
     req<{ id: string }>("POST", `/v1/sessions/${id}/messages/location`, { to, ...body }),
   sendContact: (id: string, to: string, body: { display_name: string; phone?: string; vcard?: string }) =>

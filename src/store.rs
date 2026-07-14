@@ -132,7 +132,10 @@ store_delegate! {
     prekey_load_private(session_id: &str, key_id: u32) -> rusqlite::Result<Option<Vec<u8>>>;
     prekey_delete(session_id: &str, key_id: u32) -> rusqlite::Result<()>;
     message_insert(m: &NewMessage, ignore_conflict: bool) -> rusqlite::Result<()>;
+    message_type_get(session_id: &str, chat_jid: &str, message_id: &str) -> rusqlite::Result<Option<String>>;
     message_mark_edited(session_id: &str, message_id: &str, new_body: Option<&str>) -> rusqlite::Result<bool>;
+    message_mark_revoked(session_id: &str, message_id: &str) -> rusqlite::Result<bool>;
+    message_timestamp(session_id: &str, message_id: &str) -> rusqlite::Result<Option<i64>>;
     messages_insert_batch(rows: &[NewMessage], ignore_conflict: bool) -> rusqlite::Result<usize>;
     prune(msg_age_cutoff: Option<i64>, messages_per_chat: Option<u32>, signal_age_cutoff: Option<i64>) -> rusqlite::Result<(usize, usize, usize)>;
     message_set_status(session_id: &str, message_id: &str, status: &str) -> rusqlite::Result<()>;
@@ -661,20 +664,29 @@ impl SqliteStore {
 
     // ---- messages -----------------------------------------------------------
 
-    /// Insert a message row. `ignore_conflict` uses INSERT-OR-IGNORE for the
-    /// idempotent inbound-dedup path; otherwise a plain insert. `status = None`
-    /// falls back to the column default (`received`).
+    /// Insert a message row. `ignore_conflict` is the idempotent inbound-dedup
+    /// path: a duplicate delivery of an already-stored message is dropped —
+    /// EXCEPT when the stored row is `undecryptable` and this delivery isn't.
+    /// That's the retry-receipt recovery resending the same message id with a
+    /// fresh session: the successful decrypt must replace the placeholder row,
+    /// or the first message from every new contact stays `[undecryptable]`
+    /// forever. `status = None` falls back to the column default (`received`).
     pub fn message_insert(&self, m: &NewMessage, ignore_conflict: bool) -> rusqlite::Result<()> {
-        let verb = if ignore_conflict {
-            "INSERT OR IGNORE"
+        let tail = if ignore_conflict {
+            " ON CONFLICT(session_id, chat_jid, message_id) DO UPDATE SET \
+                msg_type = excluded.msg_type, \
+                body_text = excluded.body_text, \
+                payload_json = excluded.payload_json \
+              WHERE messages.msg_type = 'undecryptable' \
+                AND excluded.msg_type <> 'undecryptable'"
         } else {
-            "INSERT"
+            ""
         };
         let sql = format!(
-            "{verb} INTO messages \
+            "INSERT INTO messages \
                 (session_id, chat_jid, message_id, sender_jid, from_me, \
                  timestamp, msg_type, body_text, payload_json, status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'received'))"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'received')){tail}"
         );
         self.with_conn(|conn| {
             conn.execute(
@@ -696,8 +708,34 @@ impl SqliteStore {
         })
     }
 
-    /// Insert many message rows in one transaction (history backfill). Honors
-    /// `ignore_conflict` like [`Self::message_insert`].
+    /// A stored message's `msg_type`, or `None` when the row doesn't exist.
+    /// Used by the delayed undecryptable-event fallback to check whether the
+    /// retry-receipt recovery already healed the row before surfacing an
+    /// `[undecryptable]` to event consumers.
+    pub fn message_type_get(
+        &self,
+        session_id: &str,
+        chat_jid: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT msg_type FROM messages \
+                 WHERE session_id = ? AND chat_jid = ? AND message_id = ?",
+                rusqlite::params![session_id, chat_jid, message_id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
+        })
+    }
+
+    /// Insert many message rows in one transaction (history backfill). Kept
+    /// plain INSERT-OR-IGNORE (no undecryptable-heal upsert): backfill must
+    /// never overwrite rows the live inbound path already stored.
     pub fn messages_insert_batch(
         &self,
         rows: &[NewMessage],
@@ -815,6 +853,47 @@ impl SqliteStore {
                 )?,
             };
             Ok(n > 0)
+        })
+    }
+
+    /// Apply a revoke (delete-for-everyone) to the target message IN PLACE: set
+    /// `revoked = 1` and clear `body_text` — the content is gone, only the
+    /// tombstone remains. Matched by id across any chat (ids are unique per
+    /// session). Returns whether a row was updated; `false` means we don't have
+    /// the target (predates storage / pruned).
+    pub fn message_mark_revoked(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<bool> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "UPDATE messages SET revoked = 1, body_text = NULL \
+                 WHERE session_id = ? AND message_id = ?",
+                rusqlite::params![session_id, message_id],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// The stored `timestamp` (unix seconds) of a message, by id. `None` when we
+    /// don't have the row.
+    pub fn message_timestamp(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT timestamp FROM messages WHERE session_id = ? AND message_id = ?",
+                rusqlite::params![session_id, message_id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
         })
     }
 
@@ -1770,7 +1849,7 @@ impl SqliteStore {
                 };
                 let mut sql = String::from(
                     "SELECT m.chat_jid, m.message_id, m.sender_jid, m.from_me, m.timestamp, \
-                            m.msg_type, m.body_text, m.payload_json, m.edited \
+                            m.msg_type, m.body_text, m.payload_json, m.edited, m.revoked \
                        FROM messages_fts \
                        JOIN messages m ON m.rowid = messages_fts.rowid \
                       WHERE messages_fts MATCH ?1 AND m.session_id = ?2 AND m.timestamp < ?3",
@@ -1792,7 +1871,7 @@ impl SqliteStore {
 
             // Plain listing (no query): newest-first, optionally chat-scoped.
             let mut sql = String::from(
-                "SELECT chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json, edited \
+                "SELECT chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json, edited, revoked \
                    FROM messages WHERE session_id = ?1 AND timestamp < ?2",
             );
             let mut params: Vec<&dyn rusqlite::ToSql> = vec![&session_id, &before];
@@ -1835,7 +1914,7 @@ impl SqliteStore {
                 })?;
             let Some(ts) = ts else { return Ok(vec![]) };
             const COLS: &str =
-                "chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json, edited";
+                "chat_jid, message_id, sender_jid, from_me, timestamp, msg_type, body_text, payload_json, edited, revoked";
             // target + `before` older, newest-first; then reverse to chronological.
             let older_sql = format!(
                 "SELECT {COLS} FROM messages WHERE session_id = ?1 AND chat_jid = ?2 \
@@ -2376,6 +2455,7 @@ fn row_to_msg_list(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageListRow> {
         msg_type: r.get(5)?,
         body_text: r.get(6)?,
         edited: r.get::<_, i64>(8)? != 0,
+        revoked: r.get::<_, i64>(9)? != 0,
         quoted,
     })
 }
@@ -2453,6 +2533,10 @@ pub struct MessageListRow {
     /// Omitted from JSON when false to keep payloads lean.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub edited: bool,
+    /// True when this message was deleted for everyone (revoked). `body_text`
+    /// is cleared with it — the content is gone, only the tombstone remains.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revoked: bool,
     /// The quoted message this is a reply to, if any (`null` for non-replies).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedInfo>,
@@ -2880,9 +2964,17 @@ impl PgStore {
     }
 
     // ---- messages ----
+    // `ignore_conflict` dedups duplicate deliveries EXCEPT healing an
+    // `undecryptable` row with its retry-recovered decrypt — see the SQLite
+    // twin for the full note.
     pub fn message_insert(&self, m: &NewMessage, ignore_conflict: bool) -> rusqlite::Result<()> {
         let tail = if ignore_conflict {
-            " ON CONFLICT (session_id,chat_jid,message_id) DO NOTHING"
+            " ON CONFLICT (session_id,chat_jid,message_id) DO UPDATE SET \
+                msg_type = EXCLUDED.msg_type, \
+                body_text = EXCLUDED.body_text, \
+                payload_json = EXCLUDED.payload_json \
+              WHERE messages.msg_type = 'undecryptable' \
+                AND EXCLUDED.msg_type <> 'undecryptable'"
         } else {
             ""
         };
@@ -2909,6 +3001,25 @@ impl PgStore {
             )
             .map_err(pg_err)?;
         Ok(())
+    }
+
+    /// The stored `msg_type` of one message, `None` when absent. Twin of the
+    /// SQLite `message_type_get`.
+    pub fn message_type_get(
+        &self,
+        session_id: &str,
+        chat_jid: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT msg_type FROM messages \
+                 WHERE session_id=$1 AND chat_jid=$2 AND message_id=$3",
+                &[&session_id, &chat_jid, &message_id],
+            )
+            .map_err(pg_err)?;
+        Ok(row.map(|r| r.get(0)))
     }
 
     pub fn messages_insert_batch(
@@ -3038,6 +3149,37 @@ impl PgStore {
                 .map_err(pg_err)?,
         };
         Ok(n > 0)
+    }
+
+    pub fn message_mark_revoked(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<bool> {
+        let n = self
+            .conn()?
+            .execute(
+                "UPDATE messages SET revoked=1, body_text=NULL \
+                 WHERE session_id=$1 AND message_id=$2",
+                &[&session_id, &message_id],
+            )
+            .map_err(pg_err)?;
+        Ok(n > 0)
+    }
+
+    pub fn message_timestamp(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        let rows = self
+            .conn()?
+            .query(
+                "SELECT timestamp FROM messages WHERE session_id=$1 AND message_id=$2 LIMIT 1",
+                &[&session_id, &message_id],
+            )
+            .map_err(pg_err)?;
+        Ok(rows.first().map(|r| r.get::<_, i64>(0)))
     }
 
     pub fn messages_mark_self_from_me(
@@ -3817,7 +3959,7 @@ impl PgStore {
         limit: u32,
     ) -> rusqlite::Result<Vec<MessageListRow>> {
         let mut sql = String::from(
-            "SELECT chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json,edited \
+            "SELECT chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json,edited,revoked \
              FROM messages WHERE session_id=$1 AND timestamp < $2",
         );
         let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&session_id, &before];
@@ -3866,7 +4008,7 @@ impl PgStore {
             .map(|r| r.get::<_, i64>(0));
         let Some(ts) = ts else { return Ok(vec![]) };
         const COLS: &str =
-            "chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json,edited";
+            "chat_jid,message_id,sender_jid,from_me,timestamp,msg_type,body_text,payload_json,edited,revoked";
         let older_sql = format!(
             "SELECT {COLS} FROM messages WHERE session_id=$1 AND chat_jid=$2 \
              AND timestamp <= $3 ORDER BY timestamp DESC, message_id DESC LIMIT {}",
@@ -4336,6 +4478,7 @@ fn pg_row_to_msg_list(r: &postgres::Row) -> MessageListRow {
         // Column 7 is `payload_json`; pull the reply quote out of it (if present).
         quoted: parse_quoted(&r.get::<_, String>(7)),
         edited: r.get::<_, i64>(8) != 0,
+        revoked: r.get::<_, i64>(9) != 0,
     }
 }
 
@@ -4454,6 +4597,7 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/0015_messages_fts.sql")),
         M::up(include_str!("../migrations/0016_message_secrets.sql")),
         M::up(include_str!("../migrations/0017_messages_edited.sql")),
+        M::up(include_str!("../migrations/0018_messages_revoked.sql")),
     ])
 }
 
@@ -4548,6 +4692,69 @@ mod tests {
             .message_context("s1", "c@s", "nope", 5, 5)
             .unwrap()
             .is_empty());
+    }
+
+    /// The inbound-dedup insert drops duplicate deliveries — EXCEPT when it
+    /// heals an `undecryptable` placeholder: the retry-receipt recovery makes
+    /// the sender resend the SAME message id, and its successful decrypt must
+    /// replace the placeholder row (or the first message from every new
+    /// contact stays `[undecryptable]` forever).
+    #[test]
+    fn message_insert_heals_undecryptable_but_keeps_dedup() {
+        let store = Store::open(":memory:").unwrap();
+        seed_session(&store, "s1");
+        let row = |msg_type: &'static str, body: Option<&'static str>, payload: &'static str| {
+            NewMessage {
+                session_id: "s1",
+                chat_jid: "c@s",
+                message_id: "m1",
+                sender_jid: "x@s",
+                from_me: false,
+                timestamp: 100,
+                msg_type,
+                body_text: body,
+                payload_json: payload,
+                status: None,
+            }
+        };
+        let stored_type =
+            |store: &Store| store.message_type_get("s1", "c@s", "m1").unwrap().unwrap();
+
+        // 1. First delivery fails to decrypt → placeholder row.
+        store
+            .message_insert(&row("undecryptable", None, r#"{"type":"undecryptable"}"#), true)
+            .unwrap();
+        assert_eq!(stored_type(&store), "undecryptable");
+
+        // 2. A redelivery that ALSO fails must not churn the row (and not error).
+        store
+            .message_insert(&row("undecryptable", None, r#"{"type":"undecryptable"}"#), true)
+            .unwrap();
+        assert_eq!(stored_type(&store), "undecryptable");
+
+        // 3. The retry-recovered resend decrypts → placeholder is healed in place.
+        store
+            .message_insert(&row("text", Some("oi"), r#"{"type":"text","text":"oi"}"#), true)
+            .unwrap();
+        assert_eq!(stored_type(&store), "text");
+        let msgs = store.messages_list("s1", Some("c@s"), None, i64::MAX, 10).unwrap();
+        assert_eq!(msgs.len(), 1, "healed in place, not duplicated");
+        assert_eq!(msgs[0].body_text.as_deref(), Some("oi"));
+
+        // 4. Ordinary dedup still holds: a duplicate of a DECRYPTED row is
+        //    dropped, and a late undecryptable redelivery never regresses it.
+        store
+            .message_insert(&row("text", Some("changed"), r#"{"type":"text"}"#), true)
+            .unwrap();
+        store
+            .message_insert(&row("undecryptable", None, r#"{"type":"undecryptable"}"#), true)
+            .unwrap();
+        let msgs = store.messages_list("s1", Some("c@s"), None, i64::MAX, 10).unwrap();
+        assert_eq!(msgs[0].body_text.as_deref(), Some("oi"));
+        assert_eq!(msgs[0].msg_type, "text");
+
+        // message_type_get: absent row → None.
+        assert!(store.message_type_get("s1", "c@s", "nope").unwrap().is_none());
     }
 
     #[test]
@@ -4812,6 +5019,44 @@ mod tests {
         let m2 = rows.iter().find(|r| r.message_id == "M2").unwrap();
         assert_eq!(m2.body_text.as_deref(), Some("keep me"));
         assert!(m2.edited);
+    }
+
+    /// A revoke tombstones the TARGET in place: body cleared, `revoked` set, no
+    /// extra row. Before this the deleted message just sat in the chat.
+    #[test]
+    fn message_mark_revoked_tombstones_target_in_place() {
+        let store = Store::open(":memory:").unwrap();
+        seed_session(&store, "s1");
+        store
+            .message_insert(
+                &NewMessage {
+                    session_id: "s1",
+                    chat_jid: "c@s",
+                    message_id: "M1",
+                    sender_jid: "x@s",
+                    from_me: true,
+                    timestamp: 100,
+                    msg_type: "text",
+                    body_text: Some("oops, wrong chat"),
+                    payload_json: "{}",
+                    status: None,
+                },
+                true,
+            )
+            .unwrap();
+
+        // Unknown target → false (caller falls back to a standalone marker).
+        assert!(!store.message_mark_revoked("s1", "NOPE").unwrap());
+        assert!(store.message_mark_revoked("s1", "M1").unwrap());
+
+        let rows = store.messages_list("s1", Some("c@s"), None, i64::MAX, 50).unwrap();
+        assert_eq!(rows.len(), 1, "revoke updates in place, no extra row");
+        assert!(rows[0].revoked);
+        assert_eq!(rows[0].body_text, None, "revoked content must be gone");
+
+        // The age lookup that gates the revoke API reads the same row.
+        assert_eq!(store.message_timestamp("s1", "M1").unwrap(), Some(100));
+        assert_eq!(store.message_timestamp("s1", "NOPE").unwrap(), None);
     }
 
     #[test]

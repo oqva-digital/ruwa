@@ -102,11 +102,13 @@ CREATE TABLE IF NOT EXISTS messages (
     media_path   TEXT,
     status       TEXT NOT NULL DEFAULT 'received',
     edited       BIGINT NOT NULL DEFAULT 0,
+    revoked      BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, chat_jid, message_id)
 );
--- Existing deploys: add the edit flag in place (CREATE above is a no-op once the
--- table exists). Mirrors the body_tsv backfill pattern.
+-- Existing deploys: add the edit/revoke flags in place (CREATE above is a no-op
+-- once the table exists). Mirrors the body_tsv backfill pattern.
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS revoked BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages (session_id, chat_jid, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages (session_id, sender_jid, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_status ON messages (session_id, status, timestamp);

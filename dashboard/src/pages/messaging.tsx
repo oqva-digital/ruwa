@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { useQuery, useQueryClient, keepPreviousData } from "@tanstack/react-query"
 import { toast } from "sonner"
-import { Search, Send, SmilePlus, Trash2, MessageSquare } from "lucide-react"
+import { Search, Send, SmilePlus, Trash2, Pencil, MessageSquare } from "lucide-react"
 import { api } from "@/lib/api"
 import type { SessionMeta, MessageRow } from "@/lib/types"
 import { fmtTs } from "@/lib/format"
@@ -160,6 +160,18 @@ export function MessagingPage({ inst }: { inst: SessionMeta }) {
       toast.error("React failed", { description: e instanceof Error ? e.message : "" })
     }
   }
+  async function doEdit(m: MessageRow) {
+    if (!sel) return
+    const text = await promptDialog({ title: "Edit message", defaultValue: m.body_text ?? "", placeholder: "new text", confirmLabel: "Save" })
+    if (text === null || !text.trim()) return
+    try {
+      await api.edit(inst.id, sel, m.message_id, text)
+      toast.success("Edited")
+      setTimeout(() => qc.invalidateQueries({ queryKey: ["messages", inst.id, sel] }), 400)
+    } catch (e) {
+      toast.error("Edit failed", { description: e instanceof Error ? e.message : "" })
+    }
+  }
   async function doRevoke(m: MessageRow) {
     if (!sel || !(await confirmDialog({ title: "Revoke message?", message: "Deletes it for everyone.", confirmLabel: "Revoke", danger: true }))) return
     try {
@@ -234,7 +246,9 @@ export function MessagingPage({ inst }: { inst: SessionMeta }) {
                         </div>
                       </div>
                     )}
-                    {MEDIA_TYPES.has(m.msg_type) ? (
+                    {m.revoked || m.msg_type === "revoked" ? (
+                      <span className="italic text-muted-foreground">This message was deleted</span>
+                    ) : MEDIA_TYPES.has(m.msg_type) ? (
                       <div className="flex flex-col gap-1">
                         <MediaBubble inst={inst} chat={sel} m={m} />
                         {m.body_text && <span>{m.body_text}</span>}
@@ -248,8 +262,14 @@ export function MessagingPage({ inst }: { inst: SessionMeta }) {
                     {(m.edited || m.msg_type === "edited") && <span className="shrink-0 italic">· edited</span>}
                     <span className="opacity-0 transition-opacity group-hover:opacity-100">
                       <button onClick={() => doReact(m)} className="ml-1 hover:text-foreground"><SmilePlus className="inline h-3 w-3" /></button>
-                      {m.from_me && (
-                        <button onClick={() => doRevoke(m)} className="ml-1.5 hover:text-destructive"><Trash2 className="inline h-3 w-3" /></button>
+                      {m.from_me && !m.revoked && m.msg_type !== "revoked" && (
+                        <>
+                          {/* Edit only applies to text; WhatsApp rejects it past 15 min (the API says so). */}
+                          {!MEDIA_TYPES.has(m.msg_type) && (
+                            <button onClick={() => doEdit(m)} className="ml-1.5 hover:text-foreground"><Pencil className="inline h-3 w-3" /></button>
+                          )}
+                          <button onClick={() => doRevoke(m)} className="ml-1.5 hover:text-destructive"><Trash2 className="inline h-3 w-3" /></button>
+                        </>
                       )}
                     </span>
                   </div>

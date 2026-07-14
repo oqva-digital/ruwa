@@ -62,6 +62,8 @@ export interface MessageRow {
   body_text: string | null
   /** True when the message was edited and the new text applied in place. */
   edited?: boolean
+  /** True when the message was deleted for everyone. `body_text` is cleared with it. */
+  revoked?: boolean
   quoted?: QuotedRef | null
   timestamp: number
   [k: string]: unknown
