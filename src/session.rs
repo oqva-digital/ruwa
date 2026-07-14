@@ -7448,15 +7448,11 @@ fn secret_encrypted_from_e2e(
             f.message
         } else if let Some(f) = m.edited_message.take() {
             f.message
-        } else if let Some(d) = m.device_sent_message.take() {
-            d.message
         } else {
-            return None;
+            let d = m.device_sent_message.take()?;
+            d.message
         };
-        match inner {
-            Some(b) => m = *b,
-            None => return None,
-        }
+        m = *inner?;
     }
     None
 }
