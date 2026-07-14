@@ -4251,7 +4251,13 @@ async fn encrypt_inner_proto_and_ship(
     // 2. Build the <message> node, register the pending ack BEFORE
     //    pushing onto the wire (so a fast server can't beat us), then
     //    ship + flip status to 'sent'.
-    let mut node = build_message_node(msg_id, chat_jid, &recipients, timestamp);
+    let mut node = build_message_node(
+        msg_id,
+        chat_jid,
+        &recipients,
+        timestamp,
+        edit_attribute_for_inner(inner_proto_bytes),
+    );
     // If any recipient got a `pkmsg` (first-time send to that device), the
     // server requires us to attach a `<device-identity>` child carrying our
     // `account_pb` (the marshalled ADVSignedDeviceIdentity). Without it,
@@ -4444,8 +4450,15 @@ async fn send_group_message(
         None
     };
 
-    let node =
-        build_group_message_node(msg_id, group_jid, &recipients, &skmsg_wire, timestamp, account_pb);
+    let node = build_group_message_node(
+        msg_id,
+        group_jid,
+        &recipients,
+        &skmsg_wire,
+        timestamp,
+        account_pb,
+        edit_attribute_for_inner(inner_proto_bytes),
+    );
 
     // 8. Ship + ack (mirrors the 1:1 tail).
     session.record_recent_send(msg_id, group_jid, inner_proto_bytes);
@@ -4582,6 +4595,7 @@ fn build_group_message_node(
     skmsg_wire: &[u8],
     timestamp: i64,
     account_pb: Option<Vec<u8>>,
+    edit: Option<&str>,
 ) -> crate::protocol::binary::Node {
     use crate::crypto::signal::MessageType;
     use crate::protocol::binary::{Attrs, Content, Node};
@@ -4598,6 +4612,9 @@ fn build_group_message_node(
                     MessageType::Whisper => "msg".into(),
                 },
             );
+            if edit.is_some() {
+                enc_attrs.insert("decrypt-fail".into(), "hide".into());
+            }
             let mut to_attrs = Attrs::new();
             to_attrs.insert("jid".into(), r.jid.clone());
             Node {
@@ -4612,6 +4629,8 @@ fn build_group_message_node(
         })
         .collect();
 
+    // The `skmsg` enc carries no `decrypt-fail`: whatsmeow only stamps the
+    // per-device SKDM envelopes (send.go, encAttrs → encryptMessageForDevices).
     let mut skmsg_attrs = Attrs::new();
     skmsg_attrs.insert("v".into(), "2".into());
     skmsg_attrs.insert("type".into(), "skmsg".into());
@@ -4641,6 +4660,9 @@ fn build_group_message_node(
     msg_attrs.insert("type".into(), "text".into());
     msg_attrs.insert("to".into(), group_jid.into());
     msg_attrs.insert("t".into(), timestamp.to_string());
+    if let Some(e) = edit {
+        msg_attrs.insert("edit".into(), e.into());
+    }
     Node {
         tag: "message".into(),
         attrs: msg_attrs,
@@ -6541,12 +6563,23 @@ fn decrypt_group_message(
     None
 }
 
+/// How long a failed-decrypt inbound gets to heal (retry receipt → sender
+/// resends → decrypt succeeds, typically 1-2s) before its `[undecryptable]`
+/// placeholder is surfaced to webhook/SSE consumers. Emitting the placeholder
+/// immediately made id-deduping consumers keep it forever even though the
+/// recovered decrypt followed a second later.
+const UNDECRYPTABLE_EVENT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Handle a server-pushed `<message>` node: try to decrypt the inner
 /// `<enc>` against the matching SessionRecord, persist a row, and emit an
 /// inbound event. Returns the `<receipt>` ack to ship back regardless of
 /// whether decryption actually worked — the server expects every message
 /// to be acked. Failed-decrypt rows still land in `messages` (with
-/// msg_type="undecryptable") so the API consumer can see something arrived.
+/// msg_type="undecryptable") so the API consumer can see something arrived —
+/// but their event is deferred by [`UNDECRYPTABLE_EVENT_GRACE`] so the
+/// retry-recovered decrypt (same id) can win the race and both the stored row
+/// (healed via the `message_insert` upsert) and the first event a consumer
+/// sees carry the real content.
 ///
 /// Decryption is best-effort: the post-Noise socket we have today doesn't
 /// yet maintain the full ratchet across multiple inbound chains. Type=
@@ -6763,6 +6796,14 @@ fn process_inbound_message(
         _ => None,
     };
 
+    // A revoke (delete-for-everyone) likewise targets an existing message: mark
+    // the ORIGINAL as revoked in place (below) instead of inserting a standalone
+    // "revoked" row that leaves the deleted message sitting in the chat.
+    let revoke_target: Option<String> = match &decoded {
+        Some(InboundContent::Revoked { target_id }) => target_id.clone(),
+        _ => None,
+    };
+
     // Decide msg_type + body_text + payload from the decoded InboundContent.
     let (msg_type, body_text, mut payload) = match decoded {
         None => (
@@ -6944,6 +6985,11 @@ fn process_inbound_message(
                 text.clone(),
                 serde_json::json!({"type": "edited", "text": text, "edits": target_id, "enc_type": enc_type}),
             ),
+            InboundContent::Revoked { target_id } => (
+                "revoked".to_string(),
+                None,
+                serde_json::json!({"type": "revoked", "revokes": target_id, "enc_type": enc_type}),
+            ),
             InboundContent::Other => (
                 "unknown".to_string(),
                 None,
@@ -7054,7 +7100,42 @@ fn process_inbound_message(
         None => false,
     };
 
-    if !is_protocol_only && !edit_applied {
+    // A REVOKE tombstones the ORIGINAL message in place: clear its body, set
+    // `revoked`, and DON'T insert a separate row. Same fallback as the edit path
+    // — if we don't have the original, `revoke_applied` stays false and the
+    // marker is stored on its own so the deletion isn't silently lost.
+    let revoke_applied = match revoke_target.as_deref() {
+        Some(target) => match store.message_mark_revoked(&session_id, target) {
+            Ok(true) => {
+                let mut body_obj = serde_json::Map::new();
+                body_obj.insert("type".into(), serde_json::json!("revoked"));
+                body_obj.insert("revokes".into(), serde_json::json!(target));
+                body_obj.insert("from_me".into(), serde_json::json!(store_from_me));
+                body_obj.insert("push_name".into(), serde_json::json!(push_name));
+                let _ = session.events.send(SessionEvent::Message {
+                    id: msg_id.clone(),
+                    chat: chat_canon.clone(),
+                    from: sender_canon.clone(),
+                    body: serde_json::Value::Object(body_obj),
+                });
+                tracing::info!(target = %target, "applied revoke onto original message in place");
+                true
+            }
+            _ => false,
+        },
+        None => false,
+    };
+
+    // Bump the per-message inbound retry counter ONCE per delivery, up front,
+    // so the event gating below and the retry-receipt branch at the tail agree
+    // on this delivery's attempt number.
+    let undecryptable_count = if msg_type == "undecryptable" {
+        session.bump_message_retry(&msg_id)
+    } else {
+        0
+    };
+
+    if !is_protocol_only && !edit_applied && !revoke_applied {
         let payload_json = payload.to_string();
         let _ = store.message_insert(
             &crate::store::NewMessage {
@@ -7116,12 +7197,49 @@ fn process_inbound_message(
         }
         body_obj.insert("push_name".into(), serde_json::json!(push_name));
         body_obj.insert("from_me".into(), serde_json::json!(store_from_me));
-        let _ = session.events.send(SessionEvent::Message {
+        let event = SessionEvent::Message {
             id: msg_id.clone(),
             chat: chat_canon.clone(),
             from: sender_canon.clone(),
             body: serde_json::Value::Object(body_obj),
-        });
+        };
+        if msg_type == "undecryptable" {
+            // Don't surface `[undecryptable]` to webhook/SSE consumers yet:
+            // the retry receipt below makes the sender resend, and the resend
+            // usually decrypts within ~1-2s — its event (same id, real body)
+            // must be the FIRST one a consumer sees, or an id-deduping
+            // consumer keeps the placeholder forever. Emit the placeholder
+            // only if the row is still undecryptable after the grace window
+            // (sender never recovered), so nothing is silently lost. One
+            // fallback per message: scheduled on the first failed delivery.
+            if undecryptable_count == 1 {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let sess = Arc::clone(session);
+                    let st = Arc::clone(store);
+                    let sid = session_id.clone();
+                    let chat = chat_canon.clone();
+                    let mid = msg_id.clone();
+                    handle.spawn(async move {
+                        tokio::time::sleep(UNDECRYPTABLE_EVENT_GRACE).await;
+                        match st.message_type_get(&sid, &chat, &mid) {
+                            Ok(Some(t)) if t == "undecryptable" => {
+                                tracing::info!(
+                                    session = %sid,
+                                    id = %mid,
+                                    "still undecryptable after grace window — surfacing placeholder event"
+                                );
+                                let _ = sess.events.send(event);
+                            }
+                            // Healed (retry resend decrypted, row upserted) or
+                            // pruned — the decrypted event already went out.
+                            _ => {}
+                        }
+                    });
+                }
+            }
+        } else {
+            let _ = session.events.send(event);
+        }
     }
 
     if msg_type == "undecryptable" {
@@ -7142,7 +7260,8 @@ fn process_inbound_message(
         // would reuse the same dead prekey. Only a fresh OPK in the bundle
         // fixes it, so we send one immediately. Stop after 5 — past that the
         // peer isn't recovering and we'd only be hammering the socket.
-        let count = session.bump_message_retry(&msg_id);
+        // (Counter bumped once per delivery, above the persist/emit block.)
+        let count = undecryptable_count;
         if count >= 5 {
             // Give up: the peer isn't recovering (typically offline backlog
             // encrypted to a one-time prekey we've already consumed — permanently
@@ -7678,12 +7797,13 @@ fn classify_e2e_message(
             };
             return InboundContent::Edited { target_id: edit_target, text };
         }
-        // A REVOKE (delete-for-everyone, `type=REVOKE`) has no body; surface a
-        // typed marker so the row isn't "unknown" either.
+        // A REVOKE (delete-for-everyone, `type=REVOKE`) has no body of its own —
+        // it names the message to delete (`pm.key`). Surface the target so the
+        // receive path can tombstone the original in place.
         if ptype
             == Some(crate::proto::wa_web_protobufs_e2e::protocol_message::Type::Revoke as i32)
         {
-            return InboundContent::Typed { kind: "revoked".into(), text: None };
+            return InboundContent::Revoked { target_id: edit_target };
         }
         // Any OTHER protocolMessage subtype (ephemeral/disappearing-timer
         // setting, peer-data operation, key-request, …) is a control message
@@ -7907,6 +8027,10 @@ enum InboundContent {
     /// The receive path applies it onto the original IN PLACE rather than
     /// storing a separate row.
     Edited { target_id: Option<String>, text: Option<String> },
+    /// A REVOKE (delete-for-everyone). `target_id` is the deleted message's
+    /// stanza id. Like an edit, the receive path applies it onto the target IN
+    /// PLACE (clear the body, set `revoked`) instead of storing a separate row.
+    Revoked { target_id: Option<String> },
     Other,
 }
 
@@ -8501,6 +8625,7 @@ fn build_retry_resend_node(
     count: u32,
     timestamp: i64,
     account_pb: Option<Vec<u8>>,
+    edit: Option<&str>,
 ) -> crate::protocol::binary::Node {
     use crate::crypto::signal::MessageType;
     use crate::protocol::binary::{Attrs, Content, Node};
@@ -8513,6 +8638,9 @@ fn build_retry_resend_node(
         if is_pkmsg { "pkmsg".into() } else { "msg".into() },
     );
     enc_attrs.insert("count".into(), count.to_string());
+    if edit.is_some() {
+        enc_attrs.insert("decrypt-fail".into(), "hide".into());
+    }
     let enc = Node {
         tag: "enc".into(),
         attrs: enc_attrs,
@@ -8537,6 +8665,12 @@ fn build_retry_resend_node(
     msg_attrs.insert("t".into(), timestamp.to_string());
     // 1:1 resend goes to a single device; suppress server-side fan-out.
     msg_attrs.insert("device_fanout".into(), "false".into());
+    // A resent revoke/edit still needs its `edit` attr, or the retried stanza
+    // lands as an ordinary message and does nothing (whatsmeow retry.go:375
+    // copies the attr off the original node the same way).
+    if let Some(e) = edit {
+        msg_attrs.insert("edit".into(), e.into());
+    }
 
     Node {
         tag: "message".into(),
@@ -8671,7 +8805,15 @@ async fn handle_inbound_retry_receipt(
     };
 
     let account_pb = store.session_account_pb(&session_id).ok().flatten();
-    let node = build_retry_resend_node(&req.msg_id, &device, &rec, req.count, now, account_pb);
+    let node = build_retry_resend_node(
+        &req.msg_id,
+        &device,
+        &rec,
+        req.count,
+        now,
+        account_pb,
+        edit_attribute_for_inner(&inner_proto),
+    );
     // Register an ack slot (best-effort; we don't block on it here).
     let _ack = dispatcher.register_ack(&req.msg_id);
     dispatcher.send_node(node);
@@ -10485,11 +10627,52 @@ pub struct EncryptedRecipient {
 /// in `recipients` is one device the message must reach (typically the
 /// phone + every linked-device fan-out you fetched prekeys for).
 #[allow(dead_code)]
+/// The stanza-level `edit` attribute for an outbound waE2E.Message, mirroring
+/// whatsmeow's `send.go::getEditAttribute`.
+///
+/// WhatsApp only *applies* a revoke or an edit when the `<message>` stanza
+/// itself carries this attribute — the `protocolMessage` inside the ciphertext
+/// is not enough on its own. A revoke shipped without `edit` is accepted and
+/// acked by the server, then silently dropped by every client: exactly the
+/// "delete for everyone did nothing" symptom.
+fn edit_attribute_for_inner(inner_proto: &[u8]) -> Option<&'static str> {
+    use crate::proto::wa_web_protobufs_e2e::{protocol_message::Type as PMType, Message};
+    use prost::Message as _;
+
+    let msg = Message::decode(inner_proto).ok()?;
+    if let Some(p) = msg.protocol_message.as_ref() {
+        if let Some(key) = p.key.as_ref() {
+            let ty = p.r#type.unwrap_or(-1);
+            if ty == PMType::Revoke as i32 {
+                // 7 = sender revoke (deleting your own message); 8 = admin
+                // revoke (deleting someone else's, group admins only).
+                return Some(if key.from_me.unwrap_or(false) {
+                    "7"
+                } else {
+                    "8"
+                });
+            }
+            if ty == PMType::MessageEdit as i32 && p.edited_message.is_some() {
+                return Some("1");
+            }
+        }
+    }
+    // Removing a reaction is an empty-text reaction, and rides the same
+    // sender-revoke attribute.
+    if let Some(r) = msg.reaction_message.as_ref() {
+        if r.text.as_deref().unwrap_or("").is_empty() {
+            return Some("7");
+        }
+    }
+    None
+}
+
 pub fn build_message_node(
     msg_id: &str,
     chat_jid: &str,
     recipients: &[EncryptedRecipient],
     timestamp: i64,
+    edit: Option<&str>,
 ) -> crate::protocol::binary::Node {
     use crate::crypto::signal::MessageType;
     use crate::protocol::binary::{Attrs, Content, Node};
@@ -10506,6 +10689,11 @@ pub fn build_message_node(
                     MessageType::Whisper => "msg".into(),
                 },
             );
+            // An edit/revoke must not surface as a decrypt failure on a device
+            // whose session is stale — it has nothing to show the user.
+            if edit.is_some() {
+                enc_attrs.insert("decrypt-fail".into(), "hide".into());
+            }
             let enc = Node {
                 tag: "enc".into(),
                 attrs: enc_attrs,
@@ -10526,6 +10714,9 @@ pub fn build_message_node(
     msg_attrs.insert("type".into(), "text".into());
     msg_attrs.insert("to".into(), chat_jid.into());
     msg_attrs.insert("t".into(), timestamp.to_string());
+    if let Some(e) = edit {
+        msg_attrs.insert("edit".into(), e.into());
+    }
 
     Node {
         tag: "message".into(),
@@ -12363,6 +12554,14 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
                             text.clone(),
                             serde_json::json!({"type":"edited","text":text,"edits":target_id,"source":"history_sync"}),
                         ),
+                        // Same for a history-sync revoke: the target may not be
+                        // ingested yet, so record the marker rather than trying
+                        // to tombstone a row that might not exist.
+                        InboundContent::Revoked { target_id } => (
+                            "revoked".to_string(),
+                            None,
+                            serde_json::json!({"type":"revoked","revokes":target_id,"source":"history_sync"}),
+                        ),
                         InboundContent::HistorySyncNotification(_)
                         | InboundContent::AppStateSyncKeyShare(_)
                         | InboundContent::Other => (
@@ -12969,7 +13168,7 @@ mod tests {
             EncryptedRecipient { jid: "5511999999999:0@s.whatsapp.net".into(), ciphertext: vec![1, 2, 3], message_type: MessageType::PreKey },
             EncryptedRecipient { jid: "5511888888888:0@s.whatsapp.net".into(), ciphertext: vec![4, 5], message_type: MessageType::Whisper },
         ];
-        let node = build_group_message_node("MID1", "120363@g.us", &recipients, &[9, 9, 9], 1700000000, Some(vec![0xAB]));
+        let node = build_group_message_node("MID1", "120363@g.us", &recipients, &[9, 9, 9], 1700000000, Some(vec![0xAB]), None);
         assert_eq!(node.attrs.get("to").map(String::as_str), Some("120363@g.us"));
         let children = match &node.content { Content::Nodes(ns) => ns, _ => panic!() };
         // participants + skmsg enc + device-identity
@@ -15203,6 +15402,85 @@ mod tests {
         assert_eq!(edited.conversation.as_deref(), Some("fixed"));
     }
 
+    /// A revoke/edit is only APPLIED by WhatsApp when the `<message>` stanza
+    /// carries the `edit` attr — the protocolMessage inside the ciphertext is
+    /// not enough. We shipped revokes without it, so the server acked them and
+    /// every client dropped them: "delete for everyone" was a silent no-op.
+    #[test]
+    fn revoke_and_edit_inners_derive_the_stanza_edit_attribute() {
+        let chat = "5511999@s.whatsapp.net";
+
+        // Deleting your OWN message → sender revoke (7).
+        let own_revoke = build_revoke_message(chat, "TGT-1", true, None);
+        assert_eq!(edit_attribute_for_inner(&own_revoke), Some("7"));
+
+        // Deleting SOMEONE ELSE's message (group admin) → admin revoke (8).
+        let admin_revoke = build_revoke_message(chat, "TGT-1", false, Some("u@s.whatsapp.net"));
+        assert_eq!(edit_attribute_for_inner(&admin_revoke), Some("8"));
+
+        // Edit → 1.
+        let edit = build_edit_message(chat, "TGT-1", true, None, "fixed", 1_700_000_000_000);
+        assert_eq!(edit_attribute_for_inner(&edit), Some("1"));
+
+        // Removing a reaction (empty emoji) rides the sender-revoke attr; a
+        // real reaction and an ordinary text carry none.
+        let unreact = build_reaction_message(chat, "TGT-1", true, None, "", 1_700_000_000_000);
+        assert_eq!(edit_attribute_for_inner(&unreact), Some("7"));
+        let react = build_reaction_message(chat, "TGT-1", true, None, "👍", 1_700_000_000_000);
+        assert_eq!(edit_attribute_for_inner(&react), None);
+        assert_eq!(edit_attribute_for_inner(&build_e2e_conversation("oi")), None);
+        // Garbage in → no attr, never a panic.
+        assert_eq!(edit_attribute_for_inner(&[0xff, 0xff, 0xff]), None);
+    }
+
+    /// The derived attr must actually land on the wire: `edit` on `<message>`
+    /// and `decrypt-fail=hide` on every `<enc>` (a stale-session device has
+    /// nothing to show for a revoke, so it must not surface a decrypt failure).
+    #[test]
+    fn revoke_message_node_carries_edit_attr_and_hides_decrypt_fail() {
+        use crate::crypto::signal::MessageType;
+        use crate::protocol::binary::Content;
+
+        let recipients = [EncryptedRecipient {
+            jid: "5511999999999.0:23@s.whatsapp.net".into(),
+            ciphertext: vec![0xDE, 0xAD],
+            message_type: MessageType::Whisper,
+        }];
+        let inner = build_revoke_message("5511999999999@s.whatsapp.net", "TGT-1", true, None);
+        let node = build_message_node(
+            "msg-rev",
+            "5511999999999@s.whatsapp.net",
+            &recipients,
+            1_700_000_000,
+            edit_attribute_for_inner(&inner),
+        );
+        assert_eq!(node.attrs.get("edit").map(String::as_str), Some("7"));
+
+        let participants = match &node.content {
+            Content::Nodes(ns) => ns.iter().find(|n| n.tag == "participants").expect("participants"),
+            _ => panic!("expected child nodes"),
+        };
+        let to = match &participants.content {
+            Content::Nodes(ns) => &ns[0],
+            _ => panic!("expected <to> nodes"),
+        };
+        let enc = match &to.content {
+            Content::Nodes(ns) => &ns[0],
+            _ => panic!("expected <enc>"),
+        };
+        assert_eq!(enc.attrs.get("decrypt-fail").map(String::as_str), Some("hide"));
+
+        // A plain text send is untouched: no edit attr, no decrypt-fail.
+        let plain = build_message_node(
+            "msg-txt",
+            "5511999999999@s.whatsapp.net",
+            &recipients,
+            1_700_000_000,
+            edit_attribute_for_inner(&build_e2e_conversation("oi")),
+        );
+        assert!(!plain.attrs.contains_key("edit"));
+    }
+
     #[test]
     fn build_remove_companion_device_iq_has_canonical_shape() {
         use crate::protocol::binary::Content;
@@ -15582,6 +15860,7 @@ mod tests {
             "5511999999999@s.whatsapp.net",
             &recipients,
             1_700_000_000,
+            None,
         );
         assert_eq!(node.tag, "message");
         assert_eq!(node.attrs.get("id").map(String::as_str), Some("msg-1"));
@@ -16585,19 +16864,25 @@ mod tests {
             _ => panic!("expected Edited"),
         }
 
+        // A REVOKE names the message it deletes (`key.id`). Surfacing that target
+        // is what lets the receive path tombstone the ORIGINAL in place instead
+        // of dropping a standalone "revoked" row next to a message that stays put.
         let revoke = e2e::Message {
             protocol_message: Some(Box::new(e2e::ProtocolMessage {
                 r#type: Some(e2e::protocol_message::Type::Revoke as i32),
+                key: Some(crate::proto::wa_common::MessageKey {
+                    id: Some("TGT-9".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             })),
             ..Default::default()
         };
         match decode_e2e_message(&revoke.encode_to_vec()) {
-            InboundContent::Typed { kind, text } => {
-                assert_eq!(kind, "revoked");
-                assert!(text.is_none());
+            InboundContent::Revoked { target_id } => {
+                assert_eq!(target_id.as_deref(), Some("TGT-9"));
             }
-            _ => panic!("expected Typed/revoked"),
+            _ => panic!("expected Revoked"),
         }
     }
 
@@ -17515,6 +17800,12 @@ mod tests {
             }
         };
 
+        // Subscribe before processing: a failed decrypt must NOT surface an
+        // immediate `[undecryptable]` Message event — id-deduping consumers
+        // would keep it and ignore the retry-recovered decrypt that follows.
+        // (The delayed fallback emit needs a tokio runtime; none here.)
+        let mut events = alice.events.subscribe();
+
         // --- Eager keys: the FIRST retry already carries the bundle. A live
         // repro showed peers won't act on a keyless retry (and would reuse a
         // dead one-time prekey), so we re-establish from retry #1. ---
@@ -17526,6 +17817,17 @@ mod tests {
         let r2 = process_inbound_message(&alice, &store, &alice_keys, None, &make_inbound())
             .expect("retry receipt");
         assert_full_retry(&r2, "2");
+
+        // No event surfaced for either failed delivery, but the placeholder
+        // row IS persisted (so nothing is lost if the sender never recovers).
+        assert!(
+            events.try_recv().is_err(),
+            "undecryptable inbound must not emit an immediate Message event"
+        );
+        assert_eq!(
+            store.message_type_get(&alice_id, peer, "RETRY-ME").unwrap().as_deref(),
+            Some("undecryptable")
+        );
 
         // Each retry mints + persists a fresh, loadable OPK (two retries → the
         // max id advanced by at least one).

@@ -2513,6 +2513,10 @@ struct EditReq {
     text: String,
 }
 
+/// How long after sending WhatsApp still accepts an edit. Past this the stanza
+/// is ignored — the official app hides the "Edit" option once it lapses.
+const EDIT_WINDOW_SECS: i64 = 15 * 60;
+
 async fn send_edit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2527,6 +2531,22 @@ async fn send_edit(
     let chat_jid = normalize_recipient_jid(&req.to);
     let now = chrono::Utc::now().timestamp();
     let now_ms = now * 1000;
+
+    // Same deal as the revoke window, just far tighter: WhatsApp only accepts an
+    // edit within 15 minutes of sending. Past that the stanza is ignored, so
+    // refuse it rather than returning a 202 that reads as success.
+    if let Ok(Some(ts)) = state.manager.store.message_timestamp(&id, &req.msg_id) {
+        let age = now.saturating_sub(ts);
+        if age > EDIT_WINDOW_SECS {
+            return Err(Error::BadRequest(format!(
+                "message is {} minutes old; WhatsApp only allows editing within \
+                 {} minutes of sending",
+                age / 60,
+                EDIT_WINDOW_SECS / 60,
+            )));
+        }
+    }
+
     let inner = crate::session::build_edit_message(
         &chat_jid,
         &req.msg_id,
@@ -2542,6 +2562,28 @@ async fn send_edit(
         inner_proto: inner,
         timestamp: now,
     });
+
+    // Apply the new text to our own copy too. The peer's devices learn it from
+    // the stanza; without this our chat keeps showing the text we just replaced
+    // (the same gap the revoke path had).
+    if let Ok(true) = state
+        .manager
+        .store
+        .message_mark_edited(&id, &req.msg_id, Some(&req.text))
+    {
+        let _ = session.events.send(crate::session::SessionEvent::Message {
+            id: msg_id.clone(),
+            chat: chat_jid.clone(),
+            from: chat_jid.clone(),
+            body: serde_json::json!({
+                "type": "edited",
+                "text": req.text,
+                "edits": req.msg_id,
+                "from_me": true,
+            }),
+        });
+    }
+
     Ok((
         StatusCode::ACCEPTED,
         Json(SendTextResp {
@@ -2562,6 +2604,12 @@ struct RevokeReq {
     participant: Option<String>,
 }
 
+/// How long after sending WhatsApp still honours a "delete for everyone".
+/// Past this the server ignores the revoke and no client deletes anything — not
+/// even the official app, which greys the option out. We reject up front instead
+/// of queueing a stanza that provably does nothing.
+const REVOKE_WINDOW_SECS: i64 = 60 * 60 * 60; // 2 days 12 hours
+
 async fn send_revoke(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2572,6 +2620,22 @@ async fn send_revoke(
     let session = state.manager.get(&id)?;
     let chat_jid = normalize_recipient_jid(&req.to);
     let now = chrono::Utc::now().timestamp();
+
+    // Refuse a revoke WhatsApp will silently drop. Only when we actually have
+    // the target row: if we don't know the message, we can't judge its age, so
+    // let it through and let the server decide.
+    if let Ok(Some(ts)) = state.manager.store.message_timestamp(&id, &req.msg_id) {
+        let age = now.saturating_sub(ts);
+        if age > REVOKE_WINDOW_SECS {
+            return Err(crate::error::Error::BadRequest(format!(
+                "message is {} hours old; WhatsApp only allows delete-for-everyone \
+                 within {} hours of sending",
+                age / 3600,
+                REVOKE_WINDOW_SECS / 3600,
+            )));
+        }
+    }
+
     let inner = crate::session::build_revoke_message(
         &chat_jid,
         &req.msg_id,
@@ -2585,6 +2649,22 @@ async fn send_revoke(
         inner_proto: inner,
         timestamp: now,
     });
+
+    // Tombstone the target on our side too, so the chat stops showing a message
+    // we just deleted for everyone. The peer's own devices learn it from the
+    // stanza; our copy would otherwise sit there untouched forever.
+    if let Ok(true) = state.manager.store.message_mark_revoked(&id, &req.msg_id) {
+        let _ = session.events.send(crate::session::SessionEvent::Message {
+            id: msg_id.clone(),
+            chat: chat_jid.clone(),
+            from: chat_jid.clone(),
+            body: serde_json::json!({
+                "type": "revoked",
+                "revokes": req.msg_id,
+                "from_me": true,
+            }),
+        });
+    }
     Ok((
         StatusCode::ACCEPTED,
         Json(SendTextResp {
@@ -3926,6 +4006,198 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// Editing applies the new text to our own copy (otherwise the chat keeps
+    /// showing the text we just replaced), and a message past WhatsApp's 15-minute
+    /// edit window is refused instead of queueing a stanza the server ignores.
+    #[tokio::test]
+    async fn edit_applies_to_own_row_and_rejects_stale_targets() {
+        let state = test_state();
+        let app = router(state.clone());
+
+        let (_, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(serde_json::json!({"label": "phone"})),
+        )
+        .await;
+        let sid = body["id"].as_str().unwrap().to_string();
+
+        let (_, body) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{sid}/messages"),
+            Some("test-token"),
+            Some(serde_json::json!({"to": "5511999999999", "text": "teh cat"})),
+        )
+        .await;
+        let fresh_id = body["id"].as_str().unwrap().to_string();
+
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{sid}/messages/edit"),
+            Some("test-token"),
+            Some(serde_json::json!({
+                "to": "5511999999999", "msg_id": fresh_id, "text": "the cat", "from_me": true
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+
+        let rows = state
+            .manager
+            .store
+            .messages_list(&sid, Some("5511999999999@s.whatsapp.net"), None, i64::MAX, 50)
+            .unwrap();
+        let row = rows.iter().find(|r| r.message_id == fresh_id).unwrap();
+        assert_eq!(row.body_text.as_deref(), Some("the cat"), "our copy carries the new text");
+        assert!(row.edited);
+
+        // Older than the 15-minute window → refused, with the reason.
+        let stale_ts = chrono::Utc::now().timestamp() - (30 * 60);
+        state
+            .manager
+            .store
+            .message_insert(
+                &crate::store::NewMessage {
+                    session_id: &sid,
+                    chat_jid: "5511999999999@s.whatsapp.net",
+                    message_id: "STALE_EDIT",
+                    sender_jid: "5511999999999@s.whatsapp.net",
+                    from_me: true,
+                    timestamp: stale_ts,
+                    msg_type: "text",
+                    body_text: Some("too late"),
+                    payload_json: "{}",
+                    status: None,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{sid}/messages/edit"),
+            Some("test-token"),
+            Some(serde_json::json!({
+                "to": "5511999999999", "msg_id": "STALE_EDIT", "text": "nope", "from_me": true
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(
+            body.to_string().contains("15 minutes"),
+            "the error must say WHY: {body}"
+        );
+    }
+
+    /// Revoking tombstones our own copy (so the chat stops showing a message we
+    /// just deleted for everyone), and a message past WhatsApp's revoke window is
+    /// rejected up front instead of queueing a stanza that provably does nothing.
+    #[tokio::test]
+    async fn revoke_tombstones_own_row_and_rejects_stale_targets() {
+        let state = test_state();
+        let app = router(state.clone());
+
+        let (_, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(serde_json::json!({"label": "phone"})),
+        )
+        .await;
+        let sid = body["id"].as_str().unwrap().to_string();
+
+        // A fresh outbound message → revoke is accepted and marks our row.
+        let (_, body) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{sid}/messages"),
+            Some("test-token"),
+            Some(serde_json::json!({"to": "5511999999999", "text": "oops"})),
+        )
+        .await;
+        let fresh_id = body["id"].as_str().unwrap().to_string();
+
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{sid}/messages/revoke"),
+            Some("test-token"),
+            Some(serde_json::json!({
+                "to": "5511999999999", "msg_id": fresh_id, "from_me": true
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+
+        let rows = state
+            .manager
+            .store
+            .messages_list(&sid, Some("5511999999999@s.whatsapp.net"), None, i64::MAX, 50)
+            .unwrap();
+        let row = rows.iter().find(|r| r.message_id == fresh_id).unwrap();
+        assert!(row.revoked, "our own copy must be tombstoned");
+        assert_eq!(row.body_text, None, "revoked content must be gone");
+
+        // A message older than the window: WhatsApp would ignore the revoke, so
+        // we refuse it instead of returning a lying 202.
+        let stale_ts = chrono::Utc::now().timestamp() - (72 * 3600);
+        state
+            .manager
+            .store
+            .message_insert(
+                &crate::store::NewMessage {
+                    session_id: &sid,
+                    chat_jid: "5511999999999@s.whatsapp.net",
+                    message_id: "STALE1",
+                    sender_jid: "5511999999999@s.whatsapp.net",
+                    from_me: true,
+                    timestamp: stale_ts,
+                    msg_type: "text",
+                    body_text: Some("ancient"),
+                    payload_json: "{}",
+                    status: None,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{sid}/messages/revoke"),
+            Some("test-token"),
+            Some(serde_json::json!({
+                "to": "5511999999999", "msg_id": "STALE1", "from_me": true
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("delete-for-everyone")
+                || body.to_string().contains("delete-for-everyone"),
+            "the error must say WHY, not just fail: {body}"
+        );
+
+        // An unknown target is still allowed through — we can't judge its age.
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{sid}/messages/revoke"),
+            Some("test-token"),
+            Some(serde_json::json!({
+                "to": "5511999999999", "msg_id": "UNKNOWN1", "from_me": true
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
     }
 
     #[tokio::test]
