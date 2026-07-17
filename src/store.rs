@@ -124,6 +124,8 @@ store_delegate! {
     pn_to_lid(session_id: &str, pn_user: &str) -> rusqlite::Result<Option<String>>;
     message_secret_put(session_id: &str, message_id: &str, chat_jid: &str, sender_jid: &str, secret: &[u8], now: i64) -> rusqlite::Result<()>;
     message_secret_get(session_id: &str, message_id: &str) -> rusqlite::Result<Option<(String, Vec<u8>)>>;
+    privacy_token_put(session_id: &str, peer_lid: &str, token: &[u8], timestamp: i64, sender_timestamp: i64) -> rusqlite::Result<()>;
+    privacy_token_get(session_id: &str, peer_lid: &str) -> rusqlite::Result<Option<(Vec<u8>, i64)>>;
     prekey_count_uploaded(session_id: &str) -> rusqlite::Result<i64>;
     prekeys_pending_upload(session_id: &str, limit: u32) -> rusqlite::Result<Vec<(u32, Vec<u8>)>>;
     prekeys_mark_uploaded(session_id: &str, up_to: u32) -> rusqlite::Result<()>;
@@ -154,6 +156,8 @@ store_delegate! {
     session_mark_online(id: &str) -> rusqlite::Result<bool>;
     session_set_mark_online(id: &str, on: bool) -> rusqlite::Result<()>;
     session_account_pb(id: &str) -> rusqlite::Result<Option<Vec<u8>>>;
+    session_nct_salt(id: &str) -> rusqlite::Result<Option<Vec<u8>>>;
+    session_set_nct_salt(id: &str, salt: &[u8]) -> rusqlite::Result<()>;
     session_push_name(id: &str) -> rusqlite::Result<Option<String>>;
     session_set_push_name(id: &str, name: &str) -> rusqlite::Result<()>;
     session_mark_logged_out(id: &str, updated_at: i64) -> rusqlite::Result<()>;
@@ -543,6 +547,54 @@ impl SqliteStore {
         .and_then(|opt| match opt {
             Some((sender, blob)) => Ok(Some((sender, unseal(blob)?))),
             None => Ok(None),
+        })
+    }
+
+    /// Upsert a peer's privacy token (tctoken). Keyed by the peer's canonical LID.
+    /// Keeps the newest by timestamp so a stale re-delivery can't overwrite a fresh
+    /// one. Stored raw (it's echoed verbatim on the wire).
+    pub fn privacy_token_put(
+        &self,
+        session_id: &str,
+        peer_lid: &str,
+        token: &[u8],
+        timestamp: i64,
+        sender_timestamp: i64,
+    ) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO privacy_tokens \
+                 (session_id, peer_lid, token, timestamp, sender_timestamp) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(session_id, peer_lid) DO UPDATE SET \
+                    token = excluded.token, \
+                    timestamp = excluded.timestamp, \
+                    sender_timestamp = excluded.sender_timestamp \
+                 WHERE excluded.timestamp >= privacy_tokens.timestamp",
+                rusqlite::params![session_id, peer_lid, token, timestamp, sender_timestamp],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The stored `(token, timestamp)` for a peer's LID, if any.
+    pub fn privacy_token_get(
+        &self,
+        session_id: &str,
+        peer_lid: &str,
+    ) -> rusqlite::Result<Option<(Vec<u8>, i64)>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT token, timestamp FROM privacy_tokens \
+                 WHERE session_id = ? AND peer_lid = ?",
+                rusqlite::params![session_id, peer_lid],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(e),
+            })
         })
     }
 
@@ -1306,6 +1358,31 @@ impl SqliteStore {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
                 _ => Err(e),
             })
+        })
+    }
+
+    /// The account NCT salt (for `<cstoken>` derivation), or `None`.
+    pub fn session_nct_salt(&self, id: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT nct_salt FROM sessions WHERE id = ?",
+                rusqlite::params![id],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(e),
+            })
+        })
+    }
+
+    pub fn session_set_nct_salt(&self, id: &str, salt: &[u8]) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET nct_salt = ? WHERE id = ?",
+                rusqlite::params![salt, id],
+            )
+            .map(|_| ())
         })
     }
 
@@ -2863,6 +2940,46 @@ impl PgStore {
         }
     }
 
+    pub fn privacy_token_put(
+        &self,
+        session_id: &str,
+        peer_lid: &str,
+        token: &[u8],
+        timestamp: i64,
+        sender_timestamp: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO privacy_tokens \
+                 (session_id, peer_lid, token, timestamp, sender_timestamp) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT(session_id, peer_lid) DO UPDATE SET \
+                    token = EXCLUDED.token, \
+                    timestamp = EXCLUDED.timestamp, \
+                    sender_timestamp = EXCLUDED.sender_timestamp \
+                 WHERE EXCLUDED.timestamp >= privacy_tokens.timestamp",
+                &[&session_id, &peer_lid, &token, &timestamp, &sender_timestamp],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn privacy_token_get(
+        &self,
+        session_id: &str,
+        peer_lid: &str,
+    ) -> rusqlite::Result<Option<(Vec<u8>, i64)>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT token, timestamp FROM privacy_tokens \
+                 WHERE session_id=$1 AND peer_lid=$2",
+                &[&session_id, &peer_lid],
+            )
+            .map_err(pg_err)?;
+        Ok(row.map(|r| (r.get::<_, Vec<u8>>(0), r.get::<_, i64>(1))))
+    }
+
     // ---- prekeys ----
     pub fn prekey_count_uploaded(&self, session_id: &str) -> rusqlite::Result<i64> {
         let row = self
@@ -3506,6 +3623,21 @@ impl PgStore {
             .query_opt("SELECT account_pb FROM sessions WHERE id=$1", &[&id])
             .map_err(pg_err)?;
         Ok(row.and_then(|r| r.get::<_, Option<Vec<u8>>>(0)))
+    }
+
+    pub fn session_nct_salt(&self, id: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+        let row = self
+            .conn()?
+            .query_opt("SELECT nct_salt FROM sessions WHERE id=$1", &[&id])
+            .map_err(pg_err)?;
+        Ok(row.and_then(|r| r.get::<_, Option<Vec<u8>>>(0)))
+    }
+
+    pub fn session_set_nct_salt(&self, id: &str, salt: &[u8]) -> rusqlite::Result<()> {
+        self.conn()?
+            .execute("UPDATE sessions SET nct_salt = $1 WHERE id = $2", &[&salt, &id])
+            .map_err(pg_err)?;
+        Ok(())
     }
 
     pub fn session_push_name(&self, id: &str) -> rusqlite::Result<Option<String>> {
@@ -4598,6 +4730,8 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/0016_message_secrets.sql")),
         M::up(include_str!("../migrations/0017_messages_edited.sql")),
         M::up(include_str!("../migrations/0018_messages_revoked.sql")),
+        M::up(include_str!("../migrations/0019_nct_salt.sql")),
+        M::up(include_str!("../migrations/0020_privacy_tokens.sql")),
     ])
 }
 
@@ -4899,7 +5033,7 @@ mod tests {
                 )
                 .unwrap();
         };
-        // Henry appears twice: under his LID (group-derived) and his phone number.
+        // Sam appears twice: under his LID (group-derived) and his phone number.
         msg("64000000000001@lid", "L1", 100);
         msg("64000000000001@lid", "L2", 110);
         msg("5511990000001@s.whatsapp.net", "P1", 120);
@@ -4946,6 +5080,44 @@ mod tests {
         );
         // Scoped per session.
         assert!(store.lid_to_pn("s2", "64000000000001").unwrap().is_none());
+    }
+
+    #[test]
+    fn privacy_token_round_trips_and_keeps_newest() {
+        let store = Store::open(":memory:").unwrap();
+        seed_session(&store, "s1");
+
+        assert!(store.privacy_token_get("s1", "64000000000001").unwrap().is_none());
+
+        store
+            .privacy_token_put("s1", "64000000000001", b"tok-a", 100, 0)
+            .unwrap();
+        assert_eq!(
+            store.privacy_token_get("s1", "64000000000001").unwrap(),
+            Some((b"tok-a".to_vec(), 100))
+        );
+
+        // Newer timestamp replaces.
+        store
+            .privacy_token_put("s1", "64000000000001", b"tok-b", 200, 0)
+            .unwrap();
+        assert_eq!(
+            store.privacy_token_get("s1", "64000000000001").unwrap(),
+            Some((b"tok-b".to_vec(), 200))
+        );
+
+        // Older timestamp must NOT overwrite a fresher token.
+        store
+            .privacy_token_put("s1", "64000000000001", b"tok-old", 150, 0)
+            .unwrap();
+        assert_eq!(
+            store.privacy_token_get("s1", "64000000000001").unwrap(),
+            Some((b"tok-b".to_vec(), 200))
+        );
+
+        // Scoped per session + per peer.
+        assert!(store.privacy_token_get("s2", "64000000000001").unwrap().is_none());
+        assert!(store.privacy_token_get("s1", "64000000000002").unwrap().is_none());
     }
 
     #[test]
@@ -5068,7 +5240,7 @@ mod tests {
             .contact_upsert("s1", "5511990000001@s.whatsapp.net", None, None)
             .unwrap();
         store
-            .contact_upsert("s1", "64000000000001@lid", None, Some("Henry"))
+            .contact_upsert("s1", "64000000000001@lid", None, Some("Sam"))
             .unwrap();
         // No mapping yet → two separate contacts (the reported symptom).
         assert_eq!(store.contacts_list("s1").unwrap().len(), 2);
@@ -5080,7 +5252,7 @@ mod tests {
         let list = store.contacts_list("s1").unwrap();
         assert_eq!(list.len(), 1, "lid + pn merge into one contact");
         assert_eq!(list[0].jid, "5511990000001@s.whatsapp.net");
-        assert_eq!(list[0].push_name.as_deref(), Some("Henry"));
+        assert_eq!(list[0].push_name.as_deref(), Some("Sam"));
 
         // An unmapped @lid contact passes through unchanged.
         store
@@ -5205,7 +5377,7 @@ mod tests {
     }
 
     /// Live Postgres backend round-trip. Gated on `RUWA_PG_TEST_URL` + `RUWA_LIVE_TEST=1`
-    /// (e.g. `postgres://henrysilva:admin@localhost:5433/postgres`). Exercises the
+    /// (e.g. `postgres://user:password@localhost:5433/postgres`). Exercises the
     /// same domain methods the app uses, plus the cross-instance lease state
     /// machine against two PgStore "instances" sharing the DB.
     #[test]

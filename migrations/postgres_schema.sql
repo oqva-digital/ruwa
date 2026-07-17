@@ -28,10 +28,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at          BIGINT NOT NULL,
     proxy_url           TEXT,
     api_key             TEXT,
-    mark_online         INTEGER NOT NULL DEFAULT 0
+    mark_online         INTEGER NOT NULL DEFAULT 0,
+    nct_salt            BYTEA
 );
 -- Idempotent add for databases created before mark_online existed.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS mark_online INTEGER NOT NULL DEFAULT 0;
+-- Idempotent add for the NCT salt (cstoken derivation), added later.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS nct_salt BYTEA;
 
 CREATE TABLE IF NOT EXISTS prekeys (
     session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -245,3 +248,15 @@ CREATE TABLE IF NOT EXISTS message_secrets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_message_secrets_created ON message_secrets (created_at);
+
+-- Per-peer "trusted contact" privacy token / tctoken (mirror of SQLite migration
+-- 0020). Required on 1:1 sends to a peer that expects one; absent it the server
+-- rejects with error 463 (MissingTcToken). Keyed by the peer's canonical LID.
+CREATE TABLE IF NOT EXISTS privacy_tokens (
+    session_id       TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    peer_lid         TEXT NOT NULL,
+    token            BYTEA NOT NULL,
+    timestamp        BIGINT NOT NULL DEFAULT 0,
+    sender_timestamp BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, peer_lid)
+);

@@ -103,6 +103,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/pair-phone", post(pair_phone_session))
         .route("/sessions/:id/connect", post(connect_session))
         .route("/sessions/:id/reconnect", post(reconnect_session))
+        .route("/sessions/:id/resync-appstate", post(resync_appstate_session))
         .route("/sessions/:id/logout", post(logout_session))
         .route("/sessions/:id/proxy", post(set_session_proxy))
         .route("/sessions/:id/label", post(set_session_label))
@@ -689,6 +690,35 @@ async fn reconnect_session(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<SessionResp>)> {
     check_session_auth_write(&headers, &state, &id)?;
+    state.manager.reconnect(&id)?;
+    let session = state.manager.get(&id)?;
+    let meta = session.meta.read().clone();
+    Ok((StatusCode::ACCEPTED, Json(SessionResp::new(meta))))
+}
+
+/// Force a FULL app-state resync: zero every collection's stored version so the
+/// next connect fetches a snapshot (not an incremental patch), then reconnect.
+/// A snapshot re-carries the current SET state of every action — including
+/// `nct_salt_sync`, the account NCT salt used to derive the 1:1 `<cstoken>`. This
+/// repairs sessions that linked before the salt-capture code existed: an
+/// incremental sync never re-delivers an old mutation, but a snapshot does.
+/// Idempotent: re-applying contact/pin/mute mutations is a no-op.
+async fn resync_appstate_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<SessionResp>)> {
+    check_session_auth_write(&headers, &state, &id)?;
+    // Verify the session exists before touching its rows.
+    let _ = state.manager.get(&id)?;
+    for col in crate::session::AppStateCollection::all() {
+        state
+            .manager
+            .store
+            .app_state_version_set(&id, col.name(), 0, &[])
+            .map_err(crate::error::Error::from)?;
+    }
+    // Reconnect re-ships the app-state fetch IQs; version 0 → want_snapshot=true.
     state.manager.reconnect(&id)?;
     let session = state.manager.get(&id)?;
     let meta = session.meta.read().clone();

@@ -3183,6 +3183,17 @@ async fn run_connection(
                     // Server `<ack>` for an outbound message we shipped:
                     // resolve the pending oneshot if anyone's waiting.
                     if node.tag == "ack" {
+                        // A server `<ack>` carrying an `error` code means the message
+                        // was rejected (e.g. 463 MissingTcToken, 479 invalid stanza)
+                        // and will NOT be delivered — surface it instead of a silent
+                        // drop.
+                        if let Some(err) = node.attrs.get("error") {
+                            tracing::warn!(
+                                id = %node.attrs.get("id").map(String::as_str).unwrap_or(""),
+                                error = %err,
+                                "server rejected message (ack error) — not delivered",
+                            );
+                        }
                         if let Some(id) = node.attrs.get("id") {
                             if let Some(tx) = dispatcher.take_pending_ack(id) {
                                 let class = node
@@ -3623,12 +3634,23 @@ async fn encrypt_per_device(
     // (`enc`); the emitted recipient keeps the original wire jid `d`.
     let mut out = Vec::with_capacity(targets.len());
     for (d, enc) in &targets {
-        let mut record = existing
-            .remove(enc)
-            .or_else(|| bootstrapped.remove(enc))
-            .ok_or_else(|| {
-                Error::Internal(anyhow::anyhow!("no session for device {enc} (wire {d})"))
-            })?;
+        let mut record = match existing.remove(enc).or_else(|| bootstrapped.remove(enc)) {
+            Some(r) => r,
+            None => {
+                // The server returned NO prekey bundle for this device (a dead /
+                // stale companion — e.g. a phantom high device id like `:99` that
+                // usync still lists but has no keys). whatsmeow skips such a device
+                // rather than failing the whole send: one unreachable companion
+                // must NOT block delivery to the peer's real devices. Before this,
+                // a single keyless device aborted the entire message via `?`,
+                // throwing away every already-encrypted real recipient.
+                tracing::warn!(
+                    wire = %d, enc = %enc,
+                    "send: no session and no prekey bundle for device — skipping (peer's other devices unaffected)"
+                );
+                continue;
+            }
+        };
         let mut state = record.current.take().ok_or_else(|| {
             Error::Internal(anyhow::anyhow!("session record has no current state for {enc}"))
         })?;
@@ -3662,31 +3684,20 @@ async fn encrypt_per_device(
         };
         record.current = Some(state);
         store_save_record(store, session_id, enc, &record)?;
-        // DIAGNOSTIC (send-delivery desync): record the per-device addressing
-        // decision so a PN<->LID flip or repeated re-establishment is visible in
-        // the log ring. `msg_type` PreKey = fresh session (pkmsg); Whisper =
-        // continuing ratchet (msg). `sibling` flags a session record under the
-        // OTHER (PN/LID) address for the same device — two divergent ratchets is
-        // the desync smoking gun. Temporary; remove once the root cause is fixed.
-        let sibling = lid_pn_alternates(store, session_id, enc).into_iter().find_map(|alt| {
-            store_load_record(store, session_id, &alt)
-                .ok()
-                .flatten()
-                .map(|r| format!("{alt}={}", if r.current.is_some() { "session" } else { "empty" }))
-        });
-        tracing::info!(
-            wire = %d,
-            enc = %enc,
-            redirected = enc != d,
-            msg_type = ?cipher.message_type,
-            sibling = ?sibling,
-            "send-diag: per-device encryption addressing"
-        );
         out.push(EncryptedRecipient {
             jid: d.clone(),
             ciphertext: cipher.serialized,
             message_type: cipher.message_type,
         });
+    }
+    // Every device was skipped (no session, no fetchable bundle). Emitting a
+    // participant-less `<message>` would be a no-op the server still acks, so fail
+    // loudly instead — the caller surfaces it rather than reporting a phantom send.
+    if out.is_empty() && !targets.is_empty() {
+        return Err(Error::Internal(anyhow::anyhow!(
+            "no encryptable devices for recipient — all {} device(s) lacked a session and prekey bundle",
+            targets.len()
+        )));
     }
     Ok(out)
 }
@@ -3746,6 +3757,127 @@ fn jid_device_token(jid: &str) -> Option<&str> {
     let at = jid.find('@').unwrap_or(jid.len());
     let head = &jid[..at];
     head.find(':').map(|i| &head[i + 1..])
+}
+
+/// Feature flag for the "modern LID" 1:1 send path: LID wire rewrite +
+/// `addressing_mode="lid"` + `phash` + `peer_recipient_pn` + `<cstoken>` + own-LID
+/// device echo. **Default OFF.** When off, 1:1 sends use the pre-#49 LEGACY stanza
+/// (PN-addressed wire, ciphertext still redirected to the peer's LID ratchet, none
+/// of the modern attrs) — the shape that DELIVERED before these were added.
+///
+/// The modern path is currently rejected by the server with error 479
+/// (smax-invalid) for migrated peers; live bisect showed the modern attrs trip
+/// strict validation our stanza fails, and stripping them yields 463
+/// (MissingTcToken) instead. Kept behind this flag so the working behavior is
+/// restored by default while the modern path (and the real token requirement) is
+/// investigated. Opt in with `RUWA_MODERN_LID_SEND=1`.
+fn modern_lid_send_enabled() -> bool {
+    std::env::var("RUWA_MODERN_LID_SEND").is_ok()
+}
+
+/// The whatsmeow `JID.ADString()` form of a device JID: always
+/// `<user>.<agent>:<device>@<server>`, filling agent/device with 0 when the
+/// input omits them. This is the EXACT string fed into the participant-list hash
+/// (`phash`), so the format must match whatsmeow byte-for-byte or the server's
+/// expected hash won't line up. Examples:
+///   `5511999@s.whatsapp.net`      -> `5511999.0:0@s.whatsapp.net`
+///   `5511999:62@s.whatsapp.net`   -> `5511999.0:62@s.whatsapp.net`
+///   `2668.1@lid`                  -> `2668.1:0@lid`
+///   `2668.1:50@lid`               -> `2668.1:50@lid`
+fn jid_ad_string(jid: &str) -> String {
+    let (head, server) = match jid.rfind('@') {
+        Some(i) => (&jid[..i], &jid[i + 1..]),
+        None => (jid, ""),
+    };
+    let user_end = head.find(['.', ':']).unwrap_or(head.len());
+    let user = &head[..user_end];
+    let agent: u32 = match head.find('.') {
+        Some(d) => {
+            let rest = &head[d + 1..];
+            let a_end = rest.find(':').unwrap_or(rest.len());
+            rest[..a_end].parse().unwrap_or(0)
+        }
+        None => 0,
+    };
+    let device: u32 = match head.find(':') {
+        Some(c) => head[c + 1..].parse().unwrap_or(0),
+        None => 0,
+    };
+    format!("{user}.{agent}:{device}@{server}")
+}
+
+/// whatsmeow `participantListHashV2`: `2:` + base64(raw-std, no pad) of the first
+/// 6 bytes of SHA-256 over the sorted, concatenated `ADString()` forms of every
+/// device the message is addressed to. Stamped as the `phash` attr on the
+/// `<message>` node. Modern WhatsApp validates the sender enumerated the peer's
+/// current device set against this hash; WITHOUT it, recipients silently drop the
+/// message (server-acked, no delivery receipt, no retry) — the exact symptom that
+/// broke outbound after WA's device-list-hash enforcement (mirrors the Baileys
+/// rc.9→rc10 regression fix). whatsmeow send.go `participantListHashV2`.
+fn participant_list_hash_v2(device_jids: &[String]) -> String {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD as B64, Engine as _};
+    use sha2::{Digest, Sha256};
+    let mut ad: Vec<String> = device_jids.iter().map(|j| jid_ad_string(j)).collect();
+    ad.sort();
+    let hash = Sha256::digest(ad.concat().as_bytes());
+    format!("2:{}", B64.encode(&hash[..6]))
+}
+
+/// Attach the peer's stored `<tctoken>` (privacy / "trusted contact" token) to a
+/// 1:1 message node when we hold a fresh one (< ~28-day window). Modern WhatsApp
+/// rejects a send to a peer that expects one with error 463 (MissingTcToken) and
+/// silently drops it. No-op when we have no (or a stale/empty) token. Shared by the
+/// initial send and the retry resend so BOTH carry it. Keyed by the peer's LID.
+fn attach_tctoken_if_available(
+    store: &Store,
+    session_id: &str,
+    peer_lid_user: &str,
+    node: &mut crate::protocol::binary::Node,
+) {
+    use crate::protocol::binary::{Attrs, Content, Node};
+    if peer_lid_user.is_empty() {
+        return;
+    }
+    match store.privacy_token_get(session_id, peer_lid_user) {
+        Ok(Some((token, ts))) => {
+            let now = chrono::Utc::now().timestamp();
+            let fresh = ts == 0 || now - ts < 28 * 86_400;
+            if fresh && !token.is_empty() {
+                if let Content::Nodes(ref mut children) = node.content {
+                    children.push(Node {
+                        tag: "tctoken".into(),
+                        attrs: Attrs::new(),
+                        content: Content::Bytes(token),
+                    });
+                }
+                tracing::info!(peer_lid = %peer_lid_user, "attached <tctoken> to 1:1 send");
+            } else {
+                tracing::warn!(peer_lid = %peer_lid_user, ts, "stored tctoken is stale — not attaching");
+            }
+        }
+        _ => tracing::warn!(
+            peer_lid = %peer_lid_user,
+            "no <tctoken> stored for peer — send may be dropped with error 463"
+        ),
+    }
+}
+
+/// whatsmeow `generateCsToken`: HMAC-SHA256(nct_salt, "<recipient_lid_user>@lid").
+/// The `<cstoken>` ("contact/non-contact token") modern WhatsApp requires on 1:1
+/// messages to prove the sender may message this recipient; WITHOUT it the
+/// recipient silently drops the message (server-acked, no delivery, no retry) —
+/// the outbound outage on a companion whose store never captured the salt. The
+/// salt arrives in the HistorySync blob; the recipient MUST be a LID (whatsmeow
+/// keys the HMAC on the recipient's LID string).
+fn generate_cs_token(nct_salt: &[u8], recipient_lid_user: &str) -> Option<Vec<u8>> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    if nct_salt.is_empty() || recipient_lid_user.is_empty() {
+        return None;
+    }
+    let mut mac = Hmac::<Sha256>::new_from_slice(nct_salt).ok()?;
+    mac.update(format!("{recipient_lid_user}@lid").as_bytes());
+    Some(mac.finalize().into_bytes().to_vec())
 }
 
 /// The canonical, stable identity key for a user JID — what we persist on
@@ -4119,7 +4251,11 @@ async fn encrypt_inner_proto_and_ship(
     // below is now the source of truth — if it returns devices, LID send is on.
     let resolved_recipient;
     let mut send_as_lid = false;
-    let chat_jid: &str = if chat_jid.ends_with("@lid") {
+    // `event_chat` is the chat identity used for STORAGE + EVENTS (what the caller
+    // / felix-ai threads by). It follows the existing resolution and is NEVER
+    // rewritten to LID by the migrated-peer WIRE rewrite below — the wire stanza
+    // may go out LID-addressed while the chat the caller sees stays PN.
+    let event_chat: &str = if chat_jid.ends_with("@lid") {
         // Probe the @lid device list and, when it returns real devices, send
         // LID-addressed (verified to deliver — a migrated contact only routes
         // LID-addressed sends). `resolve_device_jids` falls back to `[chat_jid]`
@@ -4127,7 +4263,7 @@ async fn encrypt_inner_proto_and_ship(
         // is anything other than that; in that case we drop to the legacy PR #9
         // PN-rewrite path below.
         let lid_devices = resolve_device_jids(session, dispatcher, chat_jid).await;
-        if lid_devices.iter().any(|d| d != chat_jid) {
+        if modern_lid_send_enabled() && lid_devices.iter().any(|d| d != chat_jid) {
             send_as_lid = true;
             tracing::info!(lid = %chat_jid, devices = lid_devices.len(), "sending to @lid recipient under LID addressing (modern path)");
             chat_jid
@@ -4148,21 +4284,57 @@ async fn encrypt_inner_proto_and_ship(
         chat_jid
     };
 
+    // WIRE addressing for the stanza (`<message to>`, device enumeration, the
+    // per-device `<enc>` addressing) — DECOUPLED from `event_chat` above. A peer
+    // that has MIGRATED to LID routes ONLY LID-addressed sends: a PN-addressed
+    // stanza is server-acked but silently dropped (no receipt, no retry), while
+    // its ciphertext is already encrypted under the peer's LID session
+    // (`encryption_address` redirects PN devices to their LID ratchet). So when
+    // the caller passed a PN AND the peer's @lid usync returns real devices,
+    // address the wire by LID + stamp `addressing_mode="lid"` (below) so envelope
+    // and ciphertext agree. `event_chat` stays PN, so storage/events don't move.
+    // Mirrors whatsmeow rewriting `to` to the LID for a migrated recipient; gating
+    // on the @lid usync probe (not a bare LID mapping) keeps not-yet-migrated peers
+    // — for whom we merely happen to know a LID — on the unchanged PN path.
+    let pn_to_lid_dest;
+    let wire_jid: &str = if modern_lid_send_enabled() && !send_as_lid && event_chat.ends_with("@s.whatsapp.net") {
+        match store.pn_to_lid(&session_id, jid_user(event_chat)) {
+            Ok(Some(lid)) => {
+                let lid_bare = format!("{lid}@lid");
+                let lid_devices = resolve_device_jids(session, dispatcher, &lid_bare).await;
+                if lid_devices.iter().any(|d| d != &lid_bare) {
+                    send_as_lid = true;
+                    tracing::info!(
+                        pn = %event_chat, lid = %lid_bare, devices = lid_devices.len(),
+                        "migrated peer: addressing wire stanza by LID (chat identity stays PN)"
+                    );
+                    pn_to_lid_dest = lid_bare;
+                    pn_to_lid_dest.as_str()
+                } else {
+                    event_chat
+                }
+            }
+            _ => event_chat,
+        }
+    } else {
+        event_chat
+    };
+
     // Stash the unpadded inner proto so an inbound retry receipt can re-encrypt
     // and resend it (the peer's session to us desynced and it asked again).
-    session.record_recent_send(msg_id, chat_jid, inner_proto_bytes);
+    session.record_recent_send(msg_id, wire_jid, inner_proto_bytes);
 
     // 1. Discover the peer's linked devices via usync. On the PN path we also
     //    fan out to our OWN account's *other* devices in the same batch (legacy
     //    behavior) so the message echoes into our chat history. The sending
     //    device is always excluded. Falls back to bare chat_jid if usync empty.
-    let mut device_jids = resolve_device_jids(session, dispatcher, chat_jid).await;
+    let mut device_jids = resolve_device_jids(session, dispatcher, wire_jid).await;
     let own_pn_user = own_jid.as_deref().map(|j| jid_user(j).to_string());
     if let Some(own) = own_jid.as_deref() {
         // PN path only: own devices are PN-addressed here (`encryption_address`
         // redirects each to its LID session if migrated). On the LID path our own
         // devices are mirrored separately below to keep the stanza all-`@lid`.
-        if !send_as_lid && jid_user(chat_jid) != jid_user(own) {
+        if !send_as_lid && jid_user(wire_jid) != jid_user(own) {
             let own_bare = format!("{}@s.whatsapp.net", jid_user(own));
             for d in resolve_device_jids(session, dispatcher, &own_bare).await {
                 if !device_jids.contains(&d) {
@@ -4176,7 +4348,7 @@ async fn encrypt_inner_proto_and_ship(
     // 2. Build both plaintexts: the plain message for the peer's devices,
     //    and a DeviceSentMessage-wrapped copy for our own devices.
     let padded = pad_message(inner_proto_bytes);
-    let padded_own = match build_device_sent_message(inner_proto_bytes, chat_jid) {
+    let padded_own = match build_device_sent_message(inner_proto_bytes, wire_jid) {
         Some(dsm) => pad_message(&dsm),
         None => padded.clone(),
     };
@@ -4248,15 +4420,49 @@ async fn encrypt_inner_proto_and_ship(
         }
     }
 
+    // Dedup participant devices by JID. A duplicate `<to jid>` in the participants
+    // list makes the whole stanza smax-invalid (server rejects with error 479 —
+    // "Invalid stanza sent" — and silently drops it). Overlap can arise when the
+    // peer-device resolve and the own-device echo both surface the same JID.
+    {
+        let mut seen = std::collections::HashSet::new();
+        recipients.retain(|r| seen.insert(r.jid.clone()));
+    }
+
     // 2. Build the <message> node, register the pending ack BEFORE
     //    pushing onto the wire (so a fast server can't beat us), then
     //    ship + flip status to 'sent'.
+    // A LID-addressed stanza MUST carry `addressing_mode="lid"` so the recipient
+    // interprets the participant/`enc` addressing as LID and maps the ciphertext
+    // to the right session; without it a migrated peer can't place the message and
+    // silently drops it (whatsmeow always stamps this — send.go).
+    // whatsmeow's phash covers our own sending device too (it's in
+    // `GetUserDevices([to, ownID])`); `recipients` dropped self, so recompute the
+    // self device in its ADDRESSED form (LID on the LID path, PN otherwise) and let
+    // `build_message_node` fold it into the hash. Mismatched phash = silent drop.
+    let own_phash_device: Option<String> = match own_jid.as_deref() {
+        Some(own) if send_as_lid => own_pn_user
+            .as_deref()
+            .and_then(|u| store.pn_to_lid(&session_id, u).ok().flatten())
+            .map(|lid| {
+                let dev = own
+                    .split(':')
+                    .nth(1)
+                    .and_then(|s| s.split('@').next())
+                    .unwrap_or("0");
+                format!("{lid}.1:{dev}@lid")
+            }),
+        Some(own) => Some(own.to_string()),
+        None => None,
+    };
     let mut node = build_message_node(
         msg_id,
-        chat_jid,
+        wire_jid,
         &recipients,
         timestamp,
         edit_attribute_for_inner(inner_proto_bytes),
+        if send_as_lid { Some("lid") } else { None },
+        own_phash_device.as_deref(),
     );
     // If any recipient got a `pkmsg` (first-time send to that device), the
     // server requires us to attach a `<device-identity>` child carrying our
@@ -4281,13 +4487,86 @@ async fn encrypt_inner_proto_and_ship(
             }
         }
     }
+    // Attach the peer's `<tctoken>` (privacy / "trusted contact" token) when we
+    // have one. Modern WhatsApp rejects a 1:1 send to a peer that expects a token
+    // with error 463 (MissingTcToken) and silently drops it. This runs on BOTH the
+    // legacy and modern paths (463 hits both). whatsmeow prefers the tctoken and
+    // only falls back to the cstoken below when it has none. Keyed by the peer's
+    // canonical LID; skip tokens older than the ~28-day validity window.
+    {
+        let peer_lid_user: Option<String> = if event_chat.ends_with("@lid") {
+            Some(lid_user_part(event_chat).to_string())
+        } else {
+            store.pn_to_lid(&session_id, jid_user(event_chat)).ok().flatten()
+        };
+        if let Some(peer_lid_user) = peer_lid_user {
+            attach_tctoken_if_available(store, &session_id, &peer_lid_user, &mut node);
+        }
+    }
+    // Attach the `<cstoken>` modern WhatsApp requires on 1:1 messages:
+    // HMAC-SHA256(account NCT salt, recipient LID). Modern path only — the legacy
+    // send never carried it. Best-effort even then: only when we know the
+    // recipient's LID AND captured the salt.
+    let recipient_lid_user: Option<String> = if !modern_lid_send_enabled() {
+        None
+    } else if wire_jid.ends_with("@lid") {
+        Some(lid_user_part(wire_jid).to_string())
+    } else {
+        store.pn_to_lid(&session_id, jid_user(event_chat)).ok().flatten()
+    };
+    match (
+        recipient_lid_user,
+        store.session_nct_salt(&session_id).ok().flatten(),
+    ) {
+        (Some(lid_user), Some(salt)) => {
+            if let Some(cstoken) = generate_cs_token(&salt, &lid_user) {
+                use crate::protocol::binary::{Attrs, Content, Node};
+                let cs_node = Node {
+                    tag: "cstoken".into(),
+                    attrs: Attrs::new(),
+                    content: Content::Bytes(cstoken),
+                };
+                if let Content::Nodes(ref mut children) = node.content {
+                    children.push(cs_node);
+                }
+                tracing::info!(recipient_lid = %lid_user, "attached <cstoken> to 1:1 send");
+            }
+        }
+        (lid, salt) if modern_lid_send_enabled() => tracing::warn!(
+            has_lid = lid.is_some(),
+            has_salt = salt.is_some(),
+            "no <cstoken> attached (missing recipient LID or NCT salt) — send may be dropped"
+        ),
+        _ => {}
+    }
+    // Stamp `peer_recipient_pn` on every LID-addressed 1:1 send, exactly like
+    // whatsmeow (`extraParams.peerRecipientPN`, wm_send.go:1197). When the wire
+    // stanza is LID-addressed the server needs the peer's phone number to map the
+    // LID envelope back to the PN contact; omitting it can make the recipient fail
+    // to associate (and drop) the message. Resolve the PN from the caller's chat
+    // (already a PN) or the LID→PN map.
+    if send_as_lid {
+        let peer_pn = if event_chat.ends_with("@s.whatsapp.net") {
+            Some(format!("{}@s.whatsapp.net", jid_user(event_chat)))
+        } else {
+            store
+                .lid_to_pn(&session_id, lid_user_part(wire_jid))
+                .ok()
+                .flatten()
+                .map(|pn| format!("{pn}@s.whatsapp.net"))
+        };
+        if let Some(pn) = peer_pn {
+            tracing::debug!(peer_recipient_pn = %pn, "stamping peer_recipient_pn on LID send");
+            node.attrs.insert("peer_recipient_pn".into(), pn);
+        }
+    }
     let ack_rx = dispatcher.register_ack(msg_id);
     dispatcher.send_node(node);
     metrics::incr(&metrics::MSGS_OUT);
     update_message_status(store, &session_id, msg_id, "sent")?;
     let _ = session.events.send(SessionEvent::MessageSent {
         id: msg_id.to_string(),
-        chat: chat_jid.to_string(),
+        chat: event_chat.to_string(),
     });
 
     // 6. Wait for server ack out-of-band. We tokio::spawn so the send
@@ -4298,7 +4577,7 @@ async fn encrypt_inner_proto_and_ship(
     let store_for_ack = Arc::clone(store);
     let session_id_clone = session_id.clone();
     let msg_id_clone = msg_id.to_string();
-    let chat_jid_clone = chat_jid.to_string();
+    let chat_jid_clone = event_chat.to_string();
     tokio::spawn(async move {
         match tokio::time::timeout(std::time::Duration::from_secs(60), ack_rx).await {
             Ok(Ok(_class)) => {
@@ -5693,6 +5972,54 @@ fn process_inbound_node(
         {
             session.device_cache_clear();
             tracing::info!("devices notification — cleared device-list cache");
+        }
+        // `<notification type="privacy_token">` — the peer issued us a "trusted
+        // contact" token (tctoken). We MUST echo it back on 1:1 sends to them or
+        // the server rejects with error 463 (MissingTcToken). Store it keyed by the
+        // peer's canonical LID. Mirrors whatsmeow's handlePrivacyTokenNotification.
+        if node.tag == "notification"
+            && node.attrs.get("type").map(String::as_str) == Some("privacy_token")
+        {
+            if let Content::Nodes(ns) = &node.content {
+                // Prefer an explicit `sender_lid`; else derive from `from` (LID as-is,
+                // PN via the LID map). Store under the LID user-part.
+                let from = node.attrs.get("from").map(String::as_str).unwrap_or("");
+                let session_id = session.meta.read().id.clone();
+                let peer_lid_user: Option<String> = match node.attrs.get("sender_lid") {
+                    Some(sl) if sl.ends_with("@lid") => Some(lid_user_part(sl).to_string()),
+                    _ if from.ends_with("@lid") => Some(lid_user_part(from).to_string()),
+                    _ if from.ends_with("@s.whatsapp.net") => {
+                        store.pn_to_lid(&session_id, jid_user(from)).ok().flatten()
+                    }
+                    _ => None,
+                };
+                if let (Some(peer_lid_user), Some(tokens)) =
+                    (peer_lid_user, ns.iter().find(|c| c.tag == "tokens"))
+                {
+                    if let Content::Nodes(toks) = &tokens.content {
+                        for t in toks.iter().filter(|t| t.tag == "token") {
+                            let is_tc = t.attrs.get("type").map(String::as_str)
+                                == Some("trusted_contact");
+                            if let (true, Content::Bytes(tok)) = (is_tc, &t.content) {
+                                let ts = t
+                                    .attrs
+                                    .get("t")
+                                    .and_then(|v| v.parse::<i64>().ok())
+                                    .unwrap_or(0);
+                                if store
+                                    .privacy_token_put(&session_id, &peer_lid_user, tok, ts, 0)
+                                    .is_ok()
+                                {
+                                    tracing::info!(
+                                        peer_lid = %peer_lid_user, ts,
+                                        "stored privacy token (tctoken) from peer"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         // `<notification type="account_sync">` is about OUR own account, so its
         // `from` is our own account's LID. We know our own PN (the session jid),
@@ -8801,7 +9128,7 @@ async fn handle_inbound_retry_receipt(
     };
 
     let account_pb = store.session_account_pb(&session_id).ok().flatten();
-    let node = build_retry_resend_node(
+    let mut node = build_retry_resend_node(
         &req.msg_id,
         &device,
         &rec,
@@ -8810,6 +9137,22 @@ async fn handle_inbound_retry_receipt(
         account_pb,
         edit_attribute_for_inner(&inner_proto),
     );
+    // The retry resend is a fresh stanza the server validates on its own, so it
+    // needs the peer's `<tctoken>` too — without it the resend to a token-gated
+    // peer device is rejected with 463 and that one device stays stuck. Peer
+    // devices only; our own devices don't gate on a token.
+    if !is_own_device {
+        let peer_lid_user = if device.ends_with("@lid") {
+            lid_user_part(&device).to_string()
+        } else {
+            store
+                .pn_to_lid(&session_id, jid_user(&device))
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+        attach_tctoken_if_available(&store, &session_id, &peer_lid_user, &mut node);
+    }
     // Register an ack slot (best-effort; we don't block on it here).
     let _ack = dispatcher.register_ack(&req.msg_id);
     dispatcher.send_node(node);
@@ -10669,6 +11012,8 @@ pub fn build_message_node(
     recipients: &[EncryptedRecipient],
     timestamp: i64,
     edit: Option<&str>,
+    addressing_mode: Option<&str>,
+    own_phash_device: Option<&str>,
 ) -> crate::protocol::binary::Node {
     use crate::crypto::signal::MessageType;
     use crate::protocol::binary::{Attrs, Content, Node};
@@ -10709,9 +11054,43 @@ pub fn build_message_node(
     msg_attrs.insert("id".into(), msg_id.into());
     msg_attrs.insert("type".into(), "text".into());
     msg_attrs.insert("to".into(), chat_jid.into());
-    msg_attrs.insert("t".into(), timestamp.to_string());
+    // `t` on the LEGACY path (no phash): this is what the working pre-#49 stanza
+    // carried, and the group send stamps it and delivers, so it's proven safe. On
+    // the MODERN path (phash present) whatsmeow omits `t` and lets the server stamp
+    // it — a client `t` there is one more thing strict validation can trip on — so
+    // skip it when we're stamping phash. Ties `t` to "not modern", matching the
+    // shape each path delivered/expects.
+    if addressing_mode.is_none() {
+        msg_attrs.insert("t".into(), timestamp.to_string());
+    }
     if let Some(e) = edit {
         msg_attrs.insert("edit".into(), e.into());
+    }
+    if let Some(mode) = addressing_mode {
+        msg_attrs.insert("addressing_mode".into(), mode.into());
+    }
+    // Participant-list hash over every addressed device. Modern WhatsApp drops a
+    // 1:1 message whose `phash` is absent/stale (silent, no retry) — this is what
+    // whatsmeow always stamps and what ruwa was missing. Skip only when there are
+    // no recipients (nothing to hash / a caller-built empty node).
+    //
+    // whatsmeow computes the hash over `GetUserDevices([to, ownID])`, which
+    // INCLUDES our own sending device — self-exclusion happens only at encryption
+    // time, not in the hash. `recipients` here has already dropped self (we can't
+    // encrypt to ourselves), so we add our own device's addressed form back into
+    // the hash set. Without it the hash is short one device and the recipient sees
+    // a phash mismatch → silently drops the message.
+    // Only stamp `phash` on the modern LID path (addressing_mode set). The legacy
+    // PN send never carried it (it delivered without), and stamping it flips the
+    // server into strict validation that currently rejects our stanza (error 479).
+    if addressing_mode.is_some() && !recipients.is_empty() {
+        let mut phash_jids: Vec<String> = recipients.iter().map(|r| r.jid.clone()).collect();
+        if let Some(own) = own_phash_device {
+            if !phash_jids.iter().any(|j| j == own) {
+                phash_jids.push(own.to_string());
+            }
+        }
+        msg_attrs.insert("phash".into(), participant_list_hash_v2(&phash_jids));
     }
 
     Node {
@@ -11277,6 +11656,19 @@ struct SyncActionValueSubset {
     pub pin_action: ::core::option::Option<PinActionSubset>,
     #[prost(message, optional, tag = "6")]
     pub archive_chat_action: ::core::option::Option<ArchiveChatActionSubset>,
+    // waSyncAction.SyncActionValue.nctSaltSyncAction = 80. Carries the account's
+    // "non-contact token" salt used to derive the <cstoken> modern WhatsApp
+    // requires on 1:1 messages. Unlike the HistorySync copy (link-time only), this
+    // app-state action re-syncs on every reconnect — so the salt can populate
+    // without a fresh QR re-link.
+    #[prost(message, optional, tag = "80")]
+    pub nct_salt_sync_action: ::core::option::Option<NctSaltSyncActionSubset>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct NctSaltSyncActionSubset {
+    #[prost(bytes = "vec", optional, tag = "1")]
+    pub salt: ::core::option::Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -11392,6 +11784,11 @@ pub fn decode_app_state_patch(patch_bytes: &[u8]) -> Vec<AppStateMutation> {
                     None
                 },
             });
+        }
+        if let Some(ns) = value.nct_salt_sync_action {
+            if let Some(salt) = ns.salt.filter(|s| !s.is_empty()) {
+                out.push(AppStateMutation::NctSalt(salt));
+            }
         }
     }
     out
@@ -11570,6 +11967,11 @@ pub fn decode_authenticated_app_state_patch(
                     None
                 },
             });
+        }
+        if let Some(ns) = value.nct_salt_sync_action {
+            if let Some(salt) = ns.salt.filter(|s| !s.is_empty()) {
+                out_mutations.push(AppStateMutation::NctSalt(salt));
+            }
         }
 
         // LTHash bookkeeping: SET adds, REMOVE subtracts the valueMAC.
@@ -11768,6 +12170,11 @@ fn decode_app_state_snapshot(
                     None
                 },
             });
+        }
+        if let Some(ns) = value.nct_salt_sync_action {
+            if let Some(salt) = ns.salt.filter(|s| !s.is_empty()) {
+                out.push(AppStateMutation::NctSalt(salt));
+            }
         }
         lthash.add(&expand_value_mac_to_lthash_input(&received_mac));
     }
@@ -12287,6 +12694,9 @@ pub enum AppStateMutation {
     ChatPin { jid: String, pinned: bool },
     ChatArchive { jid: String, archived: bool },
     ChatMute { jid: String, until: Option<i64> },
+    /// Account NCT salt (index `nct_salt_sync`), used to derive the 1:1 `<cstoken>`.
+    /// Account-global (no jid). Populates on every app-state sync, not just re-link.
+    NctSalt(Vec<u8>),
 }
 
 /// Apply an app-state mutation to the local mirror tables.
@@ -12308,6 +12718,15 @@ pub fn apply_app_state_mutation(
         }
         AppStateMutation::ChatMute { jid, until } => {
             store.chat_set_muted(session_id, jid, *until)?;
+        }
+        AppStateMutation::NctSalt(salt) => {
+            if !salt.is_empty() {
+                store.session_set_nct_salt(session_id, salt)?;
+                tracing::info!(
+                    len = salt.len(),
+                    "stored account NCT salt from app-state (cstoken enabled without re-link)"
+                );
+            }
         }
     }
     Ok(())
@@ -12369,6 +12788,13 @@ struct HistorySyncSubset {
     /// Matches whatsmeow's `HistorySync.pushnames` (tag 7).
     #[prost(message, repeated, tag = "7")]
     pub pushnames: Vec<PushnameSubset>,
+    /// Account-level "non-contact token" salt. Modern WhatsApp requires a
+    /// `<cstoken>` = HMAC-SHA256(nct_salt, recipient_lid) on 1:1 messages;
+    /// WITHOUT it recipients silently drop them (server-acked, no delivery, no
+    /// retry) — the outbound outage on a companion. Delivered ONLY in the
+    /// HistorySync blob (whatsmeow `HistorySync.nctSalt`, tag 19).
+    #[prost(bytes = "vec", optional, tag = "19")]
+    pub nct_salt: ::core::option::Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -12390,6 +12816,16 @@ struct ConvSubset {
     pub conversation_timestamp: ::core::option::Option<u64>,
     #[prost(string, optional, tag = "13")]
     pub name: ::core::option::Option<String>,
+    // Per-conversation "trusted contact" privacy token (tctoken). The link-time
+    // source for what a <notification type="privacy_token"> delivers in real time —
+    // lets a re-linked session repopulate every peer's token at once so it can
+    // reply without waiting for each contact to message first. Fixes error 463.
+    #[prost(bytes = "vec", optional, tag = "21")]
+    pub tc_token: ::core::option::Option<Vec<u8>>,
+    #[prost(uint64, optional, tag = "22")]
+    pub tc_token_timestamp: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "28")]
+    pub tc_token_sender_timestamp: ::core::option::Option<u64>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -12427,6 +12863,13 @@ pub struct ParsedHistorySync {
     pub rows: Vec<HistoryMessageRow>,
     /// (contact_jid, display_name) pairs from the `pushnames` field.
     pub pushnames: Vec<(String, String)>,
+    /// Account NCT salt for `<cstoken>` generation, when this chunk carried it
+    /// (only some HistorySync chunks do — usually the initial/full ones).
+    pub nct_salt: Option<Vec<u8>>,
+    /// Per-conversation privacy tokens (tctoken): `(conversation_id, token,
+    /// timestamp, sender_timestamp)`. Resolved to the peer's LID + stored by
+    /// `persist_history_sync_rows` (which has store access).
+    pub privacy_tokens: Vec<(String, Vec<u8>, i64, i64)>,
 }
 
 /// Decompress + decode a HistorySync payload (the zlib blob downloaded
@@ -12443,10 +12886,12 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
         .map_err(|e| Error::Internal(anyhow::anyhow!("zlib decompress: {e}")))?;
     let hs = HistorySyncSubset::decode(out.as_slice())
         .map_err(|e| Error::Internal(anyhow::anyhow!("decode HistorySync: {e}")))?;
+    let nct_salt = hs.nct_salt.clone().filter(|s| !s.is_empty());
     tracing::info!(
         decompressed_len = out.len(),
         conversations = hs.conversations.len(),
         pushnames = hs.pushnames.len(),
+        nct_salt_len = nct_salt.as_ref().map(|s| s.len()).unwrap_or(0),
         "parsed history sync blob"
     );
 
@@ -12460,11 +12905,25 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
         .collect();
 
     let mut rows = Vec::new();
+    let mut privacy_tokens = Vec::new();
     for conv in hs.conversations {
         let chat_jid = match conv.id.clone() {
             Some(j) => j,
             None => continue,
         };
+        // Capture this conversation's privacy token (tctoken) — the link-time
+        // counterpart to the real-time privacy_token notification. Groups never
+        // carry one. `persist_history_sync_rows` resolves the chat to the peer LID.
+        if !chat_jid.ends_with("@g.us") {
+            if let Some(tok) = conv.tc_token.clone().filter(|t| !t.is_empty()) {
+                privacy_tokens.push((
+                    chat_jid.clone(),
+                    tok,
+                    conv.tc_token_timestamp.unwrap_or(0) as i64,
+                    conv.tc_token_sender_timestamp.unwrap_or(0) as i64,
+                ));
+            }
+        }
         let chat_name = conv.name.clone().filter(|s| !s.is_empty());
         let is_group = chat_jid.ends_with("@g.us");
         for hist_msg in conv.messages {
@@ -12588,7 +13047,12 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
             });
         }
     }
-    Ok(ParsedHistorySync { rows, pushnames })
+    Ok(ParsedHistorySync {
+        rows,
+        pushnames,
+        nct_salt,
+        privacy_tokens,
+    })
 }
 
 /// One row decoded out of a HistorySync blob, shaped for direct INSERT
@@ -12622,6 +13086,39 @@ pub fn persist_history_sync_rows(
     parsed: &ParsedHistorySync,
 ) -> Result<usize> {
     let rows = &parsed.rows;
+
+    // Persist the account NCT salt when this chunk carried it — it's what lets the
+    // send path derive the `<cstoken>` that modern WhatsApp requires on 1:1
+    // messages (without it recipients silently drop them). Only some chunks carry
+    // it, so we only overwrite when present.
+    if let Some(salt) = parsed.nct_salt.as_ref().filter(|s| !s.is_empty()) {
+        match store.session_set_nct_salt(session_id, salt) {
+            Ok(()) => tracing::info!(len = salt.len(), "stored account NCT salt (cstoken enabled)"),
+            Err(e) => tracing::warn!(error = %e, "failed to store NCT salt"),
+        }
+    }
+
+    // Persist per-conversation privacy tokens (tctoken) captured from this blob.
+    // This is the link-time source: on a (re)link the HistorySync carries every
+    // chat's token at once, so a re-paired session can reply to any contact WITHOUT
+    // waiting for each to message first. Resolve the chat to the peer's LID (the
+    // key the send path looks up); @lid chats key directly, PN chats via the map.
+    for (chat_jid, token, ts, sender_ts) in &parsed.privacy_tokens {
+        let peer_lid_user = if chat_jid.ends_with("@lid") {
+            Some(lid_user_part(chat_jid).to_string())
+        } else {
+            store.pn_to_lid(session_id, jid_user(chat_jid)).ok().flatten()
+        };
+        if let Some(peer_lid_user) = peer_lid_user {
+            match store.privacy_token_put(session_id, &peer_lid_user, token, *ts, *sender_ts) {
+                Ok(()) => tracing::info!(
+                    peer_lid = %peer_lid_user,
+                    "stored privacy token (tctoken) from history sync"
+                ),
+                Err(e) => tracing::warn!(error = %e, "failed to store history-sync tctoken"),
+            }
+        }
+    }
 
     // The dedicated PUSH_NAME chunk (syncType=5) carries every contact's display
     // name — the ONLY place 1:1 chats get a name (groups use Conversation.name).
@@ -15002,7 +15499,7 @@ mod tests {
             .with_conn(|c| {
                 c.execute(
                     "UPDATE sessions SET push_name = ? WHERE id = ?",
-                    rusqlite::params!["Henry", &session_id],
+                    rusqlite::params!["Sam", &session_id],
                 )?;
                 Ok(())
             })
@@ -15027,7 +15524,7 @@ mod tests {
             presence.attrs.get("type").map(String::as_str),
             Some("unavailable")
         );
-        assert_eq!(presence.attrs.get("name").map(String::as_str), Some("Henry"));
+        assert_eq!(presence.attrs.get("name").map(String::as_str), Some("Sam"));
     }
 
     #[test]
@@ -15449,6 +15946,8 @@ mod tests {
             &recipients,
             1_700_000_000,
             edit_attribute_for_inner(&inner),
+            None,
+            None,
         );
         assert_eq!(node.attrs.get("edit").map(String::as_str), Some("7"));
 
@@ -15473,6 +15972,8 @@ mod tests {
             &recipients,
             1_700_000_000,
             edit_attribute_for_inner(&build_e2e_conversation("oi")),
+            None,
+            None,
         );
         assert!(!plain.attrs.contains_key("edit"));
     }
@@ -15835,6 +16336,89 @@ mod tests {
     }
 
     #[test]
+    fn participant_list_hash_matches_whatsmeow_adstring_format() {
+        // ADString normalization: agent + device both default to 0, LID keeps its
+        // agent — must match whatsmeow's `%s.%d:%d@%s` byte-for-byte.
+        assert_eq!(
+            jid_ad_string("5511999999999@s.whatsapp.net"),
+            "5511999999999.0:0@s.whatsapp.net"
+        );
+        assert_eq!(
+            jid_ad_string("5511999999999:62@s.whatsapp.net"),
+            "5511999999999.0:62@s.whatsapp.net"
+        );
+        assert_eq!(jid_ad_string("64000000000456.1@lid"), "64000000000456.1:0@lid");
+        assert_eq!(
+            jid_ad_string("64000000000456.1:50@lid"),
+            "64000000000456.1:50@lid"
+        );
+
+        // phash over the two devices matches an INDEPENDENT oracle (computed in
+        // Python from the same algorithm), and is order-independent (impl sorts).
+        let recips: [String; 2] = [
+            "5511999999999@s.whatsapp.net".into(),
+            "64000000000456.1:50@lid".into(),
+        ];
+        assert_eq!(participant_list_hash_v2(&recips), "2:pJCbqw4K");
+        let reversed: [String; 2] = [
+            "64000000000456.1:50@lid".into(),
+            "5511999999999@s.whatsapp.net".into(),
+        ];
+        assert_eq!(participant_list_hash_v2(&reversed), "2:pJCbqw4K");
+    }
+
+    /// whatsmeow's phash covers `GetUserDevices([to, ownID])` — INCLUDING our own
+    /// sending device. `build_message_node` must fold `own_phash_device` into the
+    /// hash so the set matches; omitting self yields a different (wrong) hash that
+    /// makes the recipient silently drop the message.
+    #[test]
+    fn phash_includes_own_sending_device() {
+        use crate::crypto::signal::MessageType;
+        let recipients = [EncryptedRecipient {
+            jid: "64000000000123.1:50@lid".into(),
+            ciphertext: vec![0xAA],
+            message_type: MessageType::Whisper,
+        }];
+        let own = "64000000000999.1:62@lid";
+
+        let with_self =
+            build_message_node("m", "64000000000123@lid", &recipients, 1, None, Some("lid"), Some(own));
+        let without_self =
+            build_message_node("m", "64000000000123@lid", &recipients, 1, None, Some("lid"), None);
+
+        // With self folded in, the phash equals the hash over BOTH devices...
+        let expected = participant_list_hash_v2(&[
+            "64000000000123.1:50@lid".to_string(),
+            own.to_string(),
+        ]);
+        assert_eq!(with_self.attrs.get("phash").map(String::as_str), Some(expected.as_str()));
+        // ...and differs from the self-excluded hash (the pre-fix, dropped behavior).
+        assert_ne!(
+            with_self.attrs.get("phash"),
+            without_self.attrs.get("phash"),
+            "omitting our own device must change the hash"
+        );
+    }
+
+    #[test]
+    fn cstoken_is_hmac_sha256_of_recipient_lid() {
+        // HMAC-SHA256(salt, "<lid>@lid") — pinned against an independent oracle so
+        // the exact keyed input (LID user + "@lid", no device/agent) can't drift.
+        let salt = [
+            0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let token = generate_cs_token(&salt, "64000000000789").expect("token");
+        assert_eq!(
+            hex::encode(&token),
+            "c3c40acaf038b38ea2f835a47cb5e97b3b2d4f3d1aaab7b689778d595faa942b"
+        );
+        // No salt or no recipient → no token (whatsmeow returns nil, we omit it).
+        assert!(generate_cs_token(&[], "64000000000789").is_none());
+        assert!(generate_cs_token(&salt, "").is_none());
+    }
+
+    #[test]
     fn build_message_node_for_two_devices_has_canonical_shape() {
         use crate::crypto::signal::MessageType;
         use crate::protocol::binary::Content;
@@ -15857,6 +16441,8 @@ mod tests {
             &recipients,
             1_700_000_000,
             None,
+            None,
+            None,
         );
         assert_eq!(node.tag, "message");
         assert_eq!(node.attrs.get("id").map(String::as_str), Some("msg-1"));
@@ -15865,7 +16451,27 @@ mod tests {
             node.attrs.get("to").map(String::as_str),
             Some("5511999999999@s.whatsapp.net")
         );
+        // A PN send (no addressing_mode) must NOT stamp the attr.
+        assert!(!node.attrs.contains_key("addressing_mode"));
+        // A LID-addressed send stamps `addressing_mode="lid"`.
+        let lid_node = build_message_node(
+            "msg-lid",
+            "266846000000000@lid",
+            &recipients,
+            1_700_000_000,
+            None,
+            Some("lid"),
+            None,
+        );
+        assert_eq!(
+            lid_node.attrs.get("addressing_mode").map(String::as_str),
+            Some("lid")
+        );
+        // Legacy PN send (no addressing_mode) carries `t` (the working pre-#49
+        // shape); the modern LID send omits it (whatsmeow lets the server stamp it,
+        // and a client `t` alongside phash trips strict validation → error 479).
         assert_eq!(node.attrs.get("t").map(String::as_str), Some("1700000000"));
+        assert!(!lid_node.attrs.contains_key("t"));
 
         let participants = match &node.content {
             Content::Nodes(ns) => &ns[0],
@@ -16247,6 +16853,98 @@ mod tests {
         );
     }
 
+    /// A peer device the server lists but has NO prekey bundle for (a stale /
+    /// phantom companion — the `:99` seen in prod) must be SKIPPED, not abort the
+    /// whole send. Before the fix a single keyless device `?`-errored out of
+    /// `encrypt_per_device`, throwing away every already-encrypted real device and
+    /// failing delivery to the peer entirely (silent on the wire, "send op failed"
+    /// in the log). Here device 0 has a bundle and device 99 does not: the message
+    /// must still ship, carrying exactly device 0.
+    #[tokio::test]
+    async fn send_skips_peer_device_without_prekey_bundle() {
+        use crate::crypto::identity::KeyPair;
+        use crate::protocol::binary::{Content, Node};
+        use std::time::Duration;
+        use tokio::sync::mpsc;
+
+        let mgr = manager();
+        let session = mgr.create(Some("alice".into())).unwrap();
+        let session_id = session.meta.read().id.clone();
+        let keys = mgr.load_device_keys(&session_id).unwrap();
+        let store = mgr.store.clone();
+
+        let bob_id = KeyPair::generate();
+        let bob_spk = KeyPair::generate();
+        let bob_opk = KeyPair::generate();
+        let bob_jid = "5511999999999@s.whatsapp.net";
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Node>();
+        let dispatcher = ConnDispatcher::new(out_tx);
+
+        let send_handle = tokio::spawn({
+            let dispatcher = dispatcher.clone();
+            let session = session.clone();
+            let store = store.clone();
+            let keys = keys.clone();
+            async move {
+                send_text_op(
+                    &dispatcher, &session, &store, &keys, bob_jid, "MSG-SKIP", "hi", 1_000_000,
+                )
+                .await
+            }
+        });
+
+        // usync: device 0 (real) + device 99 (phantom, no keys).
+        let usync = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("usync within timeout")
+            .expect("usync present");
+        let usync_id = usync.attrs.get("id").cloned().unwrap();
+        let response = build_fake_usync_response_with_devices(&usync_id, bob_jid, &["0", "99"]);
+        dispatcher.take_pending(&usync_id).unwrap().send(response).unwrap();
+
+        // prekey fetch: answer with a bundle for device 0 (bob_jid) ONLY — no
+        // bundle for device 99, so the send must skip it.
+        let iq = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("prekey IQ within timeout")
+            .expect("prekey IQ present");
+        let iq_id = iq.attrs.get("id").cloned().unwrap();
+        let bob_spk_sig = {
+            let mut signed = [0u8; 33];
+            signed[0] = 0x05;
+            signed[1..].copy_from_slice(&bob_spk.public);
+            crate::crypto::identity::xeddsa_sign(&bob_id.private, &signed)
+        };
+        let bundle_iq = build_fake_user_bundle_iq(
+            &iq_id, bob_jid, 12345, &bob_id.public, 17, &bob_spk.public, &bob_spk_sig, 29,
+            &bob_opk.public,
+        );
+        dispatcher.take_pending(&iq_id).unwrap().send(bundle_iq).unwrap();
+
+        // The message STILL ships (send did not abort) with exactly one recipient.
+        let msg = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("message within timeout")
+            .expect("message present");
+        assert_eq!(msg.tag, "message");
+        send_handle.await.unwrap().expect("send succeeds despite the keyless device");
+
+        let participants = match &msg.content {
+            Content::Nodes(ns) => ns.iter().find(|n| n.tag == "participants").unwrap().clone(),
+            _ => panic!("message must contain participants"),
+        };
+        let tos = match &participants.content {
+            Content::Nodes(ns) => ns.clone(),
+            _ => panic!(),
+        };
+        assert_eq!(
+            tos.len(),
+            1,
+            "phantom device 99 (no bundle) skipped; device 0 still shipped"
+        );
+    }
+
     /// Build a `<iq type=result>` shaped like a usync devices response,
     /// reporting that `user_jid` has a single device 0. Tests use this
     /// to satisfy the usync IQ that `encrypt_inner_proto_and_ship`
@@ -16267,6 +16965,59 @@ mod tests {
             tag: "devices".into(),
             attrs: Attrs::new(),
             content: Content::Nodes(vec![device]),
+        };
+        let mut user_attrs = Attrs::new();
+        user_attrs.insert("jid".into(), user_jid.into());
+        let user = Node {
+            tag: "user".into(),
+            attrs: user_attrs,
+            content: Content::Nodes(vec![devices]),
+        };
+        let list = Node {
+            tag: "list".into(),
+            attrs: Attrs::new(),
+            content: Content::Nodes(vec![user]),
+        };
+        let usync = Node {
+            tag: "usync".into(),
+            attrs: Attrs::new(),
+            content: Content::Nodes(vec![list]),
+        };
+        let mut iq_attrs = Attrs::new();
+        iq_attrs.insert("id".into(), iq_id.into());
+        iq_attrs.insert("type".into(), "result".into());
+        Node {
+            tag: "iq".into(),
+            attrs: iq_attrs,
+            content: Content::Nodes(vec![usync]),
+        }
+    }
+
+    /// Like `build_fake_usync_response_single_device` but lists several device
+    /// ids under the one user — for exercising multi-device fan-out (e.g. a
+    /// phantom companion the server lists but has no prekeys for).
+    fn build_fake_usync_response_with_devices(
+        iq_id: &str,
+        user_jid: &str,
+        device_ids: &[&str],
+    ) -> crate::protocol::binary::Node {
+        use crate::protocol::binary::{Attrs, Content, Node};
+        let device_nodes: Vec<Node> = device_ids
+            .iter()
+            .map(|id| {
+                let mut dev_attrs = Attrs::new();
+                dev_attrs.insert("id".into(), (*id).into());
+                Node {
+                    tag: "device".into(),
+                    attrs: dev_attrs,
+                    content: Content::None,
+                }
+            })
+            .collect();
+        let devices = Node {
+            tag: "devices".into(),
+            attrs: Attrs::new(),
+            content: Content::Nodes(device_nodes),
         };
         let mut user_attrs = Attrs::new();
         user_attrs.insert("jid".into(), user_jid.into());
@@ -17311,6 +18062,55 @@ mod tests {
         assert_eq!(muted_until, Some(1_700_000_999));
     }
 
+    /// The `nct_salt_sync` app-state action carries the account NCT salt. Decoding
+    /// it must yield `AppStateMutation::NctSalt`, and applying it must persist the
+    /// salt so `<cstoken>` derivation works — WITHOUT a fresh QR re-link (app-state
+    /// re-syncs on every reconnect, unlike the link-time-only HistorySync copy).
+    #[test]
+    fn app_state_nct_salt_sync_populates_cstoken_salt() {
+        use prost::Message as _;
+        let salt = vec![0xABu8; 32];
+
+        // The nct_salt_sync index is account-global: `["nct_salt_sync"]` (no jid).
+        let action_data = SyncActionDataSubset {
+            index: Some(b"[\"nct_salt_sync\"]".to_vec()),
+            value: Some(SyncActionValueSubset {
+                nct_salt_sync_action: Some(NctSaltSyncActionSubset {
+                    salt: Some(salt.clone()),
+                }),
+                ..Default::default()
+            }),
+        };
+        let mutation = SyncdMutationSubset {
+            operation: Some(SyncdOperation::Set as i32),
+            record: Some(SyncdRecordSubset {
+                index: Some(SyncdBlob { blob: action_data.index.clone() }),
+                value: Some(SyncdBlob { blob: Some(action_data.encode_to_vec()) }),
+                key_id: None,
+            }),
+        };
+        let patch = SyncdPatchSubset {
+            mutations: vec![mutation],
+            snapshot_mac: None,
+            patch_mac: None,
+            key_id: None,
+        };
+
+        let muts = decode_app_state_patch(&patch.encode_to_vec());
+        assert_eq!(muts.len(), 1, "expected exactly one NctSalt mutation");
+        match &muts[0] {
+            AppStateMutation::NctSalt(s) => assert_eq!(s, &salt),
+            other => panic!("expected NctSalt, got {other:?}"),
+        }
+
+        // Applying it persists the salt on the session row.
+        let mgr = manager();
+        let session = mgr.create(Some("alice".into())).unwrap();
+        let id = session.meta.read().id.clone();
+        apply_app_state_mutation(&mgr.store, &id, &muts[0]).unwrap();
+        assert_eq!(mgr.store.session_nct_salt(&id).unwrap().as_deref(), Some(salt.as_slice()));
+    }
+
     /// Round-trip a HistorySync chunk: hand-build a HistorySyncSubset
     /// with two messages (one text, one image) → zlib-encode → run
     /// `parse_history_sync_payload` → assert decoded rows match → run
@@ -17383,6 +18183,10 @@ mod tests {
             ],
             conversation_timestamp: Some(1_700_000_002),
             name: Some("Bob".into()),
+            // Per-conversation privacy token (tctoken) — the link-time source.
+            tc_token: Some(b"hs-tok".to_vec()),
+            tc_token_timestamp: Some(1_700_000_500),
+            ..Default::default()
         };
         let hs = HistorySyncSubset {
             conversations: vec![conv],
@@ -17392,6 +18196,9 @@ mod tests {
                 id: Some("5511777@s.whatsapp.net".into()),
                 pushname: Some("Carol".into()),
             }],
+            // Exercises the tag=19 wire round-trip: encode → zlib → parse must
+            // recover the salt (a wrong tag/type would silently drop it).
+            nct_salt: Some(vec![0xAB, 0xCD, 0xEF, 0x01]),
         };
         let bytes = hs.encode_to_vec();
         let mut zlib_enc = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -17402,6 +18209,12 @@ mod tests {
         let rows = &parsed.rows;
         assert_eq!(rows.len(), 2);
         assert_eq!(parsed.pushnames, vec![("5511777@s.whatsapp.net".to_string(), "Carol".to_string())]);
+        assert_eq!(parsed.nct_salt, Some(vec![0xAB, 0xCD, 0xEF, 0x01]), "NCT salt survives the wire round-trip");
+        assert_eq!(
+            parsed.privacy_tokens,
+            vec![("5511999@s.whatsapp.net".to_string(), b"hs-tok".to_vec(), 1_700_000_500, 0)],
+            "per-conversation tctoken survives the round-trip"
+        );
         let r0 = rows.iter().find(|r| r.message_id == "HS-MSG-1").unwrap();
         assert_eq!(r0.msg_type, "text");
         assert_eq!(r0.body_text.as_deref(), Some("hi from history"));
@@ -17419,9 +18232,17 @@ mod tests {
         assert_eq!(r0.chat_name.as_deref(), Some("Bob"));
         assert!(!r0.is_group);
 
-        // Persist + verify.
+        // Persist + verify. Seed the peer's LID mapping first so the PN-keyed
+        // conversation's tctoken lands under the peer's canonical LID (the key the
+        // send path looks up).
+        store.lid_pn_put(&session_id, "64999", "5511999", 0).unwrap();
         let n = persist_history_sync_rows(&store, &session_id, &parsed).unwrap();
         assert_eq!(n, 2);
+        assert_eq!(
+            store.privacy_token_get(&session_id, "64999").unwrap(),
+            Some((b"hs-tok".to_vec(), 1_700_000_500)),
+            "history-sync tctoken persisted under the peer's LID"
+        );
         let count: u32 = store
             .with_conn(|c| {
                 c.query_row(
@@ -17493,8 +18314,9 @@ mod tests {
             }],
             conversation_timestamp: Some(1_700_000_011),
             name: Some("Carol".into()),
+            ..Default::default()
         };
-        let hs = HistorySyncSubset { conversations: vec![conv], pushnames: vec![] };
+        let hs = HistorySyncSubset { conversations: vec![conv], pushnames: vec![], nct_salt: None };
         let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
         enc.write_all(&hs.encode_to_vec()).unwrap();
         let inline = enc.finish().unwrap();
@@ -18092,7 +18914,7 @@ mod tests {
         assert_eq!(
             store.lid_to_pn(&id, "64000000000001").unwrap().as_deref(),
             Some("5511990000001"),
-            "Henry's LID->PN learned from group info"
+            "Sam's LID->PN learned from group info"
         );
         assert_eq!(
             store.lid_to_pn(&id, "169000000000002").unwrap().as_deref(),
