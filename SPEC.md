@@ -57,6 +57,8 @@ GET  /v1/sessions/:id
 DELETE /v1/sessions/:id
 
 POST /v1/sessions/:id/connect         (initiates pairing if unpaired, else reconnects)
+POST /v1/sessions/:id/reconnect       (force a real socket bounce + re-login without re-pairing)
+POST /v1/sessions/:id/resync-appstate (force a full app-state snapshot; repopulates NCT salt / tokens)
 GET  /v1/sessions/:id/qr              -> {"code":"...", "image_png_base64":"..."}
 POST /v1/sessions/:id/pair-phone      {"phone":"15551234567"} -> {"code":"ABCD-1234"}  (Link with phone number; alternative to QR)
 POST /v1/sessions/:id/logout

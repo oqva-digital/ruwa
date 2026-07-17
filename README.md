@@ -225,9 +225,22 @@ curl -H "Authorization: Bearer $RUWA_API_TOKEN" \
 | `RUWA_DB_ENCRYPTION_KEY` | unset | base64 32-byte key → encrypt secret columns |
 | `RUWA_MEDIA_STORE` | `db` | `s3` to offload media (needs `RUWA_S3_*`) |
 | `RUWA_LEASING` | unset | `1` enables cross-instance session leasing |
+| `RUWA_MODERN_LID_SEND` | unset | `1` enables the modern LID 1:1 stanza (`addressing_mode`/`phash`/`peer_recipient_pn`). Off by default — some servers reject it (error 479) for migrated peers; the default legacy stanza delivers |
 | `RUST_LOG` | `info` | Tracing filter |
 
 Full list (S3, leasing, retention, WA version override) in [`.env.example`](.env.example).
+
+### 1:1 delivery & privacy tokens
+
+Modern WhatsApp gates 1:1 messages to some peers (notably **business accounts** and
+**freshly re-paired** sessions) behind a per-contact *privacy token* (`tctoken`).
+Without it the server accepts the stanza but returns error **463 (MissingTcToken)**
+and never delivers it. ruwa captures that token automatically — from the contact's
+messages in real time, and from the HistorySync at (re)link — and echoes it back on
+every send. Practical consequence: for a **new or long-dormant** conversation with a
+gated peer, the contact has to message first (the normal customer-initiated flow),
+**or** the session must (re)link once to backfill every contact's token. Established,
+active chats are unaffected.
 
 ## Contributing
 
