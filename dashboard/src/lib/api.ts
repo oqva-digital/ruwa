@@ -1,7 +1,15 @@
 // ruwa /v1 API client. Bearer-auth; base URL + token in localStorage (set in the
 // Auth gate). SSE uses fetch-streaming (EventSource can't send an auth header).
 import type {
+  AiSettings,
+  AiSettingsInput,
+  AiTestResult,
+  CloudCredsInput,
+  ImproveTextInput,
+  ImproveTextResult,
+  MediaSendType,
   ContactRow,
+  InteractiveSendBody,
   EventHistoryRow,
   MessageRow,
   MetricPoint,
@@ -10,7 +18,10 @@ import type {
   SessionEvent,
   SessionHealth,
   SessionMeta,
+  SessionKind,
   SessionWithKey,
+  TemplatePage,
+  TemplateSendBody,
   WebhookConfig,
 } from "./types"
 
@@ -120,8 +131,18 @@ export const api = {
    *  (silences the phone's notifications); false = phone keeps notifying. */
   setMarkOnline: (id: string, mark_online: boolean) =>
     req<SessionMeta>("POST", `/v1/sessions/${id}/mark-online`, { mark_online }),
-  createSession: (label: string | null, proxy?: string | null) =>
-    req<SessionWithKey>("POST", "/v1/sessions", { label, proxy: proxy || null }),
+  /** Create a session. `kind` defaults to `web` server-side; `cloud` sessions
+   *  carry Meta Cloud API credentials and need no QR/pairing. */
+  createSession: (opts: { label: string | null; proxy?: string | null; kind?: SessionKind; cloud?: CloudCredsInput }) =>
+    req<SessionWithKey>("POST", "/v1/sessions", {
+      label: opts.label,
+      proxy: opts.proxy || null,
+      ...(opts.kind ? { kind: opts.kind } : {}),
+      ...(opts.cloud ? { cloud: opts.cloud } : {}),
+    }),
+  /** Replace Cloud API credentials/metadata (only provided fields change). 501 on web sessions. */
+  updateCloud: (id: string, cloud: CloudCredsInput) =>
+    req<SessionMeta>("PUT", `/v1/sessions/${id}/cloud`, cloud),
   deleteSession: (id: string) =>
     req<void>("DELETE", `/v1/sessions/${id}?force=1`),
   /** Migrate a paired Baileys/Evolution session (no QR) from its `creds` blob. */
@@ -139,6 +160,14 @@ export const api = {
     req<unknown>("POST", `/v1/sessions/${id}/logout`, { confirm: true }),
   setProxy: (id: string, proxy: string | null) =>
     req<unknown>("POST", `/v1/sessions/${id}/proxy`, { proxy }),
+  /** Non-sensitive proxy breakdown (scheme/host/port/hints; never the password). */
+  getProxy: (id: string) =>
+    req<{ configured: boolean; proxy?: { scheme: string; host: string; port: number | null; has_auth: boolean; hints: Record<string, string>; masked: string } }>(
+      "GET", `/v1/sessions/${id}/proxy`),
+  /** Heartbeat the proxy: reachability, latency, and the exit IP WhatsApp sees. */
+  checkProxy: (id: string) =>
+    req<{ ok: boolean; via_proxy: boolean; status?: number; latency_ms: number; exit_ip?: string | null; error?: string }>(
+      "POST", `/v1/sessions/${id}/proxy/check`),
   /** Rename an instance (ruwa-side label only; no WhatsApp effect). Blank clears it. */
   setLabel: (id: string, label: string | null) =>
     req<SessionMeta>("POST", `/v1/sessions/${id}/label`, { label }),
@@ -182,6 +211,49 @@ export const api = {
   },
   sendText: (id: string, to: string, text: string) =>
     req<{ id: string }>("POST", `/v1/sessions/${id}/messages`, { to, text }),
+  /**
+   * Send a media file as multipart/form-data: field `file` (binary) + field
+   * `metadata` (JSON string). `type: "ptt"` = WhatsApp voice note (must be
+   * Ogg/Opus); `caption` only applies to image/video/document.
+   */
+  sendMediaMultipart: async (
+    id: string,
+    opts: { to: string; type: MediaSendType; file: Blob; filename: string; mime: string; caption?: string },
+  ): Promise<{ id: string; timestamp?: number; status?: string }> => {
+    const fd = new FormData()
+    fd.append("file", opts.file, opts.filename)
+    fd.append(
+      "metadata",
+      JSON.stringify({
+        to: opts.to,
+        type: opts.type,
+        mime: opts.mime,
+        filename: opts.filename,
+        ...(opts.caption ? { caption: opts.caption } : {}),
+      }),
+    )
+    // No content-type header: the browser sets multipart/form-data + boundary.
+    const res = await fetch(`${getBase()}/v1/sessions/${id}/messages/media/multipart`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${getToken()}` },
+      body: fd,
+    })
+    const text = await res.text()
+    let data: unknown
+    try {
+      data = text ? JSON.parse(text) : null
+    } catch {
+      data = text
+    }
+    if (!res.ok) {
+      const msg =
+        (data && typeof data === "object" && "error" in data
+          ? String((data as { error: unknown }).error)
+          : null) || `HTTP ${res.status}`
+      throw new ApiError(res.status, msg)
+    }
+    return data as { id: string; timestamp?: number; status?: string }
+  },
   react: (id: string, to: string, msg_id: string, from_me: boolean, emoji: string, participant?: string) =>
     req<unknown>("POST", `/v1/sessions/${id}/messages/react`, { to, msg_id, from_me, emoji, participant }),
   revoke: (id: string, to: string, msg_id: string) =>
@@ -196,6 +268,21 @@ export const api = {
     req<{ id: string }>("POST", `/v1/sessions/${id}/messages/poll`, { to, ...body }),
   sendEvent: (id: string, to: string, body: { name: string; description?: string; location?: string; start_time: number; end_time?: number }) =>
     req<{ id: string }>("POST", `/v1/sessions/${id}/messages/event`, { to, ...body }),
+
+  // ── cloud-only sends (501 on web sessions) ──
+  sendTemplate: (id: string, to: string, body: TemplateSendBody) =>
+    req<{ id: string; timestamp?: number; status?: string }>("POST", `/v1/sessions/${id}/messages/template`, { to, ...body }),
+  sendInteractive: (id: string, to: string, body: InteractiveSendBody) =>
+    req<{ id: string; timestamp?: number; status?: string }>("POST", `/v1/sessions/${id}/messages/interactive`, { to, ...body }),
+  /** Message templates of the session's WABA (proxied from Graph). */
+  listTemplates: (id: string, opts?: { status?: string; limit?: number; after?: string }) => {
+    const p = new URLSearchParams()
+    if (opts?.status) p.set("status", opts.status)
+    if (opts?.limit != null) p.set("limit", String(opts.limit))
+    if (opts?.after) p.set("after", opts.after)
+    const qs = p.toString()
+    return req<TemplatePage>("GET", `/v1/sessions/${id}/templates${qs ? "?" + qs : ""}`)
+  },
 
   // ── directory ──
   contacts: (id: string) => req<ContactRow[]>("GET", `/v1/sessions/${id}/contacts`),
@@ -225,6 +312,15 @@ export const api = {
   setRedis: (id: string, body: { url: string; mode: string; key: string; enabled: boolean; events: string[] }) =>
     req<unknown>("PUT", `/v1/sessions/${id}/egress/redis`, body),
   deleteRedis: (id: string) => req<void>("DELETE", `/v1/sessions/${id}/egress/redis`),
+
+  // ── AI text assistant (server-wide, admin token; key stored sealed server-side) ──
+  getAiSettings: () => req<AiSettings>("GET", "/v1/settings/ai"),
+  putAiSettings: (body: AiSettingsInput) => req<AiSettings>("PUT", "/v1/settings/ai", body),
+  deleteAiSettings: () => req<void>("DELETE", "/v1/settings/ai"),
+  /** Round-trips a tiny "Reply with OK" prompt through the configured provider. */
+  testAiSettings: () => req<AiTestResult>("POST", "/v1/settings/ai/test"),
+  /** Rewrite a draft. 400 when the assistant isn't configured, 422 if the model declines. */
+  improveText: (body: ImproveTextInput) => req<ImproveTextResult>("POST", "/v1/ai/improve-text", body),
 }
 
 /**

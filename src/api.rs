@@ -5,6 +5,14 @@
 //! `/v1/sessions/:id/*` route additionally accepts that session's own per-tenant
 //! `api_key` (minted + returned once at create), scoped to just that session.
 //! Convention: routes return JSON; errors flow through `error::Error`.
+//!
+//! Sessions come in two kinds (`SessionMeta.kind`): `web` (WhatsApp Web
+//! multi-device socket) and `cloud` (Meta WhatsApp Cloud API). Both share the
+//! same routes; handlers that only make sense for one backend answer 501 on the
+//! other (`require_web` / `require_cloud`). Cloud sends are synchronous Graph
+//! calls (`cloud_dispatch`) and respond `202 {"id": wamid, "status": "sent"}`;
+//! inbound cloud traffic arrives on the unauthenticated, signature-verified
+//! `GET|POST /v1/cloud/webhook` (`cloud_webhook_verify` / `cloud_webhook_receive`).
 
 use std::sync::Arc;
 
@@ -18,8 +26,12 @@ use serde_json::json;
 #[cfg(not(feature = "console"))]
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::cloud;
+use crate::egress::ai::{self, AiConfig, AiMode};
 use crate::error::{Error, Result};
-use crate::session::{SendOp, SessionManager, SessionMeta};
+use crate::session::{
+    CloudCredsPatch, SendOp, Session, SessionKind, SessionManager, SessionMeta,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -86,12 +98,23 @@ async fn track_http_metrics(
     resp
 }
 
+/// Max accepted `POST /v1/cloud/webhook` body (Meta caps deliveries at 3 MB).
+const CLOUD_WEBHOOK_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
 pub fn router(state: AppState) -> Router {
     // Stamp process start once (this is built once per process) so
     // `ruwa_process_uptime_seconds` counts from boot.
     crate::session::metrics::mark_process_start();
     let v1 = Router::new()
         .route("/config", get(config))
+        .route(
+            "/settings/ai",
+            get(get_ai_settings)
+                .put(put_ai_settings)
+                .delete(delete_ai_settings),
+        )
+        .route("/settings/ai/test", post(test_ai_settings))
+        .route("/ai/improve-text", post(ai_improve_text))
         .route("/metrics/series", get(list_metrics_series))
         .route("/metrics/history", get(get_metrics_history))
         .route("/logs", get(get_logs))
@@ -105,7 +128,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/reconnect", post(reconnect_session))
         .route("/sessions/:id/resync-appstate", post(resync_appstate_session))
         .route("/sessions/:id/logout", post(logout_session))
-        .route("/sessions/:id/proxy", post(set_session_proxy))
+        .route("/sessions/:id/proxy", get(get_session_proxy).post(set_session_proxy))
+        .route("/sessions/:id/proxy/check", post(check_session_proxy))
+        .route("/sessions/:id/calls/:call_id/reject", post(reject_call))
+        .route("/sessions/:id/cloud", put(set_session_cloud))
         .route("/sessions/:id/label", post(set_session_label))
         .route("/sessions/:id/mark-online", post(set_session_presence))
         .route("/sessions/:id/messages", get(list_messages).post(send_message))
@@ -114,6 +140,31 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/messages/contact", post(send_contact))
         .route("/sessions/:id/messages/poll", post(send_poll))
         .route("/sessions/:id/messages/event", post(send_event))
+        .route("/sessions/:id/messages/template", post(send_template))
+        .route(
+            "/sessions/:id/messages/interactive",
+            post(send_interactive),
+        )
+        .route(
+            "/sessions/:id/templates",
+            get(list_templates).post(create_template),
+        )
+        .route(
+            "/sessions/:id/templates/:name",
+            axum::routing::delete(delete_template),
+        )
+        // Meta webhook: no bearer auth (Meta can't send one) — the POST is
+        // authenticated by `X-Hub-Signature-256` over the raw body instead, and
+        // the GET by the verify token. Exempt from the readonly gate (inbound
+        // traffic, like the web socket's).
+        // Meta batches up to 1000 updates / 3 MB per POST — above axum's 2 MB
+        // default, which would 413 (and Meta would retry the same body forever).
+        .route(
+            "/cloud/webhook",
+            get(cloud_webhook_verify)
+                .post(cloud_webhook_receive)
+                .layer(axum::extract::DefaultBodyLimit::max(CLOUD_WEBHOOK_BODY_LIMIT)),
+        )
         .route(
             "/sessions/:id/messages/media/multipart",
             post(send_media_multipart),
@@ -399,6 +450,155 @@ struct CreateSessionReq {
     label: Option<String>,
     /// Optional egress proxy URL (socks5/socks5h/http). Validated on create.
     proxy: Option<String>,
+    /// Backend: `"web"` (default — WhatsApp Web linked device, QR/phone
+    /// pairing) or `"cloud"` (Meta WhatsApp Cloud API; needs `cloud`).
+    kind: Option<String>,
+    /// Cloud API credentials — required (and only accepted) with `kind: cloud`.
+    cloud: Option<CloudCredsReq>,
+}
+
+/// Cloud API credentials as accepted on `POST /sessions` (`kind: cloud`).
+/// Secrets are sealed at rest and never echoed by any response.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CloudCredsReq {
+    /// Graph node id of the business phone number (required).
+    phone_number_id: Option<String>,
+    /// WhatsApp Business Account id — needed for template management.
+    #[serde(default)]
+    waba_id: Option<String>,
+    /// System-user / business access token (required).
+    access_token: Option<String>,
+    /// Meta app secret: signs inbound webhooks. Optional but strongly
+    /// recommended (without it webhooks need `RUWA_CLOUD_ALLOW_UNSIGNED=1`).
+    #[serde(default)]
+    app_secret: Option<String>,
+    /// Token echoed on the webhook subscription handshake.
+    #[serde(default)]
+    verify_token: Option<String>,
+    /// Graph API version (default `v25.0`).
+    #[serde(default)]
+    graph_version: Option<String>,
+}
+
+/// Non-empty trimmed string, or `None` (blank/absent collapse together).
+fn non_blank(s: Option<String>) -> Option<String> {
+    s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// 501 for a WhatsApp-Web-only route called on a cloud session.
+fn require_web(session: &Session, what: &'static str) -> Result<()> {
+    if session.kind() == SessionKind::Cloud {
+        return Err(Error::NotImplemented(what));
+    }
+    Ok(())
+}
+
+/// 501 for a Cloud-API-only route called on a web session.
+fn require_cloud(session: &Session, what: &'static str) -> Result<()> {
+    if session.kind() != SessionKind::Cloud {
+        return Err(Error::NotImplemented(what));
+    }
+    Ok(())
+}
+
+/// Graph client for a cloud session: its stored (unsealed) credentials +
+/// its egress proxy, so Graph traffic shares the session's IP like web media.
+fn cloud_client(state: &AppState, id: &str, session: &Session) -> Result<cloud::CloudClient> {
+    let creds = state.manager.cloud_creds(id)?;
+    let proxy = session.meta.read().proxy_url.clone();
+    cloud::CloudClient::new(creds, proxy.as_deref())
+}
+
+/// Outcome of a synchronous cloud send, for handlers that need the persisted
+/// row's coordinates (e.g. to attach a media path) besides the HTTP response.
+struct CloudSent {
+    /// Chat the row was filed under (`<wa_id digits>@s.whatsapp.net`).
+    chat_jid: String,
+    wamid: String,
+    timestamp: i64,
+}
+
+/// POST `graph_payload` to Graph on behalf of a cloud session and, once Meta
+/// accepted it, persist the outbound row keyed by the returned `wamid`
+/// (`from_me=1, status=sent`) + emit `MessageSent`. A Graph error propagates
+/// (mapped by `cloud::map_graph_error`) and leaves NO row — the caller's
+/// message was never sent. The row's chat is the recipient as WhatsApp sees
+/// it (`contacts[0].wa_id`, e.g. Brazilian 9th digit normalized) so later
+/// status webhooks and the user's replies land in the same chat.
+#[allow(clippy::too_many_arguments)]
+async fn cloud_send_record(
+    state: &AppState,
+    id: &str,
+    session: &Session,
+    to: &str,
+    msg_type: &str,
+    body_text: Option<&str>,
+    payload_echo: serde_json::Value,
+    graph_payload: serde_json::Value,
+) -> Result<CloudSent> {
+    // The Cloud API addresses phone numbers only: refuse @lid/@g.us/… ids
+    // instead of letting the builders digit-strip them into a stranger's number.
+    cloud::check_recipient(to)?;
+    let client = cloud_client(state, id, session)?;
+    let sent = client.send(graph_payload).await?;
+    tracing::debug!(
+        session = %id,
+        phone_number_id = %client.phone_number_id(),
+        wamid = %sent.wamid,
+        msg_type,
+        "cloud: graph accepted outbound message"
+    );
+    let now = chrono::Utc::now().timestamp();
+    let recipient = sent.wa_id.as_deref().unwrap_or(to);
+    let chat_jid = cloud::to_jid(recipient);
+    let sender_jid = session.meta.read().jid.clone().unwrap_or_else(|| "self".into());
+    state.manager.cloud_record_outbound(
+        id,
+        &chat_jid,
+        &sent.wamid,
+        &sender_jid,
+        msg_type,
+        body_text,
+        &payload_echo.to_string(),
+        now,
+    )?;
+    Ok(CloudSent { chat_jid, wamid: sent.wamid, timestamp: now })
+}
+
+/// `cloud_send_record` + the standard `202 {"id","timestamp","status":"sent"}`.
+#[allow(clippy::too_many_arguments)]
+async fn cloud_dispatch(
+    state: &AppState,
+    id: &str,
+    session: &Session,
+    to: &str,
+    msg_type: &str,
+    body_text: Option<&str>,
+    payload_echo: serde_json::Value,
+    graph_payload: serde_json::Value,
+) -> Result<(StatusCode, Json<SendTextResp>)> {
+    let sent = cloud_send_record(
+        state, id, session, to, msg_type, body_text, payload_echo, graph_payload,
+    )
+    .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SendTextResp { id: sent.wamid, timestamp: sent.timestamp, status: "sent" }),
+    ))
+}
+
+/// Cloud media kind for the public `type` string of the media routes.
+fn cloud_media_kind(kind: &str) -> Option<cloud::MediaKind> {
+    Some(match kind {
+        "image" => cloud::MediaKind::Image,
+        "video" => cloud::MediaKind::Video,
+        "audio" => cloud::MediaKind::Audio,
+        "ptt" | "voice" => cloud::MediaKind::Ptt,
+        "document" => cloud::MediaKind::Document,
+        "sticker" => cloud::MediaKind::Sticker,
+        _ => return None,
+    })
 }
 
 #[derive(Serialize)]
@@ -474,7 +674,49 @@ async fn create_session(
     Json(req): Json<CreateSessionReq>,
 ) -> Result<(StatusCode, Json<SessionResp>)> {
     check_auth_write(&headers, &state)?;
-    let session = state.manager.create(req.label)?;
+    let kind = match req.kind.as_deref().map(str::trim) {
+        None | Some("") | Some("web") => SessionKind::Web,
+        Some("cloud") => SessionKind::Cloud,
+        Some(other) => {
+            return Err(Error::BadRequest(format!(
+                "unknown session kind {other:?}: expected \"web\" or \"cloud\""
+            )))
+        }
+    };
+    let session = match kind {
+        SessionKind::Web => {
+            if req.cloud.is_some() {
+                return Err(Error::BadRequest(
+                    "cloud credentials are only accepted with \"kind\": \"cloud\"".into(),
+                ));
+            }
+            state.manager.create(req.label)?
+        }
+        SessionKind::Cloud => {
+            let c = req.cloud.ok_or_else(|| {
+                Error::BadRequest(
+                    "kind \"cloud\" requires a \"cloud\" object with phone_number_id + access_token"
+                        .into(),
+                )
+            })?;
+            let phone_number_id = non_blank(c.phone_number_id)
+                .ok_or_else(|| Error::BadRequest("cloud.phone_number_id is required".into()))?;
+            let access_token = non_blank(c.access_token)
+                .ok_or_else(|| Error::BadRequest("cloud.access_token is required".into()))?;
+            state.manager.create_cloud(
+                req.label,
+                cloud::CloudCreds {
+                    phone_number_id,
+                    waba_id: non_blank(c.waba_id),
+                    access_token,
+                    app_secret: non_blank(c.app_secret),
+                    verify_token: non_blank(c.verify_token),
+                    graph_version: non_blank(c.graph_version)
+                        .unwrap_or_else(|| cloud::DEFAULT_GRAPH_VERSION.to_string()),
+                },
+            )?
+        }
+    };
     let id = session.meta.read().id.clone();
     // Apply the proxy up-front (validates the URL; rolls back the session on a
     // bad value so we don't leave a half-configured row).
@@ -570,6 +812,171 @@ async fn set_session_proxy(
     Ok(Json(SessionResp::new(meta)))
 }
 
+/// Non-sensitive breakdown of a proxy URL: scheme/host/port + the sticky-session
+/// hints parsed out of the username (country/city/session/lifetime). Never the
+/// password; the username value itself is redacted (only its parsed hints show).
+fn proxy_info_json(url: &str) -> serde_json::Value {
+    let scheme = url.split_once("://").map(|(s, _)| s).unwrap_or("");
+    // host:port is everything after the last '@' (or after scheme:// if no auth).
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let hostport = after_scheme.rsplit_once('@').map(|(_, h)| h).unwrap_or(after_scheme);
+    let (host, port) = hostport.rsplit_once(':').unwrap_or((hostport, ""));
+    // Username = between "://" and the last '@'; parse `_key-value` sticky hints.
+    let user = after_scheme.rsplit_once('@').map(|(u, _)| u).unwrap_or("");
+    let user = user.split_once(':').map(|(u, _)| u).unwrap_or(user); // drop password
+    let mut hints = serde_json::Map::new();
+    for key in ["country", "city", "session", "lifetime", "state", "region"] {
+        if let Some(pos) = user.find(&format!("_{key}-")) {
+            let rest = &user[pos + key.len() + 2..];
+            let val = rest.split('_').next().unwrap_or("");
+            if !val.is_empty() {
+                // `session` is an opaque id — confirm presence, don't echo it.
+                let shown = if key == "session" { "<set>".to_string() } else { val.to_string() };
+                hints.insert(key.to_string(), serde_json::Value::String(shown));
+            }
+        }
+    }
+    serde_json::json!({
+        "scheme": scheme,
+        "host": host,
+        "port": port.parse::<u16>().ok(),
+        "has_auth": after_scheme.contains('@'),
+        "hints": hints,
+        "masked": mask_proxy(url),
+    })
+}
+
+/// Show the session's configured proxy — non-sensitive fields only, so an
+/// operator can verify it's being built right (host/port/country/city/…).
+async fn get_session_proxy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    check_session_auth(&headers, &state, &id)?;
+    let proxy = state.manager.get(&id)?.meta.read().proxy_url.clone();
+    Ok(Json(match proxy {
+        Some(url) => serde_json::json!({ "configured": true, "proxy": proxy_info_json(&url) }),
+        None => serde_json::json!({ "configured": false }),
+    }))
+}
+
+/// Heartbeat the session's proxy: make a short HTTPS request THROUGH it and
+/// report reachability, latency, and the exit IP WhatsApp would see. Tells you
+/// whether the proxy itself is broken vs. a ruwa/account issue. No proxy → tests
+/// the direct egress (the server's own IP).
+async fn check_session_proxy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    check_session_auth(&headers, &state, &id)?;
+    let proxy = state.manager.get(&id)?.meta.read().proxy_url.clone();
+
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(8));
+    if let Some(url) = proxy.as_deref() {
+        match reqwest::Proxy::all(url) {
+            Ok(p) => builder = builder.proxy(p),
+            Err(e) => {
+                return Ok(Json(serde_json::json!({
+                    "ok": false, "via_proxy": true, "error": format!("invalid proxy url: {e}")
+                })));
+            }
+        }
+    }
+    let client = builder.build().map_err(|e| Error::Internal(anyhow::anyhow!(e)))?;
+    // A tiny plaintext IP echo — confirms the tunnel works AND surfaces the exit IP.
+    let started = std::time::Instant::now();
+    let result = client.get("https://api.ipify.org").send().await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    Ok(Json(match result {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let exit_ip = resp.text().await.ok().map(|s| s.trim().to_string());
+            serde_json::json!({
+                "ok": (200..300).contains(&status),
+                "via_proxy": proxy.is_some(),
+                "status": status,
+                "latency_ms": latency_ms,
+                "exit_ip": exit_ip,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "via_proxy": proxy.is_some(),
+            "latency_ms": latency_ms,
+            "error": e.to_string(),
+        }),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectCallReq {
+    /// The caller's JID — the `from` of the `call_offer` event. Accepts bare
+    /// digits or a full jid (normalized like message recipients).
+    peer: String,
+}
+
+/// Decline an incoming call: ships whatsmeow's `<call><reject/></call>` so
+/// the caller's phone stops ringing and shows "declined". `call_id` comes
+/// from the `call_offer` event. Web sessions only.
+async fn reject_call(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, call_id)): Path<(String, String)>,
+    Json(req): Json<RejectCallReq>,
+) -> Result<Json<serde_json::Value>> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_web(&session, "calls are not supported on cloud sessions")?;
+    let own_jid = session
+        .meta
+        .read()
+        .jid
+        .clone()
+        .ok_or_else(|| Error::BadRequest("session has no JID (not paired)".into()))?;
+    let peer = normalize_recipient_jid(&req.peer);
+    let node = crate::session::build_call_reject_node(
+        &generate_message_id(),
+        &own_jid,
+        &peer,
+        &call_id,
+    );
+    session.enqueue_send(SendOp::RawNode(node))?;
+    Ok(Json(serde_json::json!({
+        "call_id": call_id,
+        "peer": peer,
+        "rejected": true
+    })))
+}
+
+/// Update a cloud session's Graph credentials (partial: only the fields present
+/// replace the stored value; an empty string clears an optional one). Takes
+/// effect on the next `connect`/send — `reconnect` to re-validate a new token.
+/// `phone_number_id` changes need the master token and 409 if another session
+/// already owns that number. 501 on web sessions.
+async fn set_session_cloud(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(patch): Json<CloudCredsPatch>,
+) -> Result<Json<SessionResp>> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, "cloud credentials are only available on cloud sessions")?;
+    // Re-pointing a session at a different Meta number is an operator action:
+    // a per-session key may rotate tokens/secrets, not claim other numbers.
+    if patch.phone_number_id.is_some() && bearer_token(&headers)? != state.api_token.as_str() {
+        return Err(Error::Forbidden(
+            "changing phone_number_id requires the master API token".into(),
+        ));
+    }
+    state.manager.set_cloud_creds(&id, patch)?;
+    let meta = session.meta.read().clone();
+    Ok(Json(SessionResp::new(meta)))
+}
+
 /// Rename an instance: set or clear (`label: null`/blank) its display label.
 /// A purely organizational ruwa-side name — no WhatsApp protocol effect. Takes
 /// effect immediately; no reconnect needed.
@@ -595,6 +1002,8 @@ async fn set_session_presence(
     Json(req): Json<SetPresenceReq>,
 ) -> Result<Json<SessionResp>> {
     check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_web(&session, "mark-online (presence) is not supported on cloud sessions")?;
     state.manager.set_mark_online(&id, req.mark_online)?;
     let meta = state.manager.get(&id)?.meta.read().clone();
     Ok(Json(SessionResp::new(meta)))
@@ -608,6 +1017,7 @@ async fn get_qr(
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     check_session_auth(&headers, &state, &id)?;
     let session = state.manager.get(&id)?;
+    require_web(&session, "QR pairing is not supported on cloud sessions")?;
     let qr = session
         .current_qr()
         .ok_or_else(|| Error::NotFound(format!("no QR available for session {id}")))?;
@@ -657,6 +1067,7 @@ async fn pair_phone_session(
 ) -> Result<Json<serde_json::Value>> {
     check_session_auth_write(&headers, &state, &id)?;
     let session = state.manager.get(&id)?;
+    require_web(&session, "phone pairing is not supported on cloud sessions")?;
     let keys = state.manager.load_device_keys(&id)?;
     let display = req
         .client_display_name
@@ -709,8 +1120,9 @@ async fn resync_appstate_session(
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<SessionResp>)> {
     check_session_auth_write(&headers, &state, &id)?;
-    // Verify the session exists before touching its rows.
-    let _ = state.manager.get(&id)?;
+    // Verify the session exists (and is a web one) before touching its rows.
+    let session = state.manager.get(&id)?;
+    require_web(&session, "app-state resync is not supported on cloud sessions")?;
     for col in crate::session::AppStateCollection::all() {
         state
             .manager
@@ -785,6 +1197,10 @@ struct SendTextResp {
     /// for unknown peers, encrypts via Signal, and ships the `<message>`
     /// node — at which point a `MessageSent` event lands on the SSE bus.
     /// Server-ack confirmation (`<ack>` round-trip) is a follow-up.
+    ///
+    /// Cloud sessions send synchronously (Graph POST inside the handler), so
+    /// they answer `"sent"` with `id` = Meta's `wamid` and a row already at
+    /// `status=sent`; delivery/read/failed arrive later via the Meta webhook.
     status: &'static str,
 }
 
@@ -799,6 +1215,20 @@ async fn send_message(
         return Err(Error::BadRequest("text must be non-empty".into()));
     }
     let session = state.manager.get(&id)?;
+    if session.kind() == SessionKind::Cloud {
+        // Cloud: synchronous Graph text send. `quoted.id`/`reply_to` becomes the
+        // Graph `context.message_id`; `mentions` have no Cloud API equivalent
+        // and are ignored (the `@number` tokens stay in the text).
+        let reply_to = req
+            .quoted
+            .as_ref()
+            .map(|q| q.id.as_str())
+            .or(req.reply_to.as_deref());
+        let payload = cloud::text_payload(&req.to, &req.text, reply_to);
+        let echo = json!({ "type": "text", "text": req.text });
+        return cloud_dispatch(&state, &id, &session, &req.to, "text", Some(&req.text), echo, payload)
+            .await;
+    }
     let now = chrono::Utc::now().timestamp();
     let chat_jid = normalize_recipient_jid(&req.to);
     let msg_id = generate_message_id();
@@ -886,11 +1316,6 @@ async fn send_location(
         ));
     }
     let session = state.manager.get(&id)?;
-    let now = chrono::Utc::now().timestamp();
-    let chat_jid = normalize_recipient_jid(&req.to);
-    let msg_id = generate_message_id();
-    let sender_jid = session.meta.read().jid.clone().unwrap_or_else(|| "self".into());
-
     let body = req.name.as_deref().or(req.address.as_deref()).unwrap_or("location");
     let payload = serde_json::json!({
         "type": "location",
@@ -899,6 +1324,23 @@ async fn send_location(
         "name": req.name,
         "address": req.address,
     });
+    if session.kind() == SessionKind::Cloud {
+        let graph = cloud::location_payload(
+            &req.to,
+            req.latitude,
+            req.longitude,
+            req.name.as_deref(),
+            req.address.as_deref(),
+            None,
+        );
+        return cloud_dispatch(&state, &id, &session, &req.to, "location", Some(body), payload, graph)
+            .await;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let chat_jid = normalize_recipient_jid(&req.to);
+    let msg_id = generate_message_id();
+    let sender_jid = session.meta.read().jid.clone().unwrap_or_else(|| "self".into());
+
     state.manager.persist_outgoing(
         &id, &chat_jid, &msg_id, &sender_jid, "location", Some(body), &payload.to_string(), now,
     )?;
@@ -946,6 +1388,35 @@ fn build_vcard(name: &str, phone: &str) -> String {
     )
 }
 
+/// Best-effort vCard → neutral contact card for the Cloud API (which takes
+/// structured contacts, not vCard text): `FN:` (else `fallback_name`) becomes
+/// the name; every `TEL…:` line contributes a phone. Never fails — an unusable
+/// vCard yields a card with no phones (the caller rejects that).
+fn contact_card_from_vcard(vcard: &str, fallback_name: &str) -> cloud::ContactCard {
+    let mut name: Option<String> = None;
+    let mut phones = Vec::new();
+    for line in vcard.lines() {
+        let line = line.trim();
+        let (key, value) = match line.split_once(':') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        // `TEL;type=CELL;waid=…:+55 11 …` — the property name is before the
+        // first `;`; the value is everything after the LAST `:` of the params.
+        let prop = key.split(';').next().unwrap_or("").trim().to_ascii_uppercase();
+        let value = value.trim();
+        match prop.as_str() {
+            "FN" if !value.is_empty() && name.is_none() => name = Some(value.to_string()),
+            "TEL" if !value.is_empty() => phones.push(value.to_string()),
+            _ => {}
+        }
+    }
+    cloud::ContactCard {
+        name: name.unwrap_or_else(|| fallback_name.to_string()),
+        phones,
+    }
+}
+
 async fn send_contact(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -967,16 +1438,34 @@ async fn send_contact(
     };
 
     let session = state.manager.get(&id)?;
-    let now = chrono::Utc::now().timestamp();
-    let chat_jid = normalize_recipient_jid(&req.to);
-    let msg_id = generate_message_id();
-    let sender_jid = session.meta.read().jid.clone().unwrap_or_else(|| "self".into());
-
     let payload = serde_json::json!({
         "type": "contact",
         "display_name": req.display_name,
         "vcard": vcard,
     });
+    if session.kind() == SessionKind::Cloud {
+        // Cloud sends structured contact cards, not vCards: use the explicit
+        // phone when given, else pull FN/TEL out of the vCard best-effort.
+        let card = match req.phone.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            Some(p) => cloud::ContactCard { name: req.display_name.clone(), phones: vec![p.to_string()] },
+            None => contact_card_from_vcard(&vcard, &req.display_name),
+        };
+        if card.phones.is_empty() {
+            return Err(Error::BadRequest(
+                "cloud contact cards need a phone (provide `phone` or a vCard with a TEL line)".into(),
+            ));
+        }
+        let graph = cloud::contacts_payload(&req.to, std::slice::from_ref(&card), None);
+        return cloud_dispatch(
+            &state, &id, &session, &req.to, "contact", Some(&req.display_name), payload, graph,
+        )
+        .await;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let chat_jid = normalize_recipient_jid(&req.to);
+    let msg_id = generate_message_id();
+    let sender_jid = session.meta.read().jid.clone().unwrap_or_else(|| "self".into());
+
     state.manager.persist_outgoing(
         &id, &chat_jid, &msg_id, &sender_jid, "contact",
         Some(&req.display_name), &payload.to_string(), now,
@@ -1033,6 +1522,7 @@ async fn send_poll(
     }
 
     let session = state.manager.get(&id)?;
+    require_web(&session, "polls are not supported on cloud sessions")?;
     let now = chrono::Utc::now().timestamp();
     let chat_jid = normalize_recipient_jid(&req.to);
     let msg_id = generate_message_id();
@@ -1116,6 +1606,7 @@ async fn send_event(
     }
 
     let session = state.manager.get(&id)?;
+    require_web(&session, "calendar events are not supported on cloud sessions")?;
     let now = chrono::Utc::now().timestamp();
     let chat_jid = normalize_recipient_jid(&req.to);
     let msg_id = generate_message_id();
@@ -1319,6 +1810,33 @@ async fn send_media(
         )));
     }
 
+    if session.kind() == SessionKind::Cloud {
+        let bytes = std::fs::read(&req.file_path)
+            .map_err(|e| Error::BadRequest(format!("cannot read file_path {}: {e}", req.file_path)))?;
+        let upload_name = req.filename.clone().unwrap_or_else(|| {
+            std::path::Path::new(&req.file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".into())
+        });
+        return cloud_send_media(
+            &state,
+            &id,
+            &session,
+            CloudMediaSend {
+                to: &req.to,
+                kind: &req.kind,
+                mime: &req.mime,
+                caption: req.caption.as_deref(),
+                filename: req.filename.as_deref(),
+                upload_name: &upload_name,
+                bytes,
+                local_path: Some(&req.file_path),
+            },
+        )
+        .await;
+    }
+
     let now = chrono::Utc::now().timestamp();
     let chat_jid = normalize_recipient_jid(&req.to);
     let msg_id = generate_message_id();
@@ -1372,6 +1890,66 @@ async fn send_media(
             timestamp: now,
             status: "queued",
         }),
+    ))
+}
+
+/// Inputs of a cloud media send (shared by the JSON and multipart routes).
+struct CloudMediaSend<'a> {
+    to: &'a str,
+    /// Public media type string (`image|video|audio|ptt|voice|document|sticker`).
+    kind: &'a str,
+    mime: &'a str,
+    caption: Option<&'a str>,
+    /// Display filename (documents).
+    filename: Option<&'a str>,
+    /// Filename used for the Graph multipart upload part.
+    upload_name: &'a str,
+    bytes: Vec<u8>,
+    /// Local file the bytes came from (JSON route) — cached as the row's
+    /// `media_path` so `GET …/media` streams it without a Graph round-trip.
+    local_path: Option<&'a str>,
+}
+
+/// Cloud media send: upload the bytes to Graph (`POST /{pnid}/media`), send a
+/// message referencing the returned media id, persist the row (`msg_type` =
+/// the public kind, `payload_json` carries `media_id` + `mimetype` so the media
+/// route can re-fetch it lazily).
+async fn cloud_send_media(
+    state: &AppState,
+    id: &str,
+    session: &Session,
+    m: CloudMediaSend<'_>,
+) -> Result<(StatusCode, Json<SendTextResp>)> {
+    let kind = cloud_media_kind(m.kind)
+        .ok_or_else(|| Error::BadRequest(format!("unknown media type {}", m.kind)))?;
+    // Validate the recipient BEFORE spending an upload round-trip.
+    cloud::check_recipient(m.to)?;
+    let client = cloud_client(state, id, session)?;
+    let media_id = client.upload_media(m.bytes, m.mime, m.upload_name).await?;
+    let graph = cloud::media_payload(m.to, kind, &media_id, m.caption, m.filename, None);
+    // Persist under the canonical kind (`voice` → `ptt`), like the web path.
+    let msg_type = match kind {
+        cloud::MediaKind::Ptt => "ptt",
+        _ => kind.graph_type(),
+    };
+    let echo = json!({
+        "type": msg_type,
+        "mimetype": m.mime,
+        "caption": m.caption,
+        "filename": m.filename,
+        "media_id": media_id,
+        "file_path": m.local_path,
+    });
+    let sent = cloud_send_record(state, id, session, m.to, msg_type, m.caption, echo, graph).await?;
+    if let Some(path) = m.local_path {
+        state
+            .manager
+            .store
+            .message_set_media_path(id, &sent.chat_jid, &sent.wamid, path)?;
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SendTextResp { id: sent.wamid, timestamp: sent.timestamp, status: "sent" }),
     ))
 }
 
@@ -1451,6 +2029,27 @@ async fn send_media_multipart(
         "sticker" => MediaType::Sticker,
         _ => return Err(Error::BadRequest(format!("unknown media type {}", meta.kind))),
     };
+
+    if session.kind() == SessionKind::Cloud {
+        // Cloud: the bytes go straight to Graph's media upload — no spool file.
+        let upload_name = meta.filename.clone().unwrap_or_else(|| "file".into());
+        return cloud_send_media(
+            &state,
+            &id,
+            &session,
+            CloudMediaSend {
+                to: &meta.to,
+                kind: &meta.kind,
+                mime: &meta.mime,
+                caption: meta.caption.as_deref(),
+                filename: meta.filename.as_deref(),
+                upload_name: &upload_name,
+                bytes,
+                local_path: None,
+            },
+        )
+        .await;
+    }
 
     // Spool to disk so the send pump (which re-reads in send_media_op)
     // doesn't have to keep the bytes in memory across the await tree.
@@ -1553,7 +2152,7 @@ async fn get_message_media(
     use axum::response::IntoResponse;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     check_session_auth(&headers, &state, &id)?;
-    let _ = state.manager.get(&id)?;
+    let session = state.manager.get(&id)?;
 
     let row = state.manager.store.message_media_lookup(&id, &chat, &msgid)?;
     let (media_path, msg_type, payload_json) = row.ok_or_else(|| {
@@ -1575,6 +2174,25 @@ async fn get_message_media(
         let bytes =
             std::fs::read(&path).map_err(|e| Error::Internal(anyhow::anyhow!("read: {e}")))?;
         return Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response());
+    }
+
+    // Cloud: the row carries Meta's `media_id` (inbound webhook or our own
+    // upload). Resolve the short-lived download URL via Graph, fetch with the
+    // bearer token, then cache exactly like the web path below.
+    if session.kind() == SessionKind::Cloud {
+        let media_id = payload
+            .get("media_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::NotFound("media not downloaded and media_id missing".into()))?;
+        let client = cloud_client(&state, &id, &session)?;
+        let info = client.media_info(media_id).await?;
+        let bytes = client.download(&info.url).await?;
+        let content_type = info
+            .mime_type
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(content_type);
+        return cache_media_and_respond(&state, &id, &chat, &msgid, bytes, &content_type).await;
     }
 
     // Lazy inbound download. Pull url+media_key out of payload_json,
@@ -1613,43 +2231,60 @@ async fn get_message_media(
         }
     };
 
-    // Download through the session's proxy so media shares its egress IP.
+    // Download via the session proxy (or direct if RUWA_PROXY_DOWNLOADS=0, to
+    // save the metered proxy's bandwidth — CDN fetches work from any IP).
     let proxy = state.manager.get(&id)?.meta.read().proxy_url.clone();
-    let blob = crate::media::download_encrypted(url, proxy.as_deref())
+    let blob = crate::media::download_encrypted(url, crate::session::download_proxy(proxy.as_deref()))
         .await
         .map_err(|e| Error::Internal(anyhow::anyhow!("download: {e:?}")))?;
     let plaintext = crate::media::decrypt(&blob, &media_key, kind)
         .map_err(|e| Error::Internal(anyhow::anyhow!("decrypt: {e:?}")))?;
 
-    // s3 mode: offload the decrypted bytes to the bucket, persist the object URL
-    // (so the next GET redirects), and redirect now.
+    cache_media_and_respond(&state, &id, &chat, &msgid, plaintext, &content_type).await
+}
+
+/// Cache freshly fetched media bytes and serve them. s3 mode: offload to the
+/// bucket, persist the object URL as `media_path` (so the next GET redirects)
+/// and redirect now. db mode (default): write `data/media/<session>/<msgid>`,
+/// persist the path so the next call is a direct fs read, and stream the bytes.
+async fn cache_media_and_respond(
+    state: &AppState,
+    id: &str,
+    chat: &str,
+    msgid: &str,
+    plaintext: Vec<u8>,
+    content_type: &str,
+) -> Result<axum::response::Response> {
+    use axum::http::header;
     if let Some(s3) = &state.media_store {
         let key = format!("{id}/{chat}/{msgid}");
-        let object_url = crate::media::put_object(s3, &key, &plaintext, &content_type)
+        let object_url = crate::media::put_object(s3, &key, &plaintext, content_type)
             .await
             .map_err(|e| Error::Internal(anyhow::anyhow!("s3 upload: {e:?}")))?;
         state
             .manager
             .store
-            .message_set_media_path(&id, &chat, &msgid, &object_url)?;
+            .message_set_media_path(id, chat, msgid, &object_url)?;
         return Ok(axum::response::Redirect::temporary(&object_url).into_response());
     }
 
-    // db mode (default): cache to data/media/<session>/<msgid>; update the row so
-    // the next call is a direct fs read.
-    let cache_dir = std::path::PathBuf::from("data/media").join(&id);
+    let cache_dir = std::path::PathBuf::from("data/media").join(id);
     std::fs::create_dir_all(&cache_dir)
         .map_err(|e| Error::Internal(anyhow::anyhow!("mkdir: {e}")))?;
-    let cache_path = cache_dir.join(&msgid);
+    let cache_path = cache_dir.join(msgid);
     std::fs::write(&cache_path, &plaintext)
         .map_err(|e| Error::Internal(anyhow::anyhow!("write cache: {e}")))?;
     let cache_path_str = cache_path.to_string_lossy().into_owned();
     state
         .manager
         .store
-        .message_set_media_path(&id, &chat, &msgid, &cache_path_str)?;
+        .message_set_media_path(id, chat, msgid, &cache_path_str)?;
 
-    Ok(([(header::CONTENT_TYPE, content_type)], plaintext).into_response())
+    Ok((
+        [(header::CONTENT_TYPE, content_type.to_string())],
+        plaintext,
+    )
+        .into_response())
 }
 
 /// Whether a stored `media_path` is a remote URL (s3 offload) vs a local file.
@@ -2158,6 +2793,7 @@ async fn backfill_history(
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
     check_session_auth_write(&headers, &state, &id)?;
     let session = state.manager.get(&id)?;
+    require_web(&session, "history backfill is not supported on cloud sessions")?;
     let count = req.count.unwrap_or(50).min(500);
     // Anchor the pull at the oldest message we already hold for this chat; the
     // phone resends `count` messages immediately before it. Without an anchor
@@ -2220,6 +2856,7 @@ async fn set_profile(
         ));
     }
     let session = state.manager.get(&id)?;
+    require_web(&session, "profile updates are not supported on cloud sessions")?;
     let mut applied = Vec::new();
 
     if let Some(status) = req.status.as_deref() {
@@ -2276,6 +2913,7 @@ async fn set_profile(
 async fn set_block(state: &AppState, headers: &HeaderMap, id: &str, jid: &str, block: bool) -> Result<Json<serde_json::Value>> {
     check_session_auth_write(headers, state, id)?;
     let session = state.manager.get(id)?;
+    require_web(&session, "block/unblock is not supported on cloud sessions")?;
     let target = normalize_recipient_jid(jid);
     let iq_id = crate::session::uuid_v4();
     let iq = crate::session::build_block_iq(&iq_id, &target, block);
@@ -2322,6 +2960,7 @@ async fn get_contact_picture(
 ) -> Result<Json<serde_json::Value>> {
     check_session_auth(&headers, &state, &id)?;
     let session = state.manager.get(&id)?;
+    require_web(&session, "profile pictures are not supported on cloud sessions")?;
     let target = normalize_recipient_jid(&jid);
     let iq_id = crate::session::uuid_v4();
     let iq = crate::session::build_picture_iq(&iq_id, &target, q.preview);
@@ -2349,6 +2988,7 @@ async fn check_on_whatsapp(
         return Err(Error::BadRequest("numbers must be non-empty".into()));
     }
     let session = state.manager.get(&id)?;
+    require_web(&session, "onwhatsapp lookup is not supported on cloud sessions")?;
     let iq_id = crate::session::uuid_v4();
     let iq = crate::session::build_usync_contact_iq(&iq_id, &req.numbers);
     let reply = session.iq_request(iq).await?;
@@ -2377,6 +3017,7 @@ async fn set_presence(
         ));
     }
     let session = state.manager.get(&id)?;
+    require_web(&session, "presence is not supported on cloud sessions")?;
     // Server uses the push name to populate the contact card other peers
     // see; pulled from the persisted session row (pair-success populates).
     let push_name: Option<String> = state.manager.store.session_push_name(&id).ok().flatten();
@@ -2415,13 +3056,41 @@ async fn set_typing(
         ));
     }
     let session = state.manager.get(&id)?;
+    let chat_jid = normalize_recipient_jid(&chat);
+    if session.kind() == SessionKind::Cloud {
+        // Cloud has no free-standing presence: the typing indicator rides on a
+        // mark-as-read of the user's latest inbound message (and expires on
+        // its own after ~25 s or when we reply), so `paused` is a no-op.
+        if req.state != "composing" {
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"status": "ignored"})),
+            ));
+        }
+        let cloud_chat = cloud::to_jid(&chat_jid);
+        let target = state
+            .manager
+            .store
+            .latest_inbound_message_id(&id, &cloud_chat)?
+            .ok_or_else(|| {
+                Error::BadRequest(
+                    "no inbound message in this chat to attach a typing indicator to".into(),
+                )
+            })?;
+        cloud_client(&state, &id, &session)?
+            .mark_read(&target, true)
+            .await?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "sent"})),
+        ));
+    }
     let own_jid = session
         .meta
         .read()
         .jid
         .clone()
         .ok_or_else(|| Error::BadRequest("not paired".into()))?;
-    let chat_jid = normalize_recipient_jid(&chat);
     // WhatsApp only relays a typing indicator while we're marked `available`.
     // Sessions default to `unavailable` (to keep the phone notifying), so a bare
     // `composing` is silently dropped. When the user starts typing and the
@@ -2464,6 +3133,17 @@ async fn mark_read(
     }
     let session = state.manager.get(&id)?;
     let chat_jid = normalize_recipient_jid(&chat);
+    if session.kind() == SessionKind::Cloud {
+        // Cloud: one Graph `{"status":"read","message_id":…}` per id.
+        let client = cloud_client(&state, &id, &session)?;
+        for mid in &req.ids {
+            client.mark_read(mid, false).await?;
+        }
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "sent", "count": req.ids.len()})),
+        ));
+    }
     let now = chrono::Utc::now().timestamp();
     let id_refs: Vec<&str> = req.ids.iter().map(String::as_str).collect();
     let node = crate::session::build_read_receipt_node(
@@ -2503,6 +3183,12 @@ async fn send_reaction(
 ) -> Result<(StatusCode, Json<SendTextResp>)> {
     check_session_auth_write(&headers, &state, &id)?;
     let session = state.manager.get(&id)?;
+    if session.kind() == SessionKind::Cloud {
+        let graph = cloud::reaction_payload(&req.to, &req.msg_id, &req.emoji);
+        let echo = json!({ "type": "reaction", "message_id": req.msg_id, "emoji": req.emoji });
+        let body = if req.emoji.is_empty() { None } else { Some(req.emoji.as_str()) };
+        return cloud_dispatch(&state, &id, &session, &req.to, "reaction", body, echo, graph).await;
+    }
     let chat_jid = normalize_recipient_jid(&req.to);
     let now = chrono::Utc::now().timestamp();
     let now_ms = now * 1000;
@@ -2558,6 +3244,7 @@ async fn send_edit(
         return Err(Error::BadRequest("text must be non-empty".into()));
     }
     let session = state.manager.get(&id)?;
+    require_web(&session, "message edits are not supported on cloud sessions")?;
     let chat_jid = normalize_recipient_jid(&req.to);
     let now = chrono::Utc::now().timestamp();
     let now_ms = now * 1000;
@@ -2648,6 +3335,7 @@ async fn send_revoke(
 ) -> Result<(StatusCode, Json<SendTextResp>)> {
     check_session_auth_write(&headers, &state, &id)?;
     let session = state.manager.get(&id)?;
+    require_web(&session, "message revokes are not supported on cloud sessions")?;
     let chat_jid = normalize_recipient_jid(&req.to);
     let now = chrono::Utc::now().timestamp();
 
@@ -2705,6 +3393,606 @@ async fn send_revoke(
     ))
 }
 
+// ===== Cloud API: templates, interactive messages, Meta webhook ============
+
+/// Body of `POST /messages/template`: `to` + the neutral template spec (name,
+/// language, body_params, header, buttons, components, reply_to).
+#[derive(Deserialize)]
+struct SendTemplateReq {
+    /// Recipient — bare phone or `…@s.whatsapp.net` JID.
+    to: String,
+    #[serde(flatten)]
+    tpl: cloud::TemplateSend,
+}
+
+/// Send an approved message template (the only way to open a conversation on
+/// the Cloud API outside the 24 h customer-service window). Cloud only.
+async fn send_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SendTemplateReq>,
+) -> Result<(StatusCode, Json<SendTextResp>)> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, "template messages are only available on cloud sessions")?;
+    if req.tpl.name.trim().is_empty() || req.tpl.language.trim().is_empty() {
+        return Err(Error::BadRequest("template name and language are required".into()));
+    }
+    let graph = cloud::template_payload(&req.to, &req.tpl)?;
+    let components = graph
+        .get("template")
+        .and_then(|t| t.get("components"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let echo = json!({
+        "type": "template",
+        "name": req.tpl.name,
+        "language": req.tpl.language,
+        "components": components,
+    });
+    let body_text = format!("<template:{}>", req.tpl.name);
+    cloud_dispatch(&state, &id, &session, &req.to, "template", Some(&body_text), echo, graph).await
+}
+
+/// Body of `POST /messages/interactive`: `to` + the neutral interactive spec
+/// (`type` ∈ button|list|cta_url, body, header, footer, buttons|button+sections|cta).
+#[derive(Deserialize)]
+struct SendInteractiveReq {
+    to: String,
+    #[serde(flatten)]
+    msg: cloud::InteractiveSend,
+}
+
+/// Send an interactive message (reply buttons, list, or call-to-action URL).
+/// Cloud only; the recipient's tap comes back as an inbound `interactive` message.
+async fn send_interactive(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<SendInteractiveReq>,
+) -> Result<(StatusCode, Json<SendTextResp>)> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, "interactive messages are only available on cloud sessions")?;
+    let graph = cloud::interactive_payload(&req.to, &req.msg)?;
+    let m = &req.msg;
+    // Neutral echo of the request (no Graph shape) for the stored row.
+    let mut echo = serde_json::Map::new();
+    echo.insert("type".into(), json!("interactive"));
+    echo.insert("interactive_type".into(), json!(m.kind));
+    echo.insert("body".into(), json!(m.body));
+    if let Some(h) = &m.header {
+        echo.insert("header".into(), json!(h));
+    }
+    if let Some(f) = &m.footer {
+        echo.insert("footer".into(), json!(f));
+    }
+    if !m.buttons.is_empty() {
+        echo.insert("buttons".into(), json!(m.buttons));
+    }
+    if let Some(b) = &m.button {
+        echo.insert("button".into(), json!(b));
+    }
+    if !m.sections.is_empty() {
+        echo.insert("sections".into(), json!(m.sections));
+    }
+    if let Some(c) = &m.cta {
+        echo.insert("cta".into(), json!(c));
+    }
+    cloud_dispatch(
+        &state,
+        &id,
+        &session,
+        &req.to,
+        "interactive",
+        Some(&m.body),
+        serde_json::Value::Object(echo),
+        graph,
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct ListTemplatesQuery {
+    /// Filter by review status (`APPROVED`, `PENDING`, `REJECTED`, …).
+    status: Option<String>,
+    limit: Option<u32>,
+    /// Cursor from a previous page's `next`.
+    after: Option<String>,
+}
+
+/// List the WABA's message templates → `{templates: [{id,name,language,status,
+/// category,components}], next}`. Cloud only; needs `waba_id`.
+async fn list_templates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<ListTemplatesQuery>,
+) -> Result<Json<cloud::TemplatePage>> {
+    check_session_auth(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, "message templates are only available on cloud sessions")?;
+    let client = cloud_client(&state, &id, &session)?;
+    let page = client
+        .list_templates(q.status.as_deref(), q.limit, q.after.as_deref())
+        .await?;
+    Ok(Json(page))
+}
+
+/// Submit a new template for review: body `{name, language, category,
+/// components, allow_category_change?}` → 201 `{id, status, category}`.
+async fn create_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>)> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, "message templates are only available on cloud sessions")?;
+    for key in ["name", "language", "category"] {
+        if body.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).is_none() {
+            return Err(Error::BadRequest(format!("template {key} is required")));
+        }
+    }
+    if !body.get("components").is_some_and(|c| c.is_array()) {
+        return Err(Error::BadRequest("template components must be an array".into()));
+    }
+    let client = cloud_client(&state, &id, &session)?;
+    let created = client.create_template(body).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": created.get("id").cloned().unwrap_or(serde_json::Value::Null),
+            "status": created.get("status").cloned().unwrap_or(serde_json::Value::Null),
+            "category": created.get("category").cloned().unwrap_or(serde_json::Value::Null),
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+struct DeleteTemplateQuery {
+    /// Delete only this template id (one language) instead of every language
+    /// of `name`.
+    hsm_id: Option<String>,
+}
+
+/// Delete a template by name (all languages) or a single `hsm_id`.
+async fn delete_template(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, name)): Path<(String, String)>,
+    Query(q): Query<DeleteTemplateQuery>,
+) -> Result<Json<serde_json::Value>> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, "message templates are only available on cloud sessions")?;
+    let client = cloud_client(&state, &id, &session)?;
+    client.delete_template(&name, q.hsm_id.as_deref()).await?;
+    Ok(Json(json!({ "success": true })))
+}
+
+/// Query string of Meta's webhook subscription handshake.
+#[derive(Deserialize)]
+struct WebhookVerifyQuery {
+    #[serde(rename = "hub.mode")]
+    mode: Option<String>,
+    #[serde(rename = "hub.verify_token")]
+    verify_token: Option<String>,
+    #[serde(rename = "hub.challenge")]
+    challenge: Option<String>,
+}
+
+/// `GET /v1/cloud/webhook` — Meta's subscription verification. Echoes
+/// `hub.challenge` as text/plain when `hub.verify_token` matches
+/// `RUWA_CLOUD_VERIFY_TOKEN` (if set) or any cloud session's `verify_token`;
+/// 403 otherwise. No bearer auth (Meta can't send one).
+async fn cloud_webhook_verify(
+    State(state): State<AppState>,
+    Query(q): Query<WebhookVerifyQuery>,
+) -> Result<axum::response::Response> {
+    let token = q.verify_token.as_deref().map(str::trim).unwrap_or("");
+    let challenge = q.challenge.clone().unwrap_or_default();
+    let mode_ok = !matches!(q.mode.as_deref(), Some(m) if m != "subscribe");
+    let env_token = std::env::var("RUWA_CLOUD_VERIFY_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let matches = !token.is_empty()
+        && mode_ok
+        && match env_token {
+            Some(expected) => constant_time_eq(expected.as_bytes(), token.as_bytes()),
+            None => state.manager.store.cloud_verify_token_matches(token)?,
+        };
+    if !matches {
+        return Err(Error::Forbidden("webhook verify token mismatch".into()));
+    }
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        challenge,
+    )
+        .into_response())
+}
+
+/// Constant-time byte comparison (verify-token check).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Whether unsigned webhook deliveries are accepted for sessions created
+/// without an `app_secret` (`RUWA_CLOUD_ALLOW_UNSIGNED=1|true`). Off by default.
+fn cloud_allow_unsigned() -> bool {
+    std::env::var("RUWA_CLOUD_ALLOW_UNSIGNED")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// `POST /v1/cloud/webhook` — inbound Meta events. Authenticated by
+/// `X-Hub-Signature-256` (HMAC-SHA256 of the RAW body under the app secret of
+/// the cloud session that owns `metadata.phone_number_id`). The check runs
+/// PER BATCH: every batch that maps to a session must verify under THAT
+/// session's own secret before anything is ingested — a genuine Meta POST is
+/// single-app so all its batches share one secret, while a forged body mixing
+/// a tenant's own number with someone else's must not be able to piggy-back
+/// on the caller's signature. Any mapped batch failing → 401, nothing stored.
+/// Unknown phone number ids are acked (200) and ignored, and per-batch ingest
+/// errors are logged, never surfaced — Meta retries (and eventually disables)
+/// webhooks that don't 200. Credentials are read straight from the shared
+/// store (a session created on another instance is still authenticated here).
+async fn cloud_webhook_receive(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>> {
+    let batches = cloud::parse_webhook(&body)?;
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok());
+
+    // Verify every batch that maps to a session under that session's secret.
+    let mut mapped = 0usize;
+    for b in &batches {
+        let Some(sid) = state
+            .manager
+            .store
+            .cloud_session_id_by_phone_number_id(&b.phone_number_id)?
+        else {
+            continue;
+        };
+        mapped += 1;
+        let creds = match state.manager.store.session_cloud_creds(&sid) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                tracing::warn!(session = %sid, "cloud webhook: session has no cloud creds row");
+                return Err(Error::Unauthorized);
+            }
+            Err(e) => {
+                tracing::warn!(session = %sid, error = %e, "cloud webhook: creds unreadable");
+                return Err(Error::Unauthorized);
+            }
+        };
+        match creds.app_secret.as_deref() {
+            Some(secret) => {
+                if !cloud::verify_signature(secret, &body, signature) {
+                    tracing::warn!(session = %sid, "cloud webhook: X-Hub-Signature-256 mismatch");
+                    return Err(Error::Unauthorized);
+                }
+            }
+            None if cloud_allow_unsigned() => {
+                tracing::debug!(session = %sid, "cloud webhook: accepted unsigned (RUWA_CLOUD_ALLOW_UNSIGNED)");
+            }
+            None => {
+                tracing::warn!(
+                    session = %sid,
+                    "cloud webhook: session has no app_secret and RUWA_CLOUD_ALLOW_UNSIGNED is not set"
+                );
+                return Err(Error::Unauthorized);
+            }
+        }
+    }
+    if mapped == 0 {
+        tracing::debug!(
+            batches = batches.len(),
+            "cloud webhook: no batch maps to a cloud session — acked and ignored"
+        );
+        return Ok(Json(json!({})));
+    }
+
+    for batch in batches {
+        let pnid = batch.phone_number_id.clone();
+        let display_number = batch.display_phone_number.clone().unwrap_or_default();
+        if let Err(e) = state.manager.cloud_ingest(batch).await {
+            match e {
+                Error::NotFound(_) => {
+                    tracing::debug!(
+                        phone_number_id = %pnid,
+                        display_phone_number = %display_number,
+                        "cloud webhook: unknown phone_number_id ignored"
+                    )
+                }
+                other => {
+                    tracing::warn!(phone_number_id = %pnid, error = %other, "cloud webhook: ingest failed")
+                }
+            }
+        }
+    }
+    Ok(Json(json!({})))
+}
+
+// ---------------------------------------------------------------------------
+// AI text assistant — `/v1/settings/ai*` + `/v1/ai/improve-text`
+// ---------------------------------------------------------------------------
+//
+// Instance-wide (not per-session) and ADMIN-token only: the config carries a
+// third-party API key and the rewrite endpoint spends the operator's money.
+// The key is stored sealed (`app_settings['ai']`, see `store::setting_set`)
+// and is never returned — `GET` exposes only a `••••abcd` hint. Provider calls
+// live in `egress::ai`.
+
+/// Load the stored assistant config, if any. A row that no longer parses
+/// (schema drift) is reported as an internal error rather than silently
+/// "unconfigured", so the operator notices.
+fn ai_config_load(state: &AppState) -> Result<Option<AiConfig>> {
+    match state.manager.store.setting_get(ai::SETTING_KEY)? {
+        None => Ok(None),
+        Some(raw) => serde_json::from_slice::<AiConfig>(&raw)
+            .map(Some)
+            .map_err(|e| Error::Internal(anyhow::anyhow!("stored ai settings unreadable: {e}"))),
+    }
+}
+
+/// The `GET /v1/settings/ai` shape (also returned by `PUT`). Never the key.
+fn ai_settings_view(cfg: Option<&AiConfig>) -> serde_json::Value {
+    match cfg {
+        None => json!({
+            "configured": false,
+            "provider": null,
+            "model": null,
+            "base_url": null,
+            "system_prompt": null,
+            "api_key_hint": null,
+        }),
+        Some(c) => json!({
+            "configured": true,
+            "provider": c.provider.as_str(),
+            "model": c.model,
+            "base_url": c.effective_base_url(),
+            "system_prompt": c.system_prompt,
+            "api_key_hint": c.api_key_hint(),
+        }),
+    }
+}
+
+/// `GET /v1/settings/ai` — admin only.
+async fn get_ai_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse> {
+    check_auth(&headers, &state.api_token)?;
+    let cfg = ai_config_load(&state)?;
+    Ok(Json(ai_settings_view(cfg.as_ref())))
+}
+
+/// Body of `PUT /v1/settings/ai`. `api_key` may be omitted (or blank) to keep
+/// the stored key when the provider is unchanged; `base_url` /
+/// `system_prompt` are full replacements (omitted or `null` → provider
+/// default / built-in prompt).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PutAiSettingsReq {
+    provider: ai::Provider,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    system_prompt: Option<String>,
+}
+
+/// Trim an optional string, mapping blank to `None`.
+fn opt_trimmed(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Merge a `PUT` body with the currently stored config into the config to
+/// persist. Pure (testable without the store): `Err` is a 400 message.
+fn ai_settings_merge(
+    req: PutAiSettingsReq,
+    current: Option<&AiConfig>,
+) -> std::result::Result<AiConfig, String> {
+    let provider = req.provider;
+    let api_key = match opt_trimmed(req.api_key) {
+        Some(k) => {
+            // The key travels in an HTTP header: reject anything that can't be
+            // a header value up front (a pasted key with a stray newline would
+            // otherwise fail every call with an opaque "builder error").
+            if k.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                return Err("\"api_key\" must not contain whitespace or control characters".into());
+            }
+            k
+        }
+        None => match current {
+            Some(c) if c.provider == provider => c.api_key.clone(),
+            Some(_) => {
+                return Err("\"api_key\" is required when changing provider".to_string())
+            }
+            None => return Err("\"api_key\" is required".to_string()),
+        },
+    };
+    let model = match opt_trimmed(req.model).or_else(|| provider.default_model().map(str::to_string)) {
+        Some(m) => m,
+        None => {
+            return Err(format!(
+                "\"model\" is required for provider \"{}\"",
+                provider.as_str()
+            ))
+        }
+    };
+    let base_url = opt_trimmed(req.base_url).map(|u| u.trim_end_matches('/').to_string());
+    if let Some(u) = &base_url {
+        if !(u.starts_with("http://") || u.starts_with("https://")) {
+            return Err("\"base_url\" must start with http:// or https://".to_string());
+        }
+        // Must be a parseable absolute URL with a host (localhost / private
+        // ranges are deliberately allowed: Ollama et al. are local, and only
+        // the admin token can set this).
+        match reqwest::Url::parse(u) {
+            Ok(p) if p.host_str().is_some() && p.query().is_none() && p.fragment().is_none() => {}
+            _ => return Err("\"base_url\" must be a valid http(s) URL without query or fragment".to_string()),
+        }
+    }
+    let system_prompt = opt_trimmed(req.system_prompt);
+    Ok(AiConfig {
+        provider,
+        api_key,
+        model,
+        base_url,
+        system_prompt,
+    })
+}
+
+/// `PUT /v1/settings/ai` — admin only, readonly-gated. Responds with the GET
+/// shape (200).
+async fn put_ai_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PutAiSettingsReq>,
+) -> Result<impl IntoResponse> {
+    check_auth_write(&headers, &state)?;
+    let current = ai_config_load(&state)?;
+    let cfg = ai_settings_merge(req, current.as_ref()).map_err(Error::BadRequest)?;
+    let raw = serde_json::to_vec(&cfg)
+        .map_err(|e| Error::Internal(anyhow::anyhow!("encode ai settings: {e}")))?;
+    state
+        .manager
+        .store
+        .setting_set(ai::SETTING_KEY, &raw, chrono::Utc::now().timestamp())?;
+    tracing::info!(provider = cfg.provider.as_str(), model = %cfg.model, "ai settings updated");
+    Ok(Json(ai_settings_view(Some(&cfg))))
+}
+
+/// `DELETE /v1/settings/ai` — admin only, readonly-gated. 204 (idempotent).
+async fn delete_ai_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse> {
+    check_auth_write(&headers, &state)?;
+    state.manager.store.setting_delete(ai::SETTING_KEY)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Map a provider failure onto the HTTP surface: refusal → 422, everything
+/// else → 502 `{"error": "ai upstream: …"}`. The key is never in the message.
+fn ai_error_response(e: &ai::AiError) -> axum::response::Response {
+    let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+    (status, Json(json!({ "error": e.to_string() }))).into_response()
+}
+
+/// The 400 the rewrite/test routes answer when nothing is configured. Built
+/// by hand (not `Error::BadRequest`) so the message is the exact, unprefixed
+/// contract string the Console keys off.
+fn ai_unconfigured_response() -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "ai assistant not configured — set it via PUT /v1/settings/ai" })),
+    )
+        .into_response()
+}
+
+/// `POST /v1/settings/ai/test` — admin only. One tiny round-trip to the
+/// configured provider; reports latency + the model's reply.
+async fn test_ai_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response> {
+    check_auth(&headers, &state.api_token)?;
+    let Some(cfg) = ai_config_load(&state)? else {
+        return Ok(ai_unconfigured_response());
+    };
+    match ai::AiClient::new().test(&cfg).await {
+        Ok(out) => Ok(Json(json!({
+            "ok": true,
+            "provider": cfg.provider.as_str(),
+            "model": cfg.model,
+            "latency_ms": out.latency_ms,
+            "reply": out.reply,
+        }))
+        .into_response()),
+        Err(e) => {
+            tracing::warn!(provider = cfg.provider.as_str(), error = %e, "ai settings test failed");
+            Ok(ai_error_response(&e))
+        }
+    }
+}
+
+/// Body of `POST /v1/ai/improve-text`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImproveTextReq {
+    text: String,
+    #[serde(default)]
+    mode: AiMode,
+    /// Target language for `mode=translate` (e.g. `"en"`, `"pt-BR"`).
+    #[serde(default)]
+    language: Option<String>,
+    /// Free-form instruction for `mode=custom` (≤ 500 chars).
+    #[serde(default)]
+    instruction: Option<String>,
+}
+
+/// `POST /v1/ai/improve-text` — admin only. Rewrites a draft per `mode`.
+/// 400 when unconfigured / bad input, 422 when the model declines, 502 on
+/// upstream failure.
+async fn ai_improve_text(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ImproveTextReq>,
+) -> Result<axum::response::Response> {
+    check_auth(&headers, &state.api_token)?;
+    let Some(cfg) = ai_config_load(&state)? else {
+        return Ok(ai_unconfigured_response());
+    };
+    let text = req.text.trim();
+    if text.is_empty() {
+        return Err(Error::BadRequest("\"text\" must not be empty".into()));
+    }
+    if text.chars().count() > ai::MAX_TEXT_CHARS {
+        return Err(Error::BadRequest(format!(
+            "\"text\" must be at most {} characters",
+            ai::MAX_TEXT_CHARS
+        )));
+    }
+    let outcome = ai::AiClient::new()
+        .improve(
+            &cfg,
+            req.mode,
+            req.language.as_deref(),
+            req.instruction.as_deref(),
+            text,
+        )
+        .await
+        .map_err(Error::BadRequest)?;
+    match outcome {
+        Ok(rewritten) => Ok(Json(json!({
+            "text": rewritten,
+            "provider": cfg.provider.as_str(),
+            "model": cfg.model,
+        }))
+        .into_response()),
+        Err(e) => {
+            tracing::warn!(provider = cfg.provider.as_str(), error = %e, "ai improve-text failed");
+            Ok(ai_error_response(&e))
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_state() -> AppState {
     test_state_with_readonly(false)
@@ -2756,6 +4044,23 @@ mod tests {
     }
 
     #[test]
+    fn proxy_info_parses_non_sensitive_fields_only() {
+        let url = "http://user_country-br_city-riodejaneiro_session-abc123_lifetime-168h:SECRETPW@proxy.example.com:12321";
+        let v = proxy_info_json(url);
+        assert_eq!(v["scheme"], "http");
+        assert_eq!(v["host"], "proxy.example.com");
+        assert_eq!(v["port"], 12321);
+        assert_eq!(v["has_auth"], true);
+        assert_eq!(v["hints"]["country"], "br");
+        assert_eq!(v["hints"]["city"], "riodejaneiro");
+        assert_eq!(v["hints"]["lifetime"], "168h");
+        assert_eq!(v["hints"]["session"], "<set>", "opaque session id must not be echoed");
+        // No password anywhere in the output.
+        assert!(!serde_json::to_string(&v).unwrap().contains("SECRETPW"));
+        assert!(!serde_json::to_string(&v).unwrap().contains("abc123"));
+    }
+
+    #[test]
     fn mask_proxy_hides_credentials() {
         assert_eq!(
             mask_proxy("socks5://user:secret@1.2.3.4:1080"),
@@ -2791,6 +4096,34 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, v)
+    }
+
+    #[tokio::test]
+    async fn reject_call_guards_auth_session_and_offline() {
+        let state = test_state();
+        let app = router(state.clone());
+
+        // No bearer → 401.
+        let (status, _) = send(
+            app.clone(), "POST", "/v1/sessions/nope/calls/CALL1/reject",
+            None, Some(serde_json::json!({"peer": "5511900000000"})),
+        ).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Unknown session → 404.
+        let (status, _) = send(
+            app.clone(), "POST", "/v1/sessions/nope/calls/CALL1/reject",
+            Some("test-token"), Some(serde_json::json!({"peer": "5511900000000"})),
+        ).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Real session but unpaired (no JID) → 400, before any send attempt.
+        let sid = state.manager.create(None).unwrap().meta.read().id.clone();
+        let (status, body) = send(
+            app, "POST", &format!("/v1/sessions/{sid}/calls/CALL1/reject"),
+            Some("test-token"), Some(serde_json::json!({"peer": "5511900000000"})),
+        ).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "unpaired session: {body}");
     }
 
     #[tokio::test]
@@ -4414,5 +5747,1120 @@ mod tests {
         assert_eq!(spooled, file_bytes);
         // Cleanup spool dir to keep CI tidy.
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ===== Cloud API sessions + Meta webhook ================================
+
+    /// Fixture ids: an obviously fake Graph phone-number id + recipient.
+    const CLOUD_PNID: &str = "106540352242922";
+    const CLOUD_USER: &str = "5511999999999";
+    const CLOUD_APP_SECRET: &str = "fake-app-secret";
+    /// A second tenant's number (cross-tenant webhook tests).
+    const CLOUD_PNID_B: &str = "106540352242999";
+
+    /// Raw-body request helper (headers as given, no implicit auth); returns
+    /// status + raw body bytes.
+    async fn send_raw(
+        app: axum::Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = app.oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, bytes.to_vec())
+    }
+
+    fn cloud_create_body(app_secret: Option<&str>) -> serde_json::Value {
+        let mut cloud = json!({
+            "phone_number_id": CLOUD_PNID,
+            "waba_id": "102300000000000",
+            "access_token": "EAAG-fake-access-token",
+            "verify_token": "my-verify",
+        });
+        if let Some(sec) = app_secret {
+            cloud["app_secret"] = json!(sec);
+        }
+        json!({ "label": "acme cloud", "kind": "cloud", "cloud": cloud })
+    }
+
+    /// Create a cloud session via the API; returns `(id, api_key)`.
+    async fn create_cloud_session(app: axum::Router, app_secret: Option<&str>) -> (String, String) {
+        let (st, body) = send(
+            app,
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(cloud_create_body(app_secret)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "body: {body}");
+        (
+            body["id"].as_str().unwrap().to_string(),
+            body["api_key"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// Meta webhook body carrying one inbound text from `CLOUD_USER`.
+    fn webhook_text_fixture(wamid: &str, text: &str) -> Vec<u8> {
+        json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "102300000000000",
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": { "display_phone_number": "15550000000", "phone_number_id": CLOUD_PNID },
+                        "contacts": [{ "profile": { "name": "Test User" }, "wa_id": CLOUD_USER }],
+                        "messages": [{
+                            "from": CLOUD_USER,
+                            "id": wamid,
+                            "timestamp": "1700000000",
+                            "type": "text",
+                            "text": { "body": text }
+                        }]
+                    }
+                }]
+            }]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Meta webhook body carrying one delivery status for `wamid`.
+    fn webhook_status_fixture(wamid: &str, status: &str) -> Vec<u8> {
+        json!({
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "id": "102300000000000",
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": { "display_phone_number": "15550000000", "phone_number_id": CLOUD_PNID },
+                        "statuses": [{
+                            "id": wamid,
+                            "status": status,
+                            "timestamp": "1700000100",
+                            "recipient_id": CLOUD_USER
+                        }]
+                    }
+                }]
+            }]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn signature_for(secret: &str, body: &[u8]) -> String {
+        format!("sha256={}", cloud::hmac_sha256_hex(secret.as_bytes(), body))
+    }
+
+    /// POST a webhook body signed with `secret` (or unsigned when `None`).
+    async fn post_webhook(app: axum::Router, secret: Option<&str>, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
+        let sig = secret.map(|s| signature_for(s, &body));
+        let mut headers: Vec<(&str, &str)> = vec![("content-type", "application/json")];
+        if let Some(sig) = sig.as_deref() {
+            headers.push(("x-hub-signature-256", sig));
+        }
+        send_raw(app, "POST", "/v1/cloud/webhook", &headers, body).await
+    }
+
+    #[tokio::test]
+    async fn create_cloud_session_echoes_public_fields_and_never_secrets() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(cloud_create_body(Some(CLOUD_APP_SECRET))),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "body: {body}");
+        assert_eq!(body["kind"], "cloud");
+        assert_eq!(body["status"], "pending");
+        assert_eq!(body["cloud"]["phone_number_id"], CLOUD_PNID);
+        assert_eq!(body["cloud"]["waba_id"], "102300000000000");
+        assert_eq!(body["cloud"]["graph_version"], "v25.0");
+        assert!(body["api_key"].as_str().is_some_and(|k| !k.is_empty()));
+        let raw = body.to_string();
+        assert!(!raw.contains("EAAG-fake-access-token"), "access token leaked: {raw}");
+        assert!(!raw.contains(CLOUD_APP_SECRET), "app secret leaked: {raw}");
+        assert!(!raw.contains("access_token"), "{raw}");
+        assert!(!raw.contains("app_secret"), "{raw}");
+        let id = body["id"].as_str().unwrap().to_string();
+
+        // GET /sessions/:id + the list both carry the kind (and no secrets).
+        let (st, one) = send(app.clone(), "GET", &format!("/v1/sessions/{id}"), Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(one["kind"], "cloud");
+        assert!(one.get("api_key").is_none());
+        let (st, list) = send(app.clone(), "GET", "/v1/sessions", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        let me = list.as_array().unwrap().iter().find(|s| s["id"] == id).unwrap();
+        assert_eq!(me["kind"], "cloud");
+        assert_eq!(me["cloud"]["phone_number_id"], CLOUD_PNID);
+        assert!(!list.to_string().contains("EAAG-fake-access-token"));
+
+        // A plain web session reports kind=web and no cloud block.
+        let (st, web) = send(app, "POST", "/v1/sessions", Some("test-token"), Some(json!({"label": "w"}))).await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(web["kind"], "web");
+        assert!(web.get("cloud").is_none(), "{web}");
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_bad_kind_and_incomplete_cloud_creds() {
+        let app = router(test_state());
+        // Missing access_token → 400.
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(json!({"kind": "cloud", "cloud": {"phone_number_id": CLOUD_PNID}})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("access_token"));
+        // Missing cloud block entirely → 400.
+        let (st, _) = send(app.clone(), "POST", "/v1/sessions", Some("test-token"), Some(json!({"kind": "cloud"}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // Unknown kind → 400.
+        let (st, body) = send(app.clone(), "POST", "/v1/sessions", Some("test-token"), Some(json!({"kind": "sms"}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        // kind=web (explicit) with cloud creds → 400.
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(json!({"kind": "web", "cloud": {"phone_number_id": CLOUD_PNID, "access_token": "x"}})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // No cloud session got created by any of the rejects.
+        let (_, list) = send(app, "GET", "/v1/sessions", Some("test-token"), None).await;
+        assert!(list.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_only_routes_answer_501_on_cloud_sessions() {
+        let app = router(test_state());
+        let (id, key) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let (st, body) = send(app.clone(), "GET", &format!("/v1/sessions/{id}/qr"), Some(&key), None).await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("cloud"));
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/messages/poll"),
+            Some(&key),
+            Some(json!({"to": CLOUD_USER, "name": "q?", "options": ["a", "b"]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/messages/edit"),
+            Some(&key),
+            Some(json!({"to": CLOUD_USER, "msg_id": "x", "text": "y"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/mark-online"),
+            Some(&key),
+            Some(json!({"mark_online": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+        let (st, _) = send(app.clone(), "POST", &format!("/v1/sessions/{id}/resync-appstate"), Some(&key), None).await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/onwhatsapp"),
+            Some(&key),
+            Some(json!({"numbers": [CLOUD_USER]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+        let (st, _) = send(
+            app,
+            "POST",
+            &format!("/v1/sessions/{id}/presence"),
+            Some(&key),
+            Some(json!({"state": "available"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn cloud_only_routes_answer_501_on_web_sessions() {
+        let app = router(test_state());
+        let (st, web) = send(app.clone(), "POST", "/v1/sessions", Some("test-token"), Some(json!({}))).await;
+        assert_eq!(st, StatusCode::CREATED);
+        let id = web["id"].as_str().unwrap().to_string();
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/messages/template"),
+            Some("test-token"),
+            Some(json!({"to": CLOUD_USER, "name": "order_update", "language": "pt_BR"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{body}");
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/messages/interactive"),
+            Some("test-token"),
+            Some(json!({"to": CLOUD_USER, "type": "button", "body": "hi", "buttons": [{"id": "y", "title": "Yes"}]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+        let (st, _) = send(app.clone(), "GET", &format!("/v1/sessions/{id}/templates"), Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+        let (st, _) = send(
+            app,
+            "PUT",
+            &format!("/v1/sessions/{id}/cloud"),
+            Some("test-token"),
+            Some(json!({"waba_id": "1"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn put_cloud_updates_public_fields_on_cloud_session() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (id, key) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let (st, body) = send(
+            app.clone(),
+            "PUT",
+            &format!("/v1/sessions/{id}/cloud"),
+            Some(&key),
+            Some(json!({"waba_id": "999900000000000", "access_token": "EAAG-rotated", "graph_version": "26.0"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["kind"], "cloud");
+        assert_eq!(body["cloud"]["waba_id"], "999900000000000");
+        assert_eq!(body["cloud"]["graph_version"], "v26.0");
+        assert!(!body.to_string().contains("EAAG-rotated"));
+        // The new token is what the Graph client will use.
+        assert_eq!(state.manager.cloud_creds(&id).unwrap().access_token, "EAAG-rotated");
+        // Blank phone_number_id is refused (master token: 400).
+        let (st, _) = send(
+            app.clone(),
+            "PUT",
+            &format!("/v1/sessions/{id}/cloud"),
+            Some("test-token"),
+            Some(json!({"phone_number_id": "  "})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // A per-session key may rotate secrets but not re-point the number.
+        let (st, body) = send(
+            app.clone(),
+            "PUT",
+            &format!("/v1/sessions/{id}/cloud"),
+            Some(&key),
+            Some(json!({"phone_number_id": "106540352242999"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(state.manager.cloud_creds(&id).unwrap().phone_number_id, CLOUD_PNID);
+        // Non-numeric ids / malformed graph versions are refused.
+        let (st, _) = send(
+            app.clone(),
+            "PUT",
+            &format!("/v1/sessions/{id}/cloud"),
+            Some("test-token"),
+            Some(json!({"phone_number_id": "../me"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _) = send(
+            app,
+            "PUT",
+            &format!("/v1/sessions/{id}/cloud"),
+            Some(&key),
+            Some(json!({"graph_version": "v25.0/../x"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cloud_phone_number_id_cannot_be_claimed_twice() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (a_id, _) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        // Same number again → 409, and no second session exists.
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(cloud_create_body(Some(CLOUD_APP_SECRET))),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        let (_, list) = send(app.clone(), "GET", "/v1/sessions", Some("test-token"), None).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        // A session on another number can't be re-pointed at A's (even by the
+        // master token) — webhooks would otherwise route A's traffic to it.
+        let mut other = cloud_create_body(Some("other-secret"));
+        other["cloud"]["phone_number_id"] = json!(CLOUD_PNID_B);
+        let (st, b) = send(app.clone(), "POST", "/v1/sessions", Some("test-token"), Some(other)).await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+        let b_id = b["id"].as_str().unwrap().to_string();
+        let (st, body) = send(
+            app,
+            "PUT",
+            &format!("/v1/sessions/{b_id}/cloud"),
+            Some("test-token"),
+            Some(json!({"phone_number_id": CLOUD_PNID})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            state.manager.store.cloud_session_id_by_phone_number_id(CLOUD_PNID).unwrap().as_deref(),
+            Some(a_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_webhook_verify_echoes_challenge_for_matching_token() {
+        // Relies on RUWA_CLOUD_VERIFY_TOKEN being unset (the session's own
+        // verify_token is consulted then).
+        let app = router(test_state());
+        let _ = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let (st, body) = send_raw(
+            app.clone(),
+            "GET",
+            "/v1/cloud/webhook?hub.mode=subscribe&hub.verify_token=my-verify&hub.challenge=1158201444",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body, b"1158201444");
+        let (st, _) = send_raw(
+            app.clone(),
+            "GET",
+            "/v1/cloud/webhook?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=1158201444",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // Missing token → 403 too (never echo the challenge blindly).
+        let (st, _) = send_raw(app, "GET", "/v1/cloud/webhook?hub.mode=subscribe&hub.challenge=1", &[], Vec::new()).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn cloud_webhook_signed_text_message_is_stored_once_and_listed() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (id, key) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let body = webhook_text_fixture("wamid.HBgLNTUxMTk5OTk5OTk5ORUCABIYFjNFQjBDMDAwMDAwMDAwMDAwMDAwMDAA", "olá");
+
+        let (st, resp) = post_webhook(app.clone(), Some(CLOUD_APP_SECRET), body.clone()).await;
+        assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+        assert_eq!(resp, b"{}");
+
+        let chat = format!("{CLOUD_USER}@s.whatsapp.net");
+        let rows = state.manager.store.messages_list(&id, Some(&chat), None, i64::MAX, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "wamid.HBgLNTUxMTk5OTk5OTk5ORUCABIYFjNFQjBDMDAwMDAwMDAwMDAwMDAwMDAA");
+        assert!(!rows[0].from_me);
+        assert_eq!(rows[0].body_text.as_deref(), Some("olá"));
+
+        // Visible through the normal messages route (same table as web).
+        let (st, listed) = send(app.clone(), "GET", &format!("/v1/sessions/{id}/messages"), Some(&key), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["chat_jid"], chat);
+
+        // Meta retries → the same body again is acked but not duplicated.
+        let (st, _) = post_webhook(app.clone(), Some(CLOUD_APP_SECRET), body).await;
+        assert_eq!(st, StatusCode::OK);
+        let rows = state.manager.store.messages_list(&id, Some(&chat), None, i64::MAX, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        // The contact + chat got created from the webhook's profile name.
+        assert!(state.manager.store.chats_list(&id).unwrap().iter().any(|c| c.jid == chat));
+        // Health reflects the inbound webhook as last_rx.
+        let (st, health) = send(app, "GET", &format!("/v1/sessions/{id}/health"), Some(&key), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(health["last_rx"].as_i64().is_some(), "{health}");
+    }
+
+    #[tokio::test]
+    async fn cloud_webhook_rejects_bad_signature_and_acks_unknown_numbers() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (id, _) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let body = webhook_text_fixture("wamid.HBgLBAD0000000000000000000000001", "x");
+
+        // Wrong secret → 401, nothing stored.
+        let (st, _) = post_webhook(app.clone(), Some("not-the-secret"), body.clone()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        // No signature at all → 401.
+        let (st, _) = post_webhook(app.clone(), None, body.clone()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        assert!(state.manager.store.messages_list(&id, None, None, i64::MAX, 10).unwrap().is_empty());
+
+        // Unknown phone_number_id → 200 (acked, ignored) even without a signature.
+        let unknown = String::from_utf8(body).unwrap().replace(CLOUD_PNID, "999999999999999").into_bytes();
+        let (st, resp) = post_webhook(app.clone(), None, unknown).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(resp, b"{}");
+        assert!(state.manager.store.messages_list(&id, None, None, i64::MAX, 10).unwrap().is_empty());
+
+        // Garbage body → 400 (not JSON).
+        let (st, _) = post_webhook(app, None, b"not json".to_vec()).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cloud_webhook_verifies_every_batch_under_its_own_session_secret() {
+        // Tenant A (knows secret A) forges a POST carrying a batch for A's
+        // number AND one for tenant B's number, signed with A's secret. Nothing
+        // may land in B (or A): the whole POST is refused.
+        let state = test_state();
+        let app = router(state.clone());
+        let (a_id, _) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let mut other = cloud_create_body(Some("secret-of-b"));
+        other["cloud"]["phone_number_id"] = json!(CLOUD_PNID_B);
+        let (st, b) = send(app.clone(), "POST", "/v1/sessions", Some("test-token"), Some(other)).await;
+        assert_eq!(st, StatusCode::CREATED, "{b}");
+        let b_id = b["id"].as_str().unwrap().to_string();
+
+        let entry = |pnid: &str, wamid: &str| {
+            json!({
+                "id": "102300000000000",
+                "changes": [{
+                    "field": "messages",
+                    "value": {
+                        "messaging_product": "whatsapp",
+                        "metadata": { "display_phone_number": "15550000000", "phone_number_id": pnid },
+                        "contacts": [{ "profile": { "name": "Test User" }, "wa_id": CLOUD_USER }],
+                        "messages": [{
+                            "from": CLOUD_USER, "id": wamid, "timestamp": "1700000000",
+                            "type": "text", "text": { "body": "forged" }
+                        }]
+                    }
+                }]
+            })
+        };
+        let body = json!({
+            "object": "whatsapp_business_account",
+            "entry": [entry(CLOUD_PNID, "wamid.HBgLFORGEA1"), entry(CLOUD_PNID_B, "wamid.HBgLFORGEB1")]
+        })
+        .to_string()
+        .into_bytes();
+        let (st, _) = post_webhook(app.clone(), Some(CLOUD_APP_SECRET), body.clone()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        assert!(state.manager.store.messages_list(&a_id, None, None, i64::MAX, 10).unwrap().is_empty());
+        assert!(state.manager.store.messages_list(&b_id, None, None, i64::MAX, 10).unwrap().is_empty());
+        // Signed with B's secret it fails the same way (A's batch doesn't verify).
+        let (st, _) = post_webhook(app.clone(), Some("secret-of-b"), body).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        assert!(state.manager.store.messages_list(&b_id, None, None, i64::MAX, 10).unwrap().is_empty());
+
+        // A batch for B alone, signed with B's own secret, is ingested into B only.
+        let only_b = json!({ "object": "whatsapp_business_account", "entry": [entry(CLOUD_PNID_B, "wamid.HBgLREALB1")] })
+            .to_string()
+            .into_bytes();
+        let (st, _) = post_webhook(app.clone(), Some("secret-of-b"), only_b).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(state.manager.store.messages_list(&b_id, None, None, i64::MAX, 10).unwrap().len(), 1);
+        assert!(state.manager.store.messages_list(&a_id, None, None, i64::MAX, 10).unwrap().is_empty());
+        // Unknown numbers alongside a verified batch are still ignored (200).
+        let mixed = json!({ "object": "whatsapp_business_account",
+            "entry": [entry(CLOUD_PNID_B, "wamid.HBgLREALB2"), entry("999999999999999", "wamid.HBgLNOBODY")] })
+            .to_string()
+            .into_bytes();
+        let (st, _) = post_webhook(app, Some("secret-of-b"), mixed).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(state.manager.store.messages_list(&b_id, None, None, i64::MAX, 10).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cloud_webhook_status_updates_are_monotonic_and_deduped() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (id, _) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let chat = format!("{CLOUD_USER}@s.whatsapp.net");
+        let wamid = "wamid.HBgLOUT00000000000000000000000000002";
+        state
+            .manager
+            .cloud_record_outbound(&id, &chat, wamid, "self", "text", Some("hello"), r#"{"type":"text","text":"hello"}"#, 1_700_000_000)
+            .unwrap();
+        let mut rx = state.manager.get(&id).unwrap().events.subscribe();
+        let status_of = || -> String {
+            state
+                .manager
+                .store
+                .with_conn(|c| {
+                    c.query_row(
+                        "SELECT status FROM messages WHERE session_id=? AND message_id=?",
+                        rusqlite::params![id, wamid],
+                        |r| r.get(0),
+                    )
+                })
+                .unwrap()
+        };
+        // read first (Meta doesn't guarantee order)…
+        let (st, _) = post_webhook(app.clone(), Some(CLOUD_APP_SECRET), webhook_status_fixture(wamid, "read")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(status_of(), "read");
+        assert!(matches!(rx.try_recv(), Ok(crate::session::SessionEvent::MessageRead { .. })));
+        // …then a late `delivered` and a retried `read`: row stays `read`, no events.
+        for late in ["delivered", "sent", "read"] {
+            let (st, _) = post_webhook(app.clone(), Some(CLOUD_APP_SECRET), webhook_status_fixture(wamid, late)).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(status_of(), "read", "after late {late}");
+        }
+        assert!(rx.try_recv().is_err(), "stale statuses must not re-emit events");
+        // A status for a wamid this session never sent emits nothing either.
+        let (st, _) = post_webhook(app, Some(CLOUD_APP_SECRET), webhook_status_fixture("wamid.HBgLNOTOURS", "delivered")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cloud_sends_refuse_non_phone_recipients_before_any_graph_call() {
+        let app = router(test_state());
+        let (id, key) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        for to in ["123456789012345@lid", "120363123456789012@g.us", "status@broadcast"] {
+            let (st, body) = send(
+                app.clone(),
+                "POST",
+                &format!("/v1/sessions/{id}/messages"),
+                Some(&key),
+                Some(json!({"to": to, "text": "hi"})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{to}: {body}");
+            assert!(body["error"].as_str().unwrap().contains("phone number"), "{body}");
+        }
+        // Reactions / templates / interactive go through the same gate.
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/messages/react"),
+            Some(&key),
+            Some(json!({"to": "123456789012345@lid", "msg_id": "wamid.HBgLX", "emoji": "👍"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _) = send(
+            app,
+            "POST",
+            &format!("/v1/sessions/{id}/messages/template"),
+            Some(&key),
+            Some(json!({"to": "120363123456789012@g.us", "name": "hello_world", "language": "en_US"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cloud_webhook_unsigned_delivery_needs_opt_in_when_session_has_no_secret() {
+        // Relies on RUWA_CLOUD_ALLOW_UNSIGNED being unset in the test env.
+        let app = router(test_state());
+        let _ = create_cloud_session(app.clone(), None).await;
+        let body = webhook_text_fixture("wamid.HBgLUNSIGNED000000000000000000001", "x");
+        let (st, _) = post_webhook(app.clone(), None, body.clone()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        // Even a "signature" can't help: there's no secret to verify against.
+        let (st, _) = post_webhook(app, Some("whatever"), body).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn cloud_webhook_statuses_update_outbound_rows() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (id, key) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let chat = format!("{CLOUD_USER}@s.whatsapp.net");
+        let wamid = "wamid.HBgLOUT00000000000000000000000000001";
+        state
+            .manager
+            .cloud_record_outbound(
+                &id,
+                &chat,
+                wamid,
+                "15550000000@s.whatsapp.net",
+                "text",
+                Some("hello"),
+                r#"{"type":"text","text":"hello"}"#,
+                1_700_000_000,
+            )
+            .unwrap();
+        let status_of = |sid: &str, mid: &str| -> String {
+            state
+                .manager
+                .store
+                .with_conn(|c| {
+                    c.query_row(
+                        "SELECT status FROM messages WHERE session_id=? AND message_id=?",
+                        rusqlite::params![sid, mid],
+                        |r| r.get(0),
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(status_of(&id, wamid), "sent");
+        for (incoming, expect) in [("delivered", "delivered"), ("played", "read"), ("failed", "failed")] {
+            let (st, _) = post_webhook(app.clone(), Some(CLOUD_APP_SECRET), webhook_status_fixture(wamid, incoming)).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(status_of(&id, wamid), expect, "after {incoming}");
+        }
+        // Still exactly one row, listed as ours.
+        let (_, listed) = send(app, "GET", &format!("/v1/sessions/{id}/messages"), Some(&key), None).await;
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["from_me"], true);
+    }
+
+    #[tokio::test]
+    async fn cloud_typing_without_inbound_message_is_400_before_any_graph_call() {
+        let app = router(test_state());
+        let (id, key) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            &format!("/v1/sessions/{id}/chats/{CLOUD_USER}/typing"),
+            Some(&key),
+            Some(json!({"state": "composing"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        // `paused` is a no-op on cloud (indicators expire by themselves).
+        let (st, body) = send(
+            app,
+            "POST",
+            &format!("/v1/sessions/{id}/chats/{CLOUD_USER}/typing"),
+            Some(&key),
+            Some(json!({"state": "paused"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], "ignored");
+    }
+
+    #[tokio::test]
+    async fn cloud_media_route_404s_without_media_id_before_any_graph_call() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (id, key) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let chat = format!("{CLOUD_USER}@s.whatsapp.net");
+        // A text row has no media_id → 404, no Graph round-trip.
+        state
+            .manager
+            .cloud_record_outbound(&id, &chat, "wamid.HBgLTXT1", "self", "text", Some("x"), r#"{"type":"text","text":"x"}"#, 1)
+            .unwrap();
+        let (st, _) = send(
+            app,
+            "GET",
+            &format!("/v1/sessions/{id}/messages/{CLOUD_USER}%40s.whatsapp.net/wamid.HBgLTXT1/media"),
+            Some(&key),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn contact_card_from_vcard_pulls_fn_and_tel() {
+        let v = build_vcard("Ada Lovelace", "+55 11 99999-9999");
+        let card = contact_card_from_vcard(&v, "fallback");
+        assert_eq!(card.name, "Ada Lovelace");
+        assert_eq!(card.phones, vec!["+55 11 99999-9999".to_string()]);
+        // Multiple TELs, no FN → fallback name, all phones.
+        let card = contact_card_from_vcard(
+            "BEGIN:VCARD\nTEL;type=CELL:+1 555 000 0001\nTEL:+1 555 000 0002\nEND:VCARD",
+            "fallback",
+        );
+        assert_eq!(card.name, "fallback");
+        assert_eq!(card.phones.len(), 2);
+        // Garbage → no phones (caller 400s).
+        assert!(contact_card_from_vcard("nope", "n").phones.is_empty());
+    }
+
+    #[test]
+    fn template_and_interactive_request_bodies_flatten_to_and_spec() {
+        let t: SendTemplateReq = serde_json::from_value(json!({
+            "to": CLOUD_USER, "name": "order_update", "language": "pt_BR",
+            "body_params": ["Ada", "1234"], "reply_to": "wamid.X"
+        }))
+        .unwrap();
+        assert_eq!(t.to, CLOUD_USER);
+        assert_eq!(t.tpl.name, "order_update");
+        assert_eq!(t.tpl.body_params.len(), 2);
+        assert_eq!(t.tpl.reply_to.as_deref(), Some("wamid.X"));
+        let i: SendInteractiveReq = serde_json::from_value(json!({
+            "to": CLOUD_USER, "type": "list", "body": "Pick one", "button": "Menu",
+            "sections": [{"title": "A", "rows": [{"id": "r1", "title": "One"}]}]
+        }))
+        .unwrap();
+        assert_eq!(i.msg.kind, "list");
+        assert_eq!(i.msg.sections[0].rows[0].id, "r1");
+        // Missing `to` is a deserialization error (not a silent default).
+        assert!(serde_json::from_value::<SendTemplateReq>(json!({"name": "x", "language": "en"})).is_err());
+    }
+
+    // ---- AI text assistant ----
+
+    #[test]
+    fn ai_settings_merge_applies_defaults_and_requires_key_and_model() {
+        let parse = |s: &str| serde_json::from_str::<PutAiSettingsReq>(s).unwrap();
+        // Fresh anthropic config: key required, model + base_url defaulted.
+        let cfg = ai_settings_merge(
+            parse(r#"{"provider":"anthropic","api_key":"sk-ant-test-0000abcd"}"#),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "claude-opus-5");
+        assert!(cfg.base_url.is_none());
+        assert_eq!(cfg.effective_base_url(), "https://api.anthropic.com");
+        assert!(cfg.system_prompt.is_none());
+        // No key, nothing stored → 400.
+        assert!(ai_settings_merge(parse(r#"{"provider":"anthropic"}"#), None).is_err());
+        // Blank key counts as omitted → keeps the stored one (same provider).
+        let kept = ai_settings_merge(
+            parse(r#"{"provider":"anthropic","api_key":"  ","model":"claude-sonnet-4-6"}"#),
+            Some(&cfg),
+        )
+        .unwrap();
+        assert_eq!(kept.api_key, "sk-ant-test-0000abcd");
+        assert_eq!(kept.model, "claude-sonnet-4-6");
+        // Changing provider without a key → 400.
+        assert!(ai_settings_merge(
+            parse(r#"{"provider":"openai","model":"gpt-4o-mini"}"#),
+            Some(&cfg)
+        )
+        .is_err());
+        // OpenAI requires a model.
+        assert!(ai_settings_merge(
+            parse(r#"{"provider":"openai","api_key":"sk-test-0000wxyz"}"#),
+            None
+        )
+        .is_err());
+        // base_url is normalized (trailing slash) and validated.
+        let o = ai_settings_merge(
+            parse(
+                r#"{"provider":"openai","api_key":"sk-test-0000wxyz","model":"llama3",
+                     "base_url":"http://localhost:11434/v1/","system_prompt":" be brief "}"#,
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(o.base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(o.system_prompt.as_deref(), Some("be brief"));
+        assert!(ai_settings_merge(
+            parse(r#"{"provider":"openai","api_key":"k-0000wxyz","model":"m","base_url":"localhost"}"#),
+            None
+        )
+        .is_err());
+        for bad in ["http://", "https://ex ample.com/v1", "http://host/v1?x=1", "http://host/v1#f"] {
+            assert!(
+                ai_settings_merge(
+                    parse(&format!(
+                        r#"{{"provider":"openai","api_key":"k-0000wxyz","model":"m","base_url":"{bad}"}}"#
+                    )),
+                    None
+                )
+                .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        // Keys with whitespace / control chars can't be sent as a header → 400.
+        for bad in ["sk-ant 0000abcd", "sk-ant\n0000abcd", "sk\tkey-0000abcd"] {
+            assert!(
+                ai_settings_merge(
+                    parse(&serde_json::json!({"provider":"anthropic","api_key":bad}).to_string()),
+                    None
+                )
+                .is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        // Unknown fields are rejected (no silent typos).
+        assert!(serde_json::from_str::<PutAiSettingsReq>(
+            r#"{"provider":"anthropic","apikey":"x"}"#
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn ai_settings_roundtrip_hides_key_and_applies_defaults() {
+        let app = router(test_state());
+
+        // Unconfigured GET.
+        let (st, body) = send(app.clone(), "GET", "/v1/settings/ai", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["configured"], false);
+        assert!(body["provider"].is_null());
+        assert!(body["api_key_hint"].is_null());
+
+        // PUT anthropic with just provider + key → defaults applied, key hidden.
+        let (st, body) = send(
+            app.clone(),
+            "PUT",
+            "/v1/settings/ai",
+            Some("test-token"),
+            Some(serde_json::json!({"provider":"anthropic","api_key":"sk-ant-test-0000abcd"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["provider"], "anthropic");
+        assert_eq!(body["model"], "claude-opus-5");
+        assert_eq!(body["base_url"], "https://api.anthropic.com");
+        assert!(body["system_prompt"].is_null());
+        assert_eq!(body["api_key_hint"], "••••abcd");
+        assert!(body.get("api_key").is_none(), "key must never be returned");
+        assert!(!body.to_string().contains("sk-ant-test"));
+
+        // GET reflects it; the key is not in the payload.
+        let (st, body) = send(app.clone(), "GET", "/v1/settings/ai", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["api_key_hint"], "••••abcd");
+        assert!(!body.to_string().contains("sk-ant-test"));
+
+        // PUT without api_key (same provider) keeps the key, updates model.
+        let (st, body) = send(
+            app.clone(),
+            "PUT",
+            "/v1/settings/ai",
+            Some("test-token"),
+            Some(serde_json::json!({"provider":"anthropic","model":"claude-sonnet-4-6","system_prompt":"Be terse."})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(body["system_prompt"], "Be terse.");
+        assert_eq!(body["api_key_hint"], "••••abcd");
+
+        // Switching to openai without a model → 400.
+        let (st, body) = send(
+            app.clone(),
+            "PUT",
+            "/v1/settings/ai",
+            Some("test-token"),
+            Some(serde_json::json!({"provider":"openai","api_key":"sk-test-0000wxyz"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("model"));
+        // Switching provider without a key → 400.
+        let (st, _) = send(
+            app.clone(),
+            "PUT",
+            "/v1/settings/ai",
+            Some("test-token"),
+            Some(serde_json::json!({"provider":"openai","model":"gpt-4o-mini"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // Valid openai config with a custom base URL.
+        let (st, body) = send(
+            app.clone(),
+            "PUT",
+            "/v1/settings/ai",
+            Some("test-token"),
+            Some(serde_json::json!({"provider":"openai","api_key":"sk-test-0000wxyz","model":"gpt-4o-mini","base_url":"https://openrouter.ai/api/v1/"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["provider"], "openai");
+        assert_eq!(body["base_url"], "https://openrouter.ai/api/v1");
+        assert_eq!(body["api_key_hint"], "••••wxyz");
+
+        // DELETE → 204, then unconfigured again (idempotent).
+        let (st, _) = send(app.clone(), "DELETE", "/v1/settings/ai", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, _) = send(app.clone(), "DELETE", "/v1/settings/ai", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, body) = send(app.clone(), "GET", "/v1/settings/ai", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn ai_improve_text_validates_before_any_upstream_call() {
+        let app = router(test_state());
+
+        // Unconfigured → 400 with the pointer to the settings route.
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/ai/improve-text",
+            Some("test-token"),
+            Some(serde_json::json!({"text":"hello"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "ai assistant not configured — set it via PUT /v1/settings/ai"
+        );
+        // Same for the connectivity test.
+        let (st, _) = send(app.clone(), "POST", "/v1/settings/ai/test", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // Configure (no network is ever hit below: every call fails validation).
+        let (st, _) = send(
+            app.clone(),
+            "PUT",
+            "/v1/settings/ai",
+            Some("test-token"),
+            Some(serde_json::json!({"provider":"anthropic","api_key":"sk-ant-test-0000abcd"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        // Empty text → 400.
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/ai/improve-text",
+            Some("test-token"),
+            Some(serde_json::json!({"text":"   "})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // Over-long text → 400.
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/ai/improve-text",
+            Some("test-token"),
+            Some(serde_json::json!({"text": "x".repeat(8001)})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // translate without language → 400.
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/ai/improve-text",
+            Some("test-token"),
+            Some(serde_json::json!({"text":"oi","mode":"translate"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("language"));
+        // custom without instruction → 400.
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/ai/improve-text",
+            Some("test-token"),
+            Some(serde_json::json!({"text":"oi","mode":"custom"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // Unknown mode → 400 (serde rejection).
+        let (st, _) = send(
+            app.clone(),
+            "POST",
+            "/v1/ai/improve-text",
+            Some("test-token"),
+            Some(serde_json::json!({"text":"oi","mode":"poetic"})),
+        )
+        .await;
+        assert!(st.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn ai_routes_are_admin_only_and_readonly_gated() {
+        let state = test_state();
+        let mgr = state.manager.clone();
+        let app = router(state);
+
+        // Mint a per-session key: it must NOT open the instance-wide AI routes.
+        let (st, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(serde_json::json!({"label": "tenant"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let key = body["api_key"].as_str().unwrap().to_string();
+
+        for (method, uri, body) in [
+            ("GET", "/v1/settings/ai", None),
+            (
+                "PUT",
+                "/v1/settings/ai",
+                Some(serde_json::json!({"provider":"anthropic","api_key":"sk-ant-test-0000abcd"})),
+            ),
+            ("DELETE", "/v1/settings/ai", None),
+            ("POST", "/v1/settings/ai/test", None),
+            (
+                "POST",
+                "/v1/ai/improve-text",
+                Some(serde_json::json!({"text":"hello"})),
+            ),
+        ] {
+            let (st, _) = send(app.clone(), method, uri, Some(&key), body.clone()).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{method} {uri} with session key");
+            let (st, _) = send(app.clone(), method, uri, None, body.clone()).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{method} {uri} without token");
+            let (st, _) = send(app.clone(), method, uri, Some("wrong"), body).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{method} {uri} with wrong token");
+        }
+
+        // Admin token works (GET unconfigured).
+        let (st, _) = send(app.clone(), "GET", "/v1/settings/ai", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // Readonly deployment: writes blocked, reads fine.
+        let ro = AppState {
+            manager: mgr,
+            api_token: Arc::new("test-token".into()),
+            readonly: true,
+            media_store: None,
+        };
+        let ro_app = router(ro);
+        let (st, _) = send(
+            ro_app.clone(),
+            "PUT",
+            "/v1/settings/ai",
+            Some("test-token"),
+            Some(serde_json::json!({"provider":"anthropic","api_key":"sk-ant-test-0000abcd"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, _) = send(ro_app.clone(), "DELETE", "/v1/settings/ai", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, body) = send(ro_app, "GET", "/v1/settings/ai", Some("test-token"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["configured"], false);
     }
 }

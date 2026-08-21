@@ -3,6 +3,7 @@ import { toast } from "sonner"
 import { Save, Upload, UserCircle } from "lucide-react"
 import { api } from "@/lib/api"
 import type { SessionMeta } from "@/lib/types"
+import { isCloud } from "@/lib/types"
 import { SectionCard } from "@/components/ui-bits"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -38,6 +39,26 @@ export function ProfilePage({ inst, readonly }: { inst: SessionMeta; readonly: b
     } finally {
       setBusy(false)
     }
+  }
+
+  if (isCloud(inst)) {
+    return (
+      <div className="mx-auto max-w-[560px]">
+        <div className="mb-4">
+          <h1 className="text-xl font-semibold tracking-tight">My Profile</h1>
+          <div className="mt-0.5 text-xs text-muted-foreground">The connected account for {inst.label ?? inst.id}</div>
+        </div>
+        <SectionCard title="Account profile" icon={UserCircle}>
+          <div className="space-y-2 p-4 text-[13px]">
+            <div><span className="text-muted-foreground">Verified name:</span> {inst.cloud?.verified_name ?? inst.push_name ?? "—"}</div>
+            <p className="text-xs text-muted-foreground">
+              This is a Meta Cloud API number — its display name, about text and picture are managed in the
+              WhatsApp Manager business profile, not through ruwa.
+            </p>
+          </div>
+        </SectionCard>
+      </div>
+    )
   }
 
   return (

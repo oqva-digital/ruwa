@@ -4,6 +4,7 @@ import { toast } from "sonner"
 import { Database, Save, Trash2, HardDrive, Bell } from "lucide-react"
 import { api, ApiError } from "@/lib/api"
 import type { SessionMeta } from "@/lib/types"
+import { isCloud } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { confirmDialog } from "@/components/confirm"
 import { SectionCard } from "@/components/ui-bits"
@@ -70,18 +71,21 @@ export function IntegrationsPage({ inst, readonly }: { inst: SessionMeta; readon
         <div className="mt-0.5 text-xs text-muted-foreground">Egress + storage for {inst.label ?? inst.id}</div>
       </div>
 
-      <SectionCard title="Phone notifications" icon={Bell}>
-        <div className="flex items-center justify-between gap-4 p-4">
-          <div>
-            <div className="text-[13px] font-medium">Appear online</div>
-            <div className="text-xs text-muted-foreground">
-              On → companion shows as online and WhatsApp <b>silences your phone's notifications</b>.
-              Off (default) → your phone keeps notifying. Message reception is unaffected either way.
+      {/* Presence is a linked-device concept; Cloud API numbers have no phone to silence. */}
+      {!isCloud(inst) && (
+        <SectionCard title="Phone notifications" icon={Bell}>
+          <div className="flex items-center justify-between gap-4 p-4">
+            <div>
+              <div className="text-[13px] font-medium">Appear online</div>
+              <div className="text-xs text-muted-foreground">
+                On → companion shows as online and WhatsApp <b>silences your phone's notifications</b>.
+                Off (default) → your phone keeps notifying. Message reception is unaffected either way.
+              </div>
             </div>
+            <Switch checked={online} disabled={readonly} onCheckedChange={toggleOnline} />
           </div>
-          <Switch checked={online} disabled={readonly} onCheckedChange={toggleOnline} />
-        </div>
-      </SectionCard>
+        </SectionCard>
+      )}
 
       <SectionCard title="Redis queue" icon={Database}>
         <div className="space-y-4 p-4">

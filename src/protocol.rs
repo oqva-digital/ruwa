@@ -1569,14 +1569,22 @@ pub mod connection {
 
     #[derive(Debug, thiserror::Error)]
     pub enum SocketError {
+        // Boxed: tungstenite::Error is ~136 B and would bloat every
+        // Result on the recv/send hot path (clippy::result_large_err).
         #[error("WebSocket: {0}")]
-        Ws(#[from] tokio_tungstenite::tungstenite::Error),
+        Ws(Box<tokio_tungstenite::tungstenite::Error>),
         #[error("WebSocket closed")]
         Closed,
         #[error("frame: {0}")]
         Frame(#[from] FrameError),
         #[error("node: {0}")]
         Node(#[from] NodeError),
+    }
+
+    impl From<tokio_tungstenite::tungstenite::Error> for SocketError {
+        fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+            Self::Ws(Box::new(e))
+        }
     }
 
     /// Post-handshake transport: AES-GCM-encrypted binary nodes over a
@@ -1642,7 +1650,7 @@ pub mod connection {
             self.ws
                 .close(None)
                 .await
-                .map_err(SocketError::Ws)
+                .map_err(SocketError::from)
         }
 
         /// Send a clean WebSocket Close frame without consuming the socket.
@@ -1651,14 +1659,15 @@ pub mod connection {
         /// (tens of seconds), so the next instance's login races that ghost into
         /// a `<conflict type="replaced"/>`. A clean Close frees the slot at once.
         pub async fn send_close(&mut self) -> Result<(), SocketError> {
-            self.ws.close(None).await.map_err(SocketError::Ws)
+            self.ws.close(None).await.map_err(SocketError::from)
         }
     }
 
     #[derive(Debug, thiserror::Error)]
     pub enum HandshakeError {
+        // Boxed for the same result_large_err reason as SocketError::Ws.
         #[error("WebSocket: {0}")]
-        Ws(#[from] tokio_tungstenite::tungstenite::Error),
+        Ws(Box<tokio_tungstenite::tungstenite::Error>),
         #[error("WebSocket closed before handshake completed")]
         Closed,
         #[error("invalid handshake URL")]
@@ -1679,6 +1688,12 @@ pub mod connection {
         CertVerify(&'static str),
         #[error("transport: {0}")]
         Transport(String),
+    }
+
+    impl From<tokio_tungstenite::tungstenite::Error> for HandshakeError {
+        fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+            Self::Ws(Box::new(e))
+        }
     }
 
     /// WhatsApp's hardcoded Curve25519 root public key. Server-issued cert

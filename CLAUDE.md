@@ -24,9 +24,10 @@ Then read the source files relevant to your task.
 - **Every commit compiles + tests pass.** `cargo check` + `cargo test` +
   `cargo clippy --all-targets -- -D warnings` all green. No commits that break
   the tree, ever.
-- **`src/` stays at ≤10 files.** main, api, session, store, error, protocol,
-  crypto, media, egress, plus protocol/tokens.rs. No new files: grow an
-  existing module instead.
+- **`src/` stays at ≤12 files.** main, api, session, store, error, protocol,
+  crypto, media, egress, cloud, call, plus protocol/tokens.rs. No new files:
+  grow an existing module instead. (`call.rs` is the voice-call stack:
+  signaling, SRTP transport, and the audio bridge.)
 - **No CLI.** All behavior reachable via HTTP under `/v1/*` (bearer auth).
 - **Never put protobuf types in the public HTTP API.** Translate to neutral
   structs in `api.rs`.
@@ -61,6 +62,10 @@ curl -fsSL https://raw.githubusercontent.com/tulir/whatsmeow/main/proto/<pkg>/<f
 whatsmeow source the relevant module was ported from (use the `gh api` recipe
 above), and scan whatsmeow's later commits for an analogous fix.
 
+**Upstream parity:** `PARITY.md` records the last swept commit of each upstream
+(whatsmeow / Evolution / Baileys), what counts as parity-relevant, and the sweep
+recipe. When you sweep upstreams, update its checkpoint table + log.
+
 ## Codebase shape
 
 ```
@@ -80,6 +85,8 @@ src/
                           #   in-house SigV4 + S3/R2/MinIO client
   egress.rs               # event fan-out: SSE serializer, webhook delivery
                           #   (HMAC, retry, metrics), in-house Redis (RESP) client
+  cloud.rs                # Meta WhatsApp Cloud API (Graph) backend: client,
+                          #   payload builders, webhook parsing/signature verify
 
 migrations/0001_initial.sql   # full schema
 proto/                         # vendored .proto files

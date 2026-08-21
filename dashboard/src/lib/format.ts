@@ -36,7 +36,10 @@ export interface Liveness {
   cls: string
 }
 
-export function liveness(status: SessionStatus | string, lastRxSec: number | null): Liveness {
+export function liveness(status: SessionStatus | string, lastRxSec: number | null, kind?: string): Liveness {
+  // Cloud API sessions have no socket: "connected" means credentials validated
+  // and webhooks flowing — there is no rx-idle/frozen concept to report.
+  if (kind === "cloud" && status === "connected") return { kind: "live", label: "cloud · ready", cls: "chip-live" }
   if (status === "disconnected" || status === "logged_out" || status === "proxy_error" || status === "blocked")
     return { kind: "down", label: "down", cls: "chip-down" }
   if (status === "connecting" || status === "pending" || status === "awaiting_qr" || status === "syncing")

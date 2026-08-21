@@ -11,11 +11,39 @@ export type SessionStatus =
   | "logged_out"
   | "blocked"
 
+/** Backend kind: `web` = WhatsApp Web multi-device socket (QR/phone pairing);
+ *  `cloud` = Meta WhatsApp Cloud API (Graph credentials, inbound via webhook). */
+export type SessionKind = "web" | "cloud"
+
+/** Non-secret Cloud API metadata echoed on cloud sessions (never the token/secret). */
+export interface CloudMeta {
+  phone_number_id: string
+  waba_id?: string | null
+  graph_version?: string | null
+  display_phone_number?: string | null
+  verified_name?: string | null
+}
+
+/** Cloud credentials as sent on create / PUT /cloud. Every field optional on
+ *  update (only provided ones replace); create requires phone_number_id and
+ *  access_token (waba_id only for template management). */
+export interface CloudCredsInput {
+  phone_number_id?: string
+  waba_id?: string
+  access_token?: string
+  app_secret?: string
+  verify_token?: string
+  graph_version?: string
+}
+
 export interface SessionMeta {
   id: string
   label: string | null
   status: SessionStatus
   jid: string | null
+  /** Optional so older servers keep typechecking; absent ⇒ web. */
+  kind?: SessionKind
+  cloud?: CloudMeta | null
   /** WhatsApp account display name (push name). Read-only — owned by the phone,
    *  synced down to companions; ruwa can't change it. */
   push_name?: string | null
@@ -26,6 +54,8 @@ export interface SessionMeta {
   created_at: number
   updated_at: number
 }
+
+export const isCloud = (s: Pick<SessionMeta, "kind"> | null | undefined): boolean => s?.kind === "cloud"
 
 export interface SessionWithKey extends SessionMeta {
   /** Returned ONCE on create. */
@@ -118,3 +148,129 @@ export interface ServerLogRow {
   target: string
   message: string
 }
+
+// ── Cloud API: templates + interactive (neutral shapes; no Graph types leak) ──
+
+/** One component of a message template as returned by GET /templates
+ *  (`type` HEADER|BODY|FOOTER|BUTTONS; BODY carries `text` with `{{n}}` slots). */
+export interface TemplateComponent {
+  type: string
+  format?: string
+  text?: string
+  buttons?: { type: string; text?: string; url?: string; phone_number?: string; [k: string]: unknown }[]
+  example?: unknown
+  [k: string]: unknown
+}
+
+export interface TemplateRow {
+  id: string
+  name: string
+  language: string
+  status: string
+  category: string
+  components: TemplateComponent[]
+}
+
+export interface TemplatePage {
+  templates: TemplateRow[]
+  next: string | null
+}
+
+export interface TemplateHeaderParam {
+  type: "text" | "image" | "video" | "document"
+  text?: string
+  link?: string
+  media_id?: string
+  filename?: string
+}
+
+export interface TemplateButtonParam {
+  index: number
+  sub_type: "quick_reply" | "url" | string
+  payload?: string
+  text?: string
+}
+
+/** Body of POST /messages/template (minus `to`). */
+export interface TemplateSendBody {
+  name: string
+  language: string
+  body_params?: string[]
+  header?: TemplateHeaderParam
+  buttons?: TemplateButtonParam[]
+  /** Escape hatch: Cloud-native components used verbatim (body_params/header/buttons ignored). */
+  components?: unknown[]
+  reply_to?: string
+}
+
+export interface InteractiveButton {
+  id: string
+  title: string
+}
+export interface InteractiveSection {
+  title?: string
+  rows: { id: string; title: string; description?: string }[]
+}
+
+/** Body of POST /messages/interactive (minus `to`). */
+export interface InteractiveSendBody {
+  type: "button" | "list" | "cta_url"
+  body: string
+  header?: { type: "text"; text: string }
+  footer?: string
+  buttons?: InteractiveButton[]
+  button?: string
+  sections?: InteractiveSection[]
+  cta?: { display_text: string; url: string }
+  reply_to?: string
+}
+
+// ── AI text assistant (server-side, admin-only; key never returned) ──
+export type AiProvider = "anthropic" | "openai"
+
+/** GET/PUT /v1/settings/ai response. `api_key_hint` is the masked tail ("••••abcd"). */
+export interface AiSettings {
+  configured: boolean
+  provider: AiProvider | null
+  model: string | null
+  base_url: string | null
+  system_prompt: string | null
+  api_key_hint: string | null
+}
+
+/** PUT /v1/settings/ai body. `api_key` omitted = keep the stored one. */
+export interface AiSettingsInput {
+  provider: AiProvider
+  api_key?: string
+  model?: string
+  base_url?: string | null
+  system_prompt?: string | null
+}
+
+export interface AiTestResult {
+  ok: boolean
+  provider: AiProvider
+  model: string
+  latency_ms: number
+  reply: string
+}
+
+export type ImproveMode = "improve" | "formal" | "casual" | "shorter" | "grammar" | "translate" | "custom"
+
+export interface ImproveTextInput {
+  text: string
+  mode?: ImproveMode
+  /** Target language for `translate` (e.g. "en", "pt-BR"). */
+  language?: string
+  /** Required for `custom` (≤ 500 chars). */
+  instruction?: string
+}
+
+export interface ImproveTextResult {
+  text: string
+  provider: AiProvider
+  model: string
+}
+
+/** `type` field of the multipart media send; `ptt` = WhatsApp voice note. */
+export type MediaSendType = "image" | "video" | "audio" | "ptt" | "voice" | "document" | "sticker"

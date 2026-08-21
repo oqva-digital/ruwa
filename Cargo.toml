@@ -1,6 +1,6 @@
 [package]
 name = "ruwa"
-version = "0.3.20"
+version = "0.4.0"
 edition = "2021"
 description = "API-first multi-tenant WhatsApp Web client in Rust (port of whatsmeow)"
 license = "MIT"
@@ -57,13 +57,15 @@ cbc = { version = "0.1", features = ["std"] }
 ctr = "0.9"
 hmac = "0.12"
 sha2 = "0.10"
+sha1 = "0.10"        # WARP MESSAGE-INTEGRITY tag (call media plane)
+subtle = "2"         # constant-time tag comparison (SRTP/SRTCP auth)
 md-5 = "0.10"
 hkdf = "0.12"
 rand = "0.8"
 rand_core = "0.6"
 
 # Networking
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks", "multipart"] }
 
 # Per-session proxy egress (SOCKS5 / HTTP CONNECT) for the Noise WebSocket.
 # reqwest covers media via its own socks/http proxy support.
