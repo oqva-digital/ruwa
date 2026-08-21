@@ -16678,7 +16678,7 @@ mod tests {
 
         assert!(session.device_cache_get(key).is_none(), "cold = miss");
         let devs = vec![
-            format!("{key}"),
+            key.to_string(),
             "5511990000001:19@s.whatsapp.net".to_string(),
         ];
         session.device_cache_put(key, devs.clone());
