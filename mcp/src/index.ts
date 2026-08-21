@@ -49,15 +49,44 @@ const server = new McpServer({ name: "ruwa", version: "0.2.0" })
 
 // ── Instance lifecycle ──────────────────────────────────────────────────────
 
+const cloudCredsShape = {
+  phone_number_id: z.string().optional().describe("Meta phone number id (e.g. 106540352242922) — required for kind=cloud"),
+  waba_id: z.string().optional().describe("WhatsApp Business Account id — required to list/create templates"),
+  access_token: z.string().optional().describe("Graph API access token (System User token recommended) — required for kind=cloud"),
+  app_secret: z.string().optional().describe("Meta app secret, used to verify inbound webhook signatures (strongly recommended)"),
+  verify_token: z.string().optional().describe("token Meta sends on webhook subscription verification (GET /v1/cloud/webhook)"),
+  graph_version: z.string().optional().describe("Graph API version, default v25.0"),
+}
+
 server.tool(
   "create_session",
-  "Create a new WhatsApp session (instance). Returns its id; then pair it either with get_qr (scan a QR) or pair_phone (enter an 8-char code) in WhatsApp → Linked devices.",
+  "Create a new WhatsApp session (instance). Returns its id. kind='web' (default): a WhatsApp Web linked device — pair it with get_qr (scan a QR) or pair_phone (enter an 8-char code) in WhatsApp → Linked devices. kind='cloud': a Meta WhatsApp Cloud API number — no QR/pairing; pass the credentials in `cloud` (phone_number_id + access_token required, waba_id needed for templates), then call connect_session to validate them. Point the Meta webhook at <ruwa origin>/v1/cloud/webhook. Cloud sessions can only initiate conversations with approved templates (send_template); free-form sends work only inside the 24h customer-service window after the contact last wrote.",
   {
     label: z.string().optional().describe("human-friendly label for the instance"),
     proxy: z.string().optional().describe("optional egress proxy URL (socks5/socks5h/http)"),
+    kind: z.enum(["web", "cloud"]).optional().describe("session backend: 'web' (linked device, default) or 'cloud' (Meta Cloud API)"),
+    cloud: z.object(cloudCredsShape).optional().describe("Cloud API credentials — required when kind='cloud'"),
   },
-  async ({ label, proxy }) => {
-    try { return ok(await call("POST", "/v1/sessions", { label, proxy })) } catch (e) { return err(e) }
+  async ({ label, proxy, kind, cloud }) => {
+    try {
+      const body: Record<string, unknown> = { label, proxy }
+      if (kind) body.kind = kind
+      if (cloud) body.cloud = cloud
+      return ok(await call("POST", "/v1/sessions", body))
+    } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
+  "update_cloud_creds",
+  "Update the Meta Cloud API credentials of a cloud session (kind='cloud' only; 501 on web sessions). Only the fields you pass are replaced (e.g. rotate access_token). Call reconnect_session afterwards to re-validate the new credentials against Graph (connect_session is a no-op on an already-connected session). Changing phone_number_id needs the master API token and fails with 409 if another session already owns that number.",
+  { session_id: z.string(), ...cloudCredsShape },
+  async ({ session_id, ...cloud }) => {
+    try {
+      const body: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(cloud)) if (v !== undefined) body[k] = v
+      return ok(await call("PUT", `/v1/sessions/${enc(session_id)}/cloud`, body))
+    } catch (e) { return err(e) }
   },
 )
 
@@ -97,10 +126,19 @@ server.tool(
 
 server.tool(
   "connect_session",
-  "(Re)connect a paired session that is disconnected — kicks off the connect/handshake.",
+  "(Re)connect a session that is disconnected — web: kicks off the connect/handshake of a paired device; cloud: validates the Cloud API credentials against Graph and marks the session connected.",
   { session_id: z.string() },
   async ({ session_id }) => {
     try { return ok(await call("POST", `/v1/sessions/${enc(session_id)}/connect`)) } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
+  "reconnect_session",
+  "Force a fresh (re)connect even when the session is already connected — web: bounces the live socket and re-logs-in (\"rekey\", heals stuck sessions); cloud: re-validates the Cloud API credentials against Graph (use after update_cloud_creds; connect_session would be a no-op while connected).",
+  { session_id: z.string() },
+  async ({ session_id }) => {
+    try { return ok(await call("POST", `/v1/sessions/${enc(session_id)}/reconnect`)) } catch (e) { return err(e) }
   },
 )
 
@@ -118,7 +156,7 @@ server.tool(
 
 server.tool(
   "logout_session",
-  "Log out / unlink a session from WhatsApp (the linked device is removed; re-pairing needs a new QR).",
+  "Log out / unlink a session from WhatsApp (web: the linked device is removed; re-pairing needs a new QR. cloud: marks the session logged out, credentials are kept — connect_session re-validates).",
   { session_id: z.string() },
   async ({ session_id }) => {
     try { return ok(await call("POST", `/v1/sessions/${enc(session_id)}/logout`)) } catch (e) { return err(e) }
@@ -286,6 +324,27 @@ server.tool(
 )
 
 server.tool(
+  "list_templates",
+  "List the message templates of a cloud session's WhatsApp Business Account (kind='cloud' only; needs waba_id; 501 on web sessions). Returns {templates:[{id,name,language,status,category,components}], next}. Only APPROVED templates can be sent with send_template — templates are the only way to start a conversation outside the 24h customer-service window.",
+  {
+    session_id: z.string(),
+    status: z.string().optional().describe("filter by status, e.g. APPROVED | PENDING | REJECTED"),
+    limit: z.number().optional().describe("page size (default 50)"),
+    after: z.string().optional().describe("pagination cursor from a previous result's `next`"),
+  },
+  async ({ session_id, status, limit, after }) => {
+    try {
+      const q = new URLSearchParams()
+      if (status) q.set("status", status)
+      if (limit !== undefined) q.set("limit", String(limit))
+      if (after) q.set("after", after)
+      const qs = q.toString()
+      return ok(await call("GET", `/v1/sessions/${enc(session_id)}/templates${qs ? `?${qs}` : ""}`))
+    } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
   "on_whatsapp",
   "Check which phone numbers are registered on WhatsApp (a real round-trip).",
   { session_id: z.string(), numbers: z.array(z.string()).describe("phone numbers to check") },
@@ -383,6 +442,78 @@ server.tool(
   async ({ session_id, to, name, options, selectable_count }) => {
     try {
       return ok(await call("POST", `/v1/sessions/${enc(session_id)}/messages/poll`, { to, name, options, selectable_count: selectable_count ?? 1 }))
+    } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
+  "send_template",
+  "Send an approved message template (Meta Cloud API, kind='cloud' only; 501 on web sessions). Templates are REQUIRED to initiate a conversation: Cloud API only allows free-form messages (send_text/send_media/…) within 24h of the contact's last inbound message; outside that window Graph rejects them (error 131047) and you must send a template. Discover names/languages/components with list_templates. Pass body_params for positional {{1}},{{2}} body variables; header for a text/media header; buttons for quick_reply/url button parameters — or pass `components` (Cloud-native array) verbatim to override all of those.",
+  {
+    session_id: z.string(),
+    to: z.string().describe("recipient phone number in international format, digits only (e.g. 5511999999999) or JID"),
+    name: z.string().describe("template name, e.g. order_update"),
+    language: z.string().describe("template language code, e.g. pt_BR, en_US"),
+    body_params: z.array(z.string()).optional().describe("positional text params for the body {{1}}, {{2}}, …"),
+    header: z.object({
+      type: z.enum(["text", "image", "video", "document"]),
+      text: z.string().optional().describe("header text param (type=text)"),
+      link: z.string().optional().describe("public media URL (type=image|video|document)"),
+      media_id: z.string().optional().describe("previously uploaded Cloud media id (alternative to link)"),
+      filename: z.string().optional().describe("document filename (type=document)"),
+    }).optional().describe("header parameter"),
+    buttons: z.array(z.object({
+      index: z.number().describe("button position, 0-based"),
+      sub_type: z.enum(["quick_reply", "url", "copy_code"]),
+      payload: z.string().optional().describe("quick_reply payload echoed back when tapped"),
+      text: z.string().optional().describe("url suffix / coupon code param"),
+    })).optional().describe("button parameters"),
+    components: z.array(z.any()).optional().describe("escape hatch: Cloud API `components` array used verbatim (body_params/header/buttons ignored)"),
+    reply_to: z.string().optional().describe("wamid of the message to quote"),
+  },
+  async ({ session_id, to, name, language, body_params, header, buttons, components, reply_to }) => {
+    try {
+      const body: Record<string, unknown> = { to, name, language }
+      if (body_params) body.body_params = body_params
+      if (header) body.header = header
+      if (buttons) body.buttons = buttons
+      if (components) body.components = components
+      if (reply_to) body.reply_to = reply_to
+      return ok(await call("POST", `/v1/sessions/${enc(session_id)}/messages/template`, body))
+    } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
+  "send_interactive",
+  "Send an interactive message (Meta Cloud API, kind='cloud' only; 501 on web sessions): reply buttons (type=button, ≤3 buttons), a list menu (type=list, button label + sections/rows), or a call-to-action URL (type=cta_url). Free-form, so only allowed inside the 24h customer-service window (otherwise use send_template). The contact's tap comes back as an inbound 'interactive' message with the chosen id/title.",
+  {
+    session_id: z.string(),
+    to: z.string().describe("recipient phone number, digits only, or JID"),
+    type: z.enum(["button", "list", "cta_url"]),
+    body: z.string().describe("main text"),
+    header: z.object({ type: z.literal("text"), text: z.string() }).optional().describe("optional text header"),
+    footer: z.string().optional(),
+    buttons: z.array(z.object({ id: z.string(), title: z.string().describe("≤20 chars") })).optional().describe("type=button: up to 3 reply buttons"),
+    button: z.string().optional().describe("type=list: label of the button that opens the list"),
+    sections: z.array(z.object({
+      title: z.string().optional(),
+      rows: z.array(z.object({ id: z.string(), title: z.string(), description: z.string().optional() })),
+    })).optional().describe("type=list: sections with rows (≤10 rows total)"),
+    cta: z.object({ display_text: z.string(), url: z.string() }).optional().describe("type=cta_url: the button"),
+    reply_to: z.string().optional().describe("wamid of the message to quote"),
+  },
+  async ({ session_id, to, type, body, header, footer, buttons, button, sections, cta, reply_to }) => {
+    try {
+      const payload: Record<string, unknown> = { to, type, body }
+      if (header) payload.header = header
+      if (footer !== undefined) payload.footer = footer
+      if (buttons) payload.buttons = buttons
+      if (button !== undefined) payload.button = button
+      if (sections) payload.sections = sections
+      if (cta) payload.cta = cta
+      if (reply_to) payload.reply_to = reply_to
+      return ok(await call("POST", `/v1/sessions/${enc(session_id)}/messages/interactive`, payload))
     } catch (e) { return err(e) }
   },
 )
@@ -633,4 +764,4 @@ server.tool(
 
 const transport = new StdioServerTransport()
 await server.connect(transport)
-console.error(`ruwa-mcp connected → ${BASE} (35 tools)`)
+console.error(`ruwa-mcp connected → ${BASE} (45 tools)`)

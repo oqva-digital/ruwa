@@ -7,7 +7,9 @@ import {
 import { api } from "@/lib/api"
 import { fmtAgeShort, fmtAgeLong, liveness } from "@/lib/format"
 import type { SessionMeta, SessionHealth } from "@/lib/types"
-import { StatusBadge, LivenessChip } from "@/components/status"
+import { isCloud } from "@/lib/types"
+import { StatusBadge, LivenessChip, KindBadge } from "@/components/status"
+import { CloudApiPanel } from "@/components/cloud-panel"
 import { confirmDialog, promptDialog } from "@/components/confirm"
 import { StatCard, SectionCard, JsonBlock, CollapsibleSection } from "@/components/ui-bits"
 import { Button } from "@/components/ui/button"
@@ -27,9 +29,10 @@ export function OverviewPage({
     refetchInterval: 5000,
   })
 
+  const cloud = isCloud(inst)
   const h = health.data
   const lastRxSec = h?.seconds_since_rx ?? null
-  const lv = liveness(inst.status, lastRxSec)
+  const lv = liveness(inst.status, lastRxSec, inst.kind)
   const stColor = lv.kind === "live" ? "ok" : lv.kind === "frozen" ? "frozen" : lv.kind === "down" ? "down" : "progress"
   const LiveIco = lv.kind === "frozen" ? Snowflake : lv.kind === "live" ? Wifi : WifiOff
 
@@ -52,16 +55,21 @@ export function OverviewPage({
           <div className="mb-1 flex items-center gap-2.5">
             <h1 className="text-xl font-semibold tracking-tight">{inst.label || "(no label)"}</h1>
             <StatusBadge status={inst.status} />
+            {cloud && <KindBadge kind="cloud" />}
             {lv.kind === "frozen" && <LivenessChip status={inst.status} lastRxSec={lastRxSec} />}
           </div>
-          <div className="mono text-[11px] text-muted-foreground">{inst.jid ?? "not paired"}</div>
+          <div className="mono text-[11px] text-muted-foreground">
+            {cloud
+              ? `cloud · ${inst.cloud?.display_phone_number ? "+" + inst.cloud.display_phone_number.replace(/\D/g, "") : inst.jid ?? "not validated"}`
+              : inst.jid ?? "not paired"}
+          </div>
         </div>
         <div className="flex flex-wrap gap-1.5">
-          <Button size="sm" variant="outline" disabled={readonly} onClick={() => act("Connect", () => api.connect(inst.id), "Connecting…")}>
+          <Button size="sm" variant="outline" disabled={readonly} onClick={() => act("Connect", () => api.connect(inst.id), cloud ? "Validating credentials…" : "Connecting…")}>
             <Plug className="h-3.5 w-3.5" /> Connect
           </Button>
-          <Button size="sm" variant="outline" disabled={readonly} onClick={() => act("Reconnect", () => api.reconnect(inst.id), "Reconnect queued")}>
-            <RefreshCw className="h-3.5 w-3.5" /> Reconnect
+          <Button size="sm" variant="outline" disabled={readonly} onClick={() => act("Reconnect", () => api.reconnect(inst.id), cloud ? "Re-validating…" : "Reconnect queued")}>
+            <RefreshCw className="h-3.5 w-3.5" /> {cloud ? "Re-validate" : "Reconnect"}
           </Button>
           <Button size="sm" variant="outline" disabled={readonly} onClick={async () => {
             const url = await promptDialog({ title: "Set proxy", message: "Blank to clear. Takes effect on reconnect.", defaultValue: inst.proxy_url ?? "", placeholder: "http://user:pass@host:port", confirmLabel: "Save" })
@@ -69,18 +77,44 @@ export function OverviewPage({
           }}>
             <Database className="h-3.5 w-3.5" /> Set proxy
           </Button>
-          <Button size="sm" variant="outline" onClick={() => onNav("pairing")}>
-            <QrCode className="h-3.5 w-3.5" /> Pair
-          </Button>
+          {!cloud && (
+            <Button size="sm" variant="outline" onClick={() => onNav("pairing")}>
+              <QrCode className="h-3.5 w-3.5" /> Pair
+            </Button>
+          )}
           <Button size="sm" variant="destructive" disabled={readonly} onClick={async () => {
-            if (await confirmDialog({ title: "Log out this device?", message: `"${inst.label ?? inst.id}" will be unlinked.`, confirmLabel: "Logout", danger: true })) act("Logout", () => api.logout(inst.id), "Logged out")
+            if (await confirmDialog({
+              title: cloud ? "Log out this cloud session?" : "Log out this device?",
+              message: cloud
+                ? `"${inst.label ?? inst.id}" stops sending; credentials are kept — Connect re-validates.`
+                : `"${inst.label ?? inst.id}" will be unlinked.`,
+              confirmLabel: "Logout", danger: true,
+            })) act("Logout", () => api.logout(inst.id), "Logged out")
           }}>
             <Power className="h-3.5 w-3.5" /> Logout
           </Button>
         </div>
       </div>
 
-      {/* body: stat grid + liveness panel */}
+      {/* body: stat grid + liveness panel (web) / cloud API panel (cloud) */}
+      {cloud ? (
+        <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[1fr_360px]">
+          <div className="flex flex-col gap-4">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <StatCard label="Backend" value="CLOUD" accent="hsl(var(--st-progress))" />
+              <StatCard label="Status" value={inst.status === "connected" ? "READY" : inst.status.toUpperCase()} accent={`hsl(var(--st-${inst.status === "connected" ? "ok" : lv.kind === "progress" ? "progress" : "down"}))`} />
+              <StatCard label="Last webhook" value={fmtAgeShort(lastRxSec)} />
+              <StatCard label="Proxy" value={h?.proxy_configured ? "configured" : "none"} />
+              <StatCard label="Graph" value={inst.cloud?.graph_version ?? "—"} />
+              <StatCard label="Number" value={inst.cloud?.display_phone_number ? "+" + inst.cloud.display_phone_number.replace(/\D/g, "") : inst.jid ? "+" + inst.jid.split("@")[0].split(":")[0] : "—"} />
+            </div>
+            <CollapsibleSection title="Raw health JSON" icon={Terminal}>
+              {h ? <JsonBlock data={h} /> : <div className="text-xs text-muted-foreground">loading…</div>}
+            </CollapsibleSection>
+          </div>
+          <CloudApiPanel inst={inst} readonly={readonly} />
+        </div>
+      ) : (
       <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[1fr_320px]">
         <div className="flex flex-col gap-4">
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
@@ -145,6 +179,7 @@ export function OverviewPage({
           </div>
         </SectionCard>
       </div>
+      )}
     </div>
   )
 }

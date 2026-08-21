@@ -4,14 +4,39 @@ import { toast } from "sonner"
 import { RefreshCw, Check, Zap, Plug, Loader2, QrCode, Smartphone } from "lucide-react"
 import { api, ApiError } from "@/lib/api"
 import type { SessionMeta, SessionHealth } from "@/lib/types"
+import { isCloud } from "@/lib/types"
 import { StatusBadge } from "@/components/status"
+import { CloudApiPanel } from "@/components/cloud-panel"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 
 type Method = "qr" | "phone"
 
-export function PairingPage({ inst }: { inst: SessionMeta }) {
+export function PairingPage({ inst, readonly = false }: { inst: SessionMeta; readonly?: boolean }) {
+  if (isCloud(inst)) return <CloudPairingView inst={inst} readonly={readonly} />
+  return <WebPairingView inst={inst} />
+}
+
+/** Cloud API sessions don't pair: credentials are validated against Graph and
+ *  inbound arrives via webhook. Show the compact panel in place of QR/phone. */
+function CloudPairingView({ inst, readonly }: { inst: SessionMeta; readonly: boolean }) {
+  return (
+    <div>
+      <div className="mb-4">
+        <h1 className="text-xl font-semibold tracking-tight">Connection</h1>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          {inst.label ?? inst.id} uses the Meta Cloud API — no device to link. Validate the credentials and point the webhook here.
+        </div>
+      </div>
+      <div className="mx-auto max-w-[480px]">
+        <CloudApiPanel inst={inst} readonly={readonly} />
+      </div>
+    </div>
+  )
+}
+
+function WebPairingView({ inst }: { inst: SessionMeta }) {
   const qc = useQueryClient()
   const [method, setMethod] = useState<Method>("qr")
   const health = useQuery<SessionHealth>({
@@ -72,7 +97,73 @@ export function PairingPage({ inst }: { inst: SessionMeta }) {
           </>
         )}
       </Card>
+
+      <ProxyCard sessionId={inst.id} />
     </div>
+  )
+}
+
+/** Proxy address (non-sensitive) + a live reachability heartbeat. Shown on the
+ *  pairing screen so a bad proxy is obvious before/while linking. */
+export function ProxyCard({ sessionId }: { sessionId: string }) {
+  const info = useQuery({
+    queryKey: ["proxy", sessionId],
+    queryFn: () => api.getProxy(sessionId),
+  })
+  const [checking, setChecking] = useState(false)
+  const [result, setResult] = useState<Awaited<ReturnType<typeof api.checkProxy>> | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  async function runCheck() {
+    setChecking(true)
+    setErr(null)
+    try {
+      setResult(await api.checkProxy(sessionId))
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  const p = info.data?.proxy
+  const hintStr = p ? Object.entries(p.hints).map(([k, v]) => `${k}=${v}`).join(" · ") : ""
+
+  return (
+    <Card className="mx-auto mt-4 flex max-w-[420px] flex-col gap-3 p-5 text-sm">
+      <div className="flex items-center justify-between">
+        <div className="font-medium">Egress proxy</div>
+        <Button size="sm" variant="outline" onClick={runCheck} disabled={checking}>
+          {checking ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <Zap className="mr-1 h-3.5 w-3.5" />}
+          Test
+        </Button>
+      </div>
+
+      {info.isLoading ? (
+        <div className="text-muted-foreground">Loading…</div>
+      ) : !info.data?.configured ? (
+        <div className="text-muted-foreground">No proxy — connecting directly (server IP).</div>
+      ) : (
+        <div className="space-y-0.5">
+          <div><span className="text-muted-foreground">host</span> {p?.host}:{p?.port ?? "?"} <span className="text-muted-foreground">({p?.scheme}{p?.has_auth ? ", auth" : ""})</span></div>
+          {hintStr && <div><span className="text-muted-foreground">geo</span> {hintStr}</div>}
+        </div>
+      )}
+
+      {result && (
+        <div className={`rounded-md px-3 py-2 ${result.ok ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" : "bg-red-500/10 text-red-600 dark:text-red-400"}`}>
+          {result.ok ? (
+            <div className="flex items-center gap-2">
+              <Check className="h-4 w-4" />
+              <span>Reachable · {result.latency_ms}ms · exit IP {result.exit_ip ?? "?"}</span>
+            </div>
+          ) : (
+            <span>Proxy failed{result.status ? ` (HTTP ${result.status})` : ""}{result.error ? `: ${result.error}` : ""} · {result.latency_ms}ms</span>
+          )}
+        </div>
+      )}
+      {err && <div className="text-red-600 dark:text-red-400">{err}</div>}
+    </Card>
   )
 }
 

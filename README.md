@@ -10,6 +10,8 @@ speaks WhatsApp's multi-device (WhatsApp Web) protocol directly and exposes it a
 bearer-authed REST API with Server-Sent Events, webhooks, and Redis event streams.
 **No Baileys, no whatsmeow runtime, no FFI, no heavy SDKs** — Signal, Noise, the WA
 binary protocol, the Redis and S3 clients, and SigV4 are all implemented in-house.
+It can also drive numbers on Meta's **official Cloud API** (`kind=cloud` sessions)
+behind the very same API — see below.
 The result is a single **~9 MB binary** that idles at **~11 MB RAM** and runs many
 WhatsApp accounts at once.
 
@@ -99,7 +101,16 @@ caveats.
 - **Messaging** — text with **@mentions** and **reply/quote**, media
   (image/video/audio/ptt/document/sticker), **location**, **contact (vCard)**,
   **poll**, **calendar event**, reactions, edit, revoke.
-- **Multi-tenant sessions** — pair via QR or phone code, many accounts per instance, **per-tenant
+- **Meta Cloud API backend (`kind=cloud`)** — the *official* WhatsApp Business
+  Platform behind the **same `/v1/*` API and events**: create a session with a
+  `phone_number_id` + System User token instead of scanning a QR, and ruwa handles
+  the Graph calls, webhook signature checks, and media for you. See
+  [Meta WhatsApp Cloud API backend](#meta-whatsapp-cloud-api-official-backend).
+- **Template + interactive messages** — send approved **templates** (body params,
+  media headers, buttons), **interactive** button / list / CTA-URL messages, and
+  list / create / delete templates — on cloud sessions.
+- **Multi-tenant sessions** — pair via QR or phone code (web) or Meta Cloud API
+  credentials (cloud), many accounts per instance, **per-tenant
   API keys**, **per-session proxy**, graceful shutdown.
 - **Event egress** — live **SSE** stream, **webhooks** (HMAC-signed, retried,
   event-filtered), and **Redis** queues (RPUSH / PUBLISH) — pick one or all.
@@ -114,6 +125,11 @@ caveats.
   rest**, cross-instance **leasing** for multi-replica deployments.
 - **Ops** — `/health`, Prometheus `/metrics`, and a built-in dashboard (ruwa Console)
   served at `GET /`.
+- **Console** — record and send **voice notes (Ogg/Opus)**, **attach files**
+  (image / video / audio / document), and an optional **AI text assistant** that
+  rewrites a draft (improve, formal, casual, shorter, grammar, translate, custom) —
+  bring your own Anthropic or OpenAI-compatible key. See
+  [AI text assistant](#ai-text-assistant).
 - **Agent-ready (MCP)** — a first-party **Model Context Protocol** server (`mcp/`)
   exposing 39 tools so any MCP client (Claude, etc.) can create instances, pair them,
   send every message type, manage chats, and **search history by meaning** — no other
@@ -171,9 +187,11 @@ troubleshooting): [`mcp/INSTALL.md`](mcp/INSTALL.md); tool list: [`mcp/README.md
 
 **Not a fit**
 
-- You need the **official** WhatsApp Business Cloud API — Meta's compliance, SLAs,
-  template messaging at scale, and support. ruwa speaks the *unofficial* Web protocol.
-- You can't tolerate account-ban risk or operating in a ToS gray area.
+- You need Meta's compliance, SLAs, and support **without** running anything yourself
+  — ruwa's `kind=cloud` sessions do speak the official Cloud API, but you still
+  self-host ruwa (and bring your own Meta app / WABA).
+- You can't tolerate account-ban risk or operating in a ToS gray area (web sessions
+  only — cloud sessions use the official API).
 - You don't want to self-host or operate a service.
 - You need capabilities outside the WhatsApp Web multi-device protocol surface.
 
@@ -225,9 +243,213 @@ curl -H "Authorization: Bearer $RUWA_API_TOKEN" \
 | `RUWA_DB_ENCRYPTION_KEY` | unset | base64 32-byte key → encrypt secret columns |
 | `RUWA_MEDIA_STORE` | `db` | `s3` to offload media (needs `RUWA_S3_*`) |
 | `RUWA_LEASING` | unset | `1` enables cross-instance session leasing |
+| `RUWA_MODERN_LID_SEND` | unset | `1` enables the modern LID 1:1 stanza (`addressing_mode`/`phash`/`peer_recipient_pn`). Off by default — some servers reject it (error 479) for migrated peers; the default legacy stanza delivers |
+| `RUWA_PROXY_DOWNLOADS` | on | `0` routes media + history-sync **downloads** direct (off the session's egress proxy) to save metered proxy bandwidth; the WebSocket and uploads always stay on the proxy |
+| `RUWA_SKIP_REDUNDANT_HISTORY` | on | `0` disables the reconnect gate that skips re-downloading heavy history-sync chunks (BOOTSTRAP/FULL/RECENT) the phone re-pushes on reconnect |
+| `RUWA_CLOUD_VERIFY_TOKEN` | unset | Verify token Meta sends on the webhook subscription handshake (`GET /v1/cloud/webhook`). Unset → any cloud session's own `verify_token` is accepted |
+| `RUWA_CLOUD_ALLOW_UNSIGNED` | unset | `1` accepts Meta webhooks for cloud sessions created **without** an `app_secret` (no `X-Hub-Signature-256` check). Off by default — unsigned deliveries are rejected 401 |
 | `RUST_LOG` | `info` | Tracing filter |
 
 Full list (S3, leasing, retention, WA version override) in [`.env.example`](.env.example).
+
+### 1:1 delivery & privacy tokens
+
+Modern WhatsApp gates 1:1 messages to some peers (notably **business accounts** and
+**freshly re-paired** sessions) behind a per-contact *privacy token* (`tctoken`).
+Without it the server accepts the stanza but returns error **463 (MissingTcToken)**
+and never delivers it. ruwa captures that token automatically — from the contact's
+messages in real time, and from the HistorySync at (re)link — and echoes it back on
+every send. Practical consequence: for a **new or long-dormant** conversation with a
+gated peer, the contact has to message first (the normal customer-initiated flow),
+**or** the session must (re)link once to backfill every contact's token. Established,
+active chats are unaffected.
+Cloud sessions are unaffected (Meta's servers handle delivery; the equivalent
+constraint there is the 24-hour window + templates, below).
+
+## Meta WhatsApp Cloud API (official) backend
+
+Besides the WhatsApp Web protocol, ruwa can drive a number registered on Meta's
+**WhatsApp Business Platform (Cloud API)**. A session created with `"kind": "cloud"`
+talks to the Graph API instead of a WhatsApp socket, but exposes the **same
+`/v1/sessions/:id/*` routes, the same message/contact/chat tables and the same events**
+(SSE / webhooks / Redis) — consumers only notice capability differences.
+
+**When to use which**
+
+| | `kind=web` (default) | `kind=cloud` |
+|---|---|---|
+| What it is | unofficial WhatsApp Web multi-device client (QR / phone-code pairing) | official Meta Cloud API (Graph) client |
+| Account | any personal / business number you can link | a number registered in a WhatsApp Business Account (WABA) |
+| Ban / ToS risk | yes | none (official) |
+| Cost | free | Meta per-template pricing; free-form replies inside the 24 h window are free |
+| Groups, presence, history, polls, edit/revoke | yes | no (see matrix) |
+| Templates, interactive messages, delivery SLAs | no | yes |
+
+**Prerequisites** (Meta side, one-time)
+
+1. A Meta developer app with the **WhatsApp** product added, and a **WABA** with a
+   registered phone number → note the `phone_number_id` and `waba_id`.
+2. A **System User** access token (permanent) with `whatsapp_business_messaging` +
+   `whatsapp_business_management` — the `access_token`.
+3. The app's **App Secret** (App settings → Basic) — the `app_secret`, used to verify
+   `X-Hub-Signature-256` on inbound webhooks. Optional but strongly recommended;
+   without it webhooks are rejected unless `RUWA_CLOUD_ALLOW_UNSIGNED=1`.
+4. Webhook configuration (App → WhatsApp → Configuration): **Callback URL** =
+   `https://<your-ruwa-host>/v1/cloud/webhook`, **Verify token** = the value of
+   `RUWA_CLOUD_VERIFY_TOKEN` (or the session's `verify_token`), then **subscribe the
+   `messages` field**. ruwa must be reachable from the internet over HTTPS for this.
+
+**Create + connect**
+
+```sh
+# 1. create the session (secrets are stored sealed and never returned by the API)
+curl -H "Authorization: Bearer $RUWA_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"label":"acme-support","kind":"cloud",
+       "cloud":{"phone_number_id":"106540352242922","waba_id":"102290129340398",
+                "access_token":"EAAG...","app_secret":"abcd1234...",
+                "verify_token":"my-verify-token","graph_version":"v25.0"}}' \
+  http://127.0.0.1:8080/v1/sessions
+# → 201 {"id":"<id>","kind":"cloud","cloud":{"phone_number_id":"106540352242922",...},"api_key":"..."}
+
+# 2. connect = validate the credentials against Graph (no QR); status → connected
+curl -X POST -H "Authorization: Bearer $RUWA_API_TOKEN" http://127.0.0.1:8080/v1/sessions/<id>/connect
+```
+
+Credentials can be rotated later with `PUT /v1/sessions/:id/cloud` (same `cloud`
+object; only the fields you send are replaced) — then `POST …/reconnect` to
+re-validate against Graph (`connect` is a no-op on an already-connected session).
+A Meta `phone_number_id` belongs to exactly one session (409 otherwise), and
+changing it requires the master token.
+
+**Send** — the regular endpoints work unchanged; sends are synchronous and the
+returned `id` is Meta's `wamid`:
+
+```sh
+# free-form text (only inside the 24 h customer-service window)
+curl -H "Authorization: Bearer $RUWA_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"to":"5511999999999","text":"hello from ruwa"}' \
+  http://127.0.0.1:8080/v1/sessions/<id>/messages
+# → 202 {"id":"wamid.HBgLNTUxMTk5OTk5OTk5ORUCABEYEj...","timestamp":1755500000,"status":"sent"}
+
+# approved template (works outside the window)
+curl -H "Authorization: Bearer $RUWA_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"to":"5511999999999","name":"order_update","language":"pt_BR",
+       "body_params":["Ana","1234"],
+       "buttons":[{"index":0,"sub_type":"quick_reply","payload":"TRACK"}]}' \
+  http://127.0.0.1:8080/v1/sessions/<id>/messages/template
+
+# interactive reply buttons (also "list" and "cta_url")
+curl -H "Authorization: Bearer $RUWA_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"to":"5511999999999","type":"button","body":"Confirm your booking?",
+       "buttons":[{"id":"yes","title":"Yes"},{"id":"no","title":"No"}]}' \
+  http://127.0.0.1:8080/v1/sessions/<id>/messages/interactive
+
+# templates: list (proxy of the WABA's message_templates), create, delete
+curl -H "Authorization: Bearer $RUWA_API_TOKEN" \
+  'http://127.0.0.1:8080/v1/sessions/<id>/templates?status=APPROVED&limit=50'
+# → {"templates":[{"id":"...","name":"order_update","language":"pt_BR","status":"APPROVED","category":"UTILITY","components":[...]}],"next":null}
+```
+
+`header` (text / image / video / document), `components` (raw Cloud-native
+components array, used verbatim when present) and `reply_to` are accepted on
+`/messages/template`; see [`SPEC.md`](SPEC.md) for the full request shapes.
+Inbound messages, template button taps (`type: "button"`) and interactive replies
+(`type: "interactive"`) arrive as normal `message` events; delivery receipts arrive
+as `message_sent` / `message_delivered` / `message_read` / `message_failed`.
+
+**Capability matrix**
+
+| Feature | `web` | `cloud` |
+|---|---|---|
+| Text (reply/quote) | ✅ | ✅ (`mentions` ignored) |
+| Media (image/video/audio/ptt/document/sticker) | ✅ | ✅ (uploaded to Meta, sent by media id; inbound fetched lazily via `…/media`) |
+| Location | ✅ | ✅ |
+| Contact (vCard) | ✅ | ✅ |
+| Reaction | ✅ | ✅ |
+| Read receipts (`chats/:chat/read`) | ✅ | ✅ |
+| Typing (`chats/:chat/typing`) | ✅ | ✅ (25 s indicator, attached to the last inbound message; 400 if none) |
+| Template messages | — | ✅ |
+| Interactive (button / list / cta_url) | — | ✅ |
+| Edit / revoke | ✅ | 501 (no Cloud API endpoint) |
+| Polls / calendar events | ✅ | 501 |
+| Groups | ✅ | `[]` (Groups API not wired) |
+| Presence (online / last seen) | ✅ | 501 |
+| History backfill | ✅ | 501 (Meta keeps no history) |
+| onWhatsApp check | ✅ | 501 (Meta reports `131026` asynchronously instead) |
+| Profile picture / block / own profile | ✅ | 501 |
+| QR / phone-code pairing, resync-appstate, mark-online | ✅ | 501 |
+
+**24-hour window & templates.** Meta only lets you send free-form (service)
+messages within **24 h of the customer's last message**. Outside that window only
+**approved templates** go through — Graph answers with error `131047`, which ruwa
+maps to **`400 cloud: 131047 outside 24h customer-service window — send a template`**.
+Other mappings: `190`/`401` → `401`; `100`, `131008/131009`, `132000/132001/132012/132018`
+(bad params / template mismatch), `131026` (undeliverable), `131030` (recipient not
+in the sandbox allow-list) → `400`; `130429`, `131056`, `80007` (rate limits) → `409`;
+anything else → `500` with the Graph code + message. Failed sends return the error
+and persist **no** row; asynchronous failures come back as `message_failed`
+events (`reason: "<code>: <title>"`).
+
+## AI text assistant
+
+An optional, instance-wide writing assistant behind the Console's composer (the ✨
+"Improve" menu) and a plain HTTP endpoint. It rewrites a draft WhatsApp message —
+*improve*, *more formal*, *more casual*, *shorter*, *fix grammar*, *translate to…*,
+or a *custom* instruction — by calling an LLM provider you configure: **Anthropic**
+(Messages API) or any **OpenAI-compatible** `/chat/completions` endpoint (OpenAI,
+OpenRouter, Groq, Ollama, …). Raw HTTP, no SDK; nothing leaves your box except the
+draft sent to the provider you chose.
+
+- **Admin-only**: every `/v1/settings/ai*` and `/v1/ai/*` route accepts only
+  `RUWA_API_TOKEN` (a per-session `api_key` gets 401).
+- **The key is stored sealed server-side** (`app_settings`, encrypted at rest when
+  `RUWA_DB_ENCRYPTION_KEY` is set) and **never returned** — `GET` exposes only a
+  `••••abcd` hint. `PUT`/`DELETE` respect `RUWA_READONLY`.
+- Off until you configure it: the composer button is disabled and
+  `POST /v1/ai/improve-text` answers `400 {"error":"ai assistant not configured — set it via PUT /v1/settings/ai"}`.
+
+Configure — Anthropic (model defaults to `claude-opus-5`, base URL to
+`https://api.anthropic.com`):
+
+```sh
+curl -X PUT localhost:8080/v1/settings/ai \
+  -H "Authorization: Bearer $RUWA_API_TOKEN" -H 'content-type: application/json' \
+  -d '{"provider":"anthropic","api_key":"sk-ant-api03-EXAMPLE-not-a-real-key"}'
+# → {"configured":true,"provider":"anthropic","model":"claude-opus-5",
+#    "base_url":"https://api.anthropic.com","system_prompt":null,"api_key_hint":"••••-key"}
+```
+
+Configure — OpenAI-compatible (`model` is required; `base_url` defaults to
+`https://api.openai.com/v1`, point it at OpenRouter / Groq / Ollama instead):
+
+```sh
+curl -X PUT localhost:8080/v1/settings/ai \
+  -H "Authorization: Bearer $RUWA_API_TOKEN" -H 'content-type: application/json' \
+  -d '{"provider":"openai","api_key":"sk-EXAMPLE-not-a-real-key","model":"gpt-4o-mini",
+       "base_url":"https://openrouter.ai/api/v1",
+       "system_prompt":"You rewrite WhatsApp messages for a barber shop; keep it warm and short."}'
+```
+
+`api_key` may be omitted on a later `PUT` to keep the stored key (same provider);
+`system_prompt` overrides the built-in WhatsApp-tuned prompt. Check the wiring with
+`POST /v1/settings/ai/test` (`{"ok":true,"provider","model","latency_ms","reply"}`)
+and remove everything with `DELETE /v1/settings/ai` (204).
+
+Rewrite a draft:
+
+```sh
+curl -X POST localhost:8080/v1/ai/improve-text \
+  -H "Authorization: Bearer $RUWA_API_TOKEN" -H 'content-type: application/json' \
+  -d '{"text":"hey, ur appointment is tmrw 3pm, pls confirm","mode":"formal"}'
+# → {"text":"Hi! Your appointment is tomorrow at 3 pm — could you please confirm?",
+#    "provider":"anthropic","model":"claude-opus-5"}
+```
+
+`mode` is one of `improve` (default) · `formal` · `casual` · `shorter` · `grammar` ·
+`translate` (needs `"language":"pt-BR"`) · `custom` (needs `"instruction"`, ≤ 500
+chars); `text` is 1–8000 chars. Upstream failures come back as
+`502 {"error":"ai upstream: <status> <message>"}`; a model refusal as
+`422 {"error":"ai declined to rewrite this text"}`.
 
 ## Contributing
 

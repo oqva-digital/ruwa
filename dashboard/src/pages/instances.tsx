@@ -3,13 +3,16 @@ import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 import {
   Search, Plus, Upload, MoreHorizontal, ExternalLink, Plug, Power, Trash2,
-  Snowflake, Inbox, Copy, CheckCircle2, TriangleAlert, Loader2, Pencil,
+  Snowflake, Inbox, Copy, CheckCircle2, TriangleAlert, Loader2, Pencil, Cloud, Smartphone,
 } from "lucide-react"
 import { Textarea } from "@/components/ui/textarea"
 import { api, ApiError } from "@/lib/api"
-import type { SessionMeta, SessionHealth } from "@/lib/types"
+import type { SessionMeta, SessionHealth, SessionKind } from "@/lib/types"
+import { isCloud } from "@/lib/types"
+import { cloudWebhookUrl, validateCloudForm, cloudFormToInput, EMPTY_CLOUD, type CloudForm } from "@/lib/cloud"
+import { CloudFields } from "@/components/cloud-fields"
 import { cn } from "@/lib/utils"
-import { StatusBadge, LivenessChip } from "@/components/status"
+import { StatusBadge, LivenessChip, KindBadge } from "@/components/status"
 import { confirmDialog } from "@/components/confirm"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -38,7 +41,7 @@ export function InstancesPage({ onOpen, readonly }: { onOpen: (id: string) => vo
   const [filter, setFilter] = useState<Filter>("all")
   const [showCreate, setShowCreate] = useState(false)
   const [showImport, setShowImport] = useState(false)
-  const [createdKey, setCreatedKey] = useState<string | null>(null)
+  const [created, setCreated] = useState<{ key: string; kind: SessionKind } | null>(null)
 
   const sessions = useQuery({
     queryKey: ["sessions"],
@@ -180,9 +183,9 @@ export function InstancesPage({ onOpen, readonly }: { onOpen: (id: string) => vo
       <CreateDialog
         open={showCreate}
         onClose={() => setShowCreate(false)}
-        onCreated={(key) => {
+        onCreated={(key, kind) => {
           setShowCreate(false)
-          setCreatedKey(key)
+          setCreated({ key, kind })
           qc.invalidateQueries({ queryKey: ["sessions"] })
         }}
       />
@@ -191,11 +194,11 @@ export function InstancesPage({ onOpen, readonly }: { onOpen: (id: string) => vo
         onClose={() => setShowImport(false)}
         onImported={(key) => {
           setShowImport(false)
-          setCreatedKey(key)
+          setCreated({ key, kind: "web" })
           qc.invalidateQueries({ queryKey: ["sessions"] })
         }}
       />
-      <KeyDialog apiKey={createdKey} onClose={() => setCreatedKey(null)} />
+      <KeyDialog apiKey={created?.key ?? null} kind={created?.kind ?? "web"} onClose={() => setCreated(null)} />
     </div>
   )
 }
@@ -225,7 +228,9 @@ function InstanceRow({
 
   const lastRxSec = health.data?.seconds_since_rx ?? null
   const recon = health.data?.reconnect_count ?? 0
-  const frozen = s.status === "connected" && lastRxSec != null && lastRxSec >= 75
+  const cloud = isCloud(s)
+  // Cloud sessions have no socket → no rx-idle "frozen" verdict.
+  const frozen = !cloud && s.status === "connected" && lastRxSec != null && lastRxSec >= 75
 
   const [renaming, setRenaming] = useState(false)
   const [renameVal, setRenameVal] = useState(s.label ?? "")
@@ -261,7 +266,12 @@ function InstanceRow({
   return (
     <>
     <TableRow className="cursor-pointer" onClick={() => onOpen(s.id)}>
-      <TableCell className="font-medium">{s.label || "(no label)"}</TableCell>
+      <TableCell className="font-medium">
+        <span className="inline-flex items-center gap-2">
+          {s.label || "(no label)"}
+          {cloud && <KindBadge kind="cloud" />}
+        </span>
+      </TableCell>
       <TableCell>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -271,15 +281,19 @@ function InstanceRow({
         </Tooltip>
       </TableCell>
       <TableCell><StatusBadge status={s.status} /></TableCell>
-      <TableCell><span className="mono text-[11px] text-muted-foreground">{jidPhone(s.jid)}</span></TableCell>
+      <TableCell>
+        <span className="mono text-[11px] text-muted-foreground">
+          {cloud && s.cloud?.display_phone_number ? "+" + s.cloud.display_phone_number.replace(/\D/g, "") : jidPhone(s.jid)}
+        </span>
+      </TableCell>
       <TableCell>
         {health.isLoading ? (
           <span className="text-xs text-muted-foreground">…</span>
         ) : (
-          <LivenessChip status={s.status} lastRxSec={lastRxSec} />
+          <LivenessChip status={s.status} lastRxSec={lastRxSec} kind={s.kind} />
         )}
       </TableCell>
-      <TableCell className="mono tnum text-right">{recon}</TableCell>
+      <TableCell className="mono tnum text-right">{cloud ? "—" : recon}</TableCell>
       <TableCell className="text-center">
         <Tooltip>
           <TooltipTrigger asChild>
@@ -310,16 +324,22 @@ function InstanceRow({
             </DropdownMenuItem>
             <DropdownMenuItem
               disabled={readonly}
-              onClick={() => act("Connect", () => api.connect(s.id), "Connecting…")}
+              onClick={() => act("Connect", () => api.connect(s.id), cloud ? "Validating credentials…" : "Connecting…")}
             >
-              <Plug className="h-4 w-4" /> Connect
+              <Plug className="h-4 w-4" /> {cloud ? "Connect (validate)" : "Connect"}
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem
               variant="destructive"
               disabled={readonly}
               onClick={async () => {
-                if (await confirmDialog({ title: "Log out this device?", message: `"${s.label ?? s.id}" will be unlinked.`, confirmLabel: "Logout", danger: true }))
+                if (await confirmDialog({
+                  title: cloud ? "Log out this cloud session?" : "Log out this device?",
+                  message: cloud
+                    ? `"${s.label ?? s.id}" stops sending; credentials are kept — Connect re-validates.`
+                    : `"${s.label ?? s.id}" will be unlinked.`,
+                  confirmLabel: "Logout", danger: true,
+                }))
                   act("Logout", () => api.logout(s.id), "Logged out")
               }}
             >
@@ -369,24 +389,61 @@ function InstanceRow({
   )
 }
 
+/** Pill toggle for the session backend — same look as the pairing QR/phone toggle. */
+function KindToggle({ kind, onChange }: { kind: SessionKind; onChange: (k: SessionKind) => void }) {
+  const opt = (k: SessionKind, icon: React.ReactNode, label: string, sub: string) => (
+    <button
+      type="button"
+      onClick={() => onChange(k)}
+      className={`flex flex-1 flex-col items-center justify-center gap-0.5 rounded-md px-3 py-1.5 transition-colors ${
+        kind === k ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      <span className="flex items-center gap-1.5 text-[13px] font-medium">{icon}{label}</span>
+      <span className="text-[10.5px] font-normal text-muted-foreground">{sub}</span>
+    </button>
+  )
+  return (
+    <div className="flex w-full gap-1 rounded-lg bg-secondary p-1">
+      {opt("web", <Smartphone className="h-3.5 w-3.5" />, "WhatsApp Web", "QR / phone-code pairing")}
+      {opt("cloud", <Cloud className="h-3.5 w-3.5" />, "Cloud API", "Meta Graph credentials")}
+    </div>
+  )
+}
+
 function CreateDialog({
   open, onClose, onCreated,
 }: {
   open: boolean
   onClose: () => void
-  onCreated: (key: string) => void
+  onCreated: (key: string, kind: SessionKind) => void
 }) {
   const [label, setLabel] = useState("")
   const [proxy, setProxy] = useState("")
+  const [kind, setKind] = useState<SessionKind>("web")
+  const [cloud, setCloud] = useState<CloudForm>(EMPTY_CLOUD)
+  const [touched, setTouched] = useState(false)
   const [busy, setBusy] = useState(false)
 
+  const errors = kind === "cloud" ? validateCloudForm(cloud, true) : {}
+  const hasErrors = Object.keys(errors).length > 0
+
+  function reset() {
+    setLabel(""); setProxy(""); setKind("web"); setCloud(EMPTY_CLOUD); setTouched(false)
+  }
+
   async function create() {
+    setTouched(true)
+    if (hasErrors) return
     setBusy(true)
     try {
-      const res = await api.createSession(label.trim() || null, proxy.trim() || null)
-      onCreated(res.api_key ?? "")
-      setLabel("")
-      setProxy("")
+      const res = await api.createSession({
+        label: label.trim() || null,
+        proxy: proxy.trim() || null,
+        ...(kind === "cloud" ? { kind, cloud: cloudFormToInput(cloud, true) } : {}),
+      })
+      onCreated(res.api_key ?? "", kind)
+      reset()
     } catch (e) {
       toast.error("Create failed", { description: e instanceof Error ? e.message : "" })
     } finally {
@@ -396,12 +453,17 @@ function CreateDialog({
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
-      <DialogContent>
+      <DialogContent className={cn(kind === "cloud" && "max-w-[560px]")}>
         <DialogHeader>
           <DialogTitle>Create instance</DialogTitle>
-          <DialogDescription>Spins up a new WhatsApp session. The API key is shown once.</DialogDescription>
+          <DialogDescription>
+            {kind === "cloud"
+              ? "Connects a Meta WhatsApp Cloud API number. No QR — inbound arrives via webhook. The API key is shown once."
+              : "Spins up a new WhatsApp session. The API key is shown once."}
+          </DialogDescription>
         </DialogHeader>
-        <div className="space-y-3.5 py-1">
+        <div className="max-h-[70vh] space-y-3.5 overflow-y-auto py-1 pr-0.5">
+          <KindToggle kind={kind} onChange={setKind} />
           <div>
             <Label className="mb-1.5 block">Label</Label>
             <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="e.g. Main Account" autoFocus />
@@ -409,13 +471,26 @@ function CreateDialog({
           <div>
             <Label className="mb-1.5 block">Proxy URL <span className="text-muted-foreground">· optional</span></Label>
             <Input className="mono text-xs" value={proxy} onChange={(e) => setProxy(e.target.value)} placeholder="http://user:pass@host:port" />
+            {kind === "cloud" && (
+              <p className="mt-1 text-[12px] text-muted-foreground">Used for outbound Graph API calls.</p>
+            )}
           </div>
+          {kind === "cloud" && (
+            <CloudFields c={cloud} onChange={setCloud} errors={touched ? errors : {}} forCreate />
+          )}
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>Cancel</Button>
-          <Button disabled={busy} onClick={create}>
-            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />} Create
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span>
+                <Button disabled={busy || (touched && hasErrors)} onClick={create}>
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />} Create
+                </Button>
+              </span>
+            </TooltipTrigger>
+            {touched && hasErrors && <TooltipContent>Fix the highlighted fields</TooltipContent>}
+          </Tooltip>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -492,7 +567,7 @@ function ImportDialog({
   )
 }
 
-function KeyDialog({ apiKey, onClose }: { apiKey: string | null; onClose: () => void }) {
+function KeyDialog({ apiKey, kind, onClose }: { apiKey: string | null; kind: SessionKind; onClose: () => void }) {
   const [copied, setCopied] = useState(false)
   return (
     <Dialog open={!!apiKey} onOpenChange={(o) => !o && onClose()}>
@@ -526,6 +601,16 @@ function KeyDialog({ apiKey, onClose }: { apiKey: string | null; onClose: () => 
               Shown <b>only once</b>. Store it now — you can't retrieve it later, only rotate.
             </div>
           </div>
+          {kind === "cloud" && (
+            <div className="mt-3 flex items-start gap-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2.5 text-[12.5px]">
+              <Cloud className="mt-0.5 h-3.5 w-3.5 flex-none text-muted-foreground" />
+              <div>
+                <b>Next:</b> point the Meta app's webhook at{" "}
+                <span className="mono select-all break-all text-[11px]">{cloudWebhookUrl()}</span> and open the
+                instance → <b>Connect</b> to validate the credentials.
+              </div>
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button onClick={onClose}>I've saved it</Button>

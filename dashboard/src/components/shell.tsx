@@ -7,6 +7,7 @@ import {
   Settings,
   Activity,
   QrCode,
+  Cloud,
   MessageSquare,
   Users,
   Webhook,
@@ -31,7 +32,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command"
 import { LivenessChip, StatusDot } from "@/components/status"
 import { ageSec, liveness } from "@/lib/format"
-import type { SessionMeta } from "@/lib/types"
+import type { SessionMeta, SessionKind } from "@/lib/types"
 
 export type GlobalPage = "instances" | "metrics" | "logs" | "diagnostics" | "settings"
 export type InstancePage =
@@ -161,7 +162,7 @@ function InstanceSwitcher({
   onPick: (id: string) => void
 }) {
   const [open, setOpen] = useState(false)
-  const lk = liveness(current.status, ageSec(current.updated_at)).kind
+  const lk = liveness(current.status, ageSec(current.updated_at), current.kind).kind
   const stKey = lk === "live" ? "ok" : lk === "frozen" ? "frozen" : lk === "down" ? "down" : "progress"
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -225,7 +226,7 @@ export function InstanceTopBar({
       <ChevronRight className="hidden h-[13px] w-[13px] flex-none text-muted-foreground/60 sm:block" />
       <InstanceSwitcher instances={instances} current={current} onPick={onPick} />
       <div className="hidden sm:block">
-        <LivenessChip status={current.status} lastRxSec={lastRxSec} />
+        <LivenessChip status={current.status} lastRxSec={lastRxSec} kind={current.kind} />
       </div>
       <div className="flex-1" />
       <RightCluster {...cluster} />
@@ -234,7 +235,7 @@ export function InstanceTopBar({
 }
 
 export function InstanceSidebar({
-  ipage, onNav, collapsed, onToggle, mobileOpen, onMobileClose,
+  ipage, onNav, collapsed, onToggle, mobileOpen, onMobileClose, kind,
 }: {
   ipage: InstancePage
   onNav: (p: InstancePage) => void
@@ -242,7 +243,13 @@ export function InstanceSidebar({
   onToggle: () => void
   mobileOpen: boolean
   onMobileClose: () => void
+  kind?: SessionKind
 }) {
+  // Cloud API sessions have no device to pair (the page becomes "Connection")
+  // and no WA-Web profile to edit.
+  const nav = kind === "cloud"
+    ? INSTANCE_NAV.filter((n) => n.key !== "profile").map((n) => (n.key === "pairing" ? { ...n, label: "Connection", icon: Cloud } : n))
+    : INSTANCE_NAV
   return (
     <>
       {/* Mobile backdrop — tap to dismiss the drawer. */}
@@ -265,7 +272,7 @@ export function InstanceSidebar({
         )}
       >
         <nav className="flex flex-1 flex-col gap-0.5 overflow-y-auto p-2">
-          {INSTANCE_NAV.map((n) => {
+          {nav.map((n) => {
             const active = ipage === n.key
             const Ico = n.icon
             const btn = (

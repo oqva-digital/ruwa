@@ -14,6 +14,10 @@
 //!   [`event_to_payload`]. The `data` object is the event's fields minus the
 //!   relocated `type` tag.
 //!
+//! Also home to [`ai`] — the Console's AI text assistant (outbound LLM HTTP
+//! calls to Anthropic / OpenAI-compatible endpoints), kept here because it is
+//! another outbound third-party HTTP integration.
+//!
 //! Item A2 lands the serializer + the SSE seam; the delivery worker, signing,
 //! retry, and the queue transports arrive in A4–B (hence the `#[allow(dead_code)]`
 //! on the egress-only helpers until their callers exist).
@@ -75,14 +79,10 @@ fn target_url(t: &EgressTarget) -> Option<String> {
         .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(str::to_string))
 }
 
-/// Hex-encoded HMAC-SHA256 of `msg` under `key`.
+/// Hex-encoded HMAC-SHA256 of `msg` under `key` (shared with the Cloud API
+/// webhook signature check — one implementation for both directions).
 fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    let mut mac =
-        <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts a key of any length");
-    mac.update(msg);
-    hex::encode(mac.finalize().into_bytes())
+    crate::cloud::hmac_sha256_hex(key, msg)
 }
 
 /// POST one payload to a webhook target. Returns `Ok(())` on a 2xx response.
@@ -638,6 +638,954 @@ impl EgressTransport for RedisTransport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AI text assistant — outbound third-party LLM HTTP integration
+// ---------------------------------------------------------------------------
+
+/// The Console's AI text assistant: rewrites a draft WhatsApp message
+/// ("improve", "more formal", "translate to …") by calling an LLM provider over
+/// raw HTTP — Anthropic's Messages API or any OpenAI-compatible
+/// `/chat/completions` endpoint (OpenAI, OpenRouter, Groq, Ollama, …).
+///
+/// Lives in `egress` because, like webhooks and Redis, it is an *outbound*
+/// third-party HTTP integration (and `src/` is capped at ten files). The
+/// instance-wide config (`AiConfig`) is stored sealed under the `app_settings`
+/// key [`SETTING_KEY`]; the HTTP surface (`/v1/settings/ai`,
+/// `/v1/ai/improve-text`) lives in `api.rs`. No SDK: request bodies and
+/// response parsing are hand-rolled and unit-tested against fixtures here.
+pub mod ai {
+    use std::time::{Duration, Instant};
+
+    use serde::{Deserialize, Serialize};
+    use serde_json::{json, Value};
+
+    /// `app_settings.key` under which the JSON-encoded [`AiConfig`] lives.
+    pub const SETTING_KEY: &str = "ai";
+    /// Default model for the Anthropic provider (the OpenAI-compatible provider
+    /// has no sensible default — gateways differ — so its model is required).
+    pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-5";
+    pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+    pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+    /// Hard cap on the draft passed to `improve-text` (chars).
+    pub const MAX_TEXT_CHARS: usize = 8000;
+    /// Hard cap on a `custom` mode instruction (chars).
+    pub const MAX_INSTRUCTION_CHARS: usize = 500;
+    /// Hard cap on a `translate` mode target language (chars).
+    pub const MAX_LANGUAGE_CHARS: usize = 64;
+    /// Per-request upstream timeout. A timed-out attempt is NOT retried: the
+    /// model already spent ~a minute on it, a second pass would just double
+    /// the bill and the wait.
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+    /// Retries on 429 / 5xx / connection failures (in addition to the first
+    /// attempt).
+    const MAX_RETRIES: u32 = 2;
+    /// Backoff before retry `n` (1-based): 500 ms, 1 s.
+    const RETRY_BASE: Duration = Duration::from_millis(500);
+    /// Anthropic API version header value.
+    const ANTHROPIC_VERSION: &str = "2023-06-01";
+    /// Beta header enabling server-side refusal fallbacks (`"fallbacks":
+    /// "default"`) on the Opus 5 / Fable 5 family.
+    const ANTHROPIC_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+    /// Max output tokens requested from the model. A ceiling, not a target:
+    /// on Opus 5 adaptive thinking is always on and its tokens count against
+    /// `max_tokens`, so a tight cap would truncate long rewrites (the draft is
+    /// up to 8000 chars). Truncation is detected and reported, never returned
+    /// as if it were the full rewrite.
+    const MAX_OUTPUT_TOKENS: u32 = 16000;
+    /// Max chars of an upstream error message echoed back to the client.
+    const ERROR_EXCERPT_CHARS: usize = 200;
+
+    /// Default system prompt when `AiConfig.system_prompt` is unset.
+    pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a writing assistant for WhatsApp messages \
+sent by a business or person. Rewrite the user's draft according to the instruction. Keep the \
+original meaning, language and tone register unless the instruction says otherwise; preserve \
+names, numbers, dates, prices, links, emojis and line breaks that carry meaning. Keep it natural \
+for WhatsApp (short paragraphs, no markdown headings). Output ONLY the rewritten message — no \
+preamble, no quotes, no explanations.";
+
+    /// Which upstream API dialect to speak.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Provider {
+        Anthropic,
+        Openai,
+    }
+
+    impl Provider {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Provider::Anthropic => "anthropic",
+                Provider::Openai => "openai",
+            }
+        }
+
+        pub fn default_base_url(self) -> &'static str {
+            match self {
+                Provider::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
+                Provider::Openai => DEFAULT_OPENAI_BASE_URL,
+            }
+        }
+
+        /// Default model, when the provider has one.
+        pub fn default_model(self) -> Option<&'static str> {
+            match self {
+                Provider::Anthropic => Some(DEFAULT_ANTHROPIC_MODEL),
+                Provider::Openai => None,
+            }
+        }
+    }
+
+    /// Instance-wide assistant configuration, JSON-encoded under
+    /// `app_settings['ai']` (sealed at rest — it carries the API key).
+    #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct AiConfig {
+        pub provider: Provider,
+        pub api_key: String,
+        pub model: String,
+        /// `None` → the provider default.
+        #[serde(default)]
+        pub base_url: Option<String>,
+        /// `None` → [`DEFAULT_SYSTEM_PROMPT`].
+        #[serde(default)]
+        pub system_prompt: Option<String>,
+    }
+
+    /// Hand-rolled so a stray `{:?}` (log line, `assert_eq!` failure, panic
+    /// message) can never print the key — only its masked hint.
+    impl std::fmt::Debug for AiConfig {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AiConfig")
+                .field("provider", &self.provider)
+                .field("api_key", &self.api_key_hint())
+                .field("model", &self.model)
+                .field("base_url", &self.base_url)
+                .field("system_prompt", &self.system_prompt)
+                .finish()
+        }
+    }
+
+    impl AiConfig {
+        /// Base URL actually used for requests (explicit or provider default),
+        /// with any trailing slash removed so path joins are predictable.
+        pub fn effective_base_url(&self) -> String {
+            let raw = self
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| self.provider.default_base_url());
+            raw.trim_end_matches('/').to_string()
+        }
+
+        /// The system prompt in force (custom or default).
+        pub fn effective_system_prompt(&self) -> &str {
+            self.system_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_SYSTEM_PROMPT)
+        }
+
+        /// `••••abcd` — the last four chars of the key, never more. Keys shorter
+        /// than eight chars are fully masked (a 4-char tail would be the key).
+        pub fn api_key_hint(&self) -> String {
+            api_key_hint(&self.api_key)
+        }
+    }
+
+    /// Mask an API key for display: `••••` + last four chars (or all dots when
+    /// the key is too short for a tail to be safe).
+    pub fn api_key_hint(key: &str) -> String {
+        let chars: Vec<char> = key.chars().collect();
+        if chars.len() < 8 {
+            return "••••".to_string();
+        }
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("••••{tail}")
+    }
+
+    /// What to do with the draft.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum AiMode {
+        #[default]
+        Improve,
+        Formal,
+        Casual,
+        Shorter,
+        Grammar,
+        Translate,
+        Custom,
+    }
+
+    /// Turn a mode (+ its optional argument) into the instruction line of the
+    /// user prompt. `Err(msg)` is a caller error (400): `translate` needs a
+    /// `language`, `custom` needs a non-empty `instruction` ≤ 500 chars.
+    pub fn mode_instruction(
+        mode: AiMode,
+        language: Option<&str>,
+        instruction: Option<&str>,
+    ) -> Result<String, String> {
+        Ok(match mode {
+            AiMode::Improve => {
+                "Improve clarity, flow and correctness while keeping the same length and tone."
+                    .to_string()
+            }
+            AiMode::Formal => "Make it more formal and professional.".to_string(),
+            AiMode::Casual => "Make it more casual and friendly.".to_string(),
+            AiMode::Shorter => {
+                "Make it significantly shorter without losing key information.".to_string()
+            }
+            AiMode::Grammar => {
+                "Fix spelling, grammar and punctuation only; change nothing else.".to_string()
+            }
+            AiMode::Translate => {
+                let lang = language
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "mode=translate requires \"language\"".to_string())?;
+                if lang.chars().count() > MAX_LANGUAGE_CHARS {
+                    return Err(format!(
+                        "\"language\" must be at most {MAX_LANGUAGE_CHARS} characters"
+                    ));
+                }
+                format!("Translate it to {lang}.")
+            }
+            AiMode::Custom => {
+                let ins = instruction
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "mode=custom requires \"instruction\"".to_string())?;
+                if ins.chars().count() > MAX_INSTRUCTION_CHARS {
+                    return Err(format!(
+                        "\"instruction\" must be at most {MAX_INSTRUCTION_CHARS} characters"
+                    ));
+                }
+                ins.to_string()
+            }
+        })
+    }
+
+    /// The user turn sent to the model.
+    pub fn build_user_prompt(instruction: &str, text: &str) -> String {
+        format!("Instruction: {instruction}\n\nDraft:\n{text}")
+    }
+
+    /// Normalize the model's answer: trim whitespace and strip one layer of
+    /// surrounding quotes (models sometimes quote the rewrite despite the
+    /// "no quotes" instruction).
+    pub fn clean_reply(raw: &str) -> String {
+        let stripped = strip_reasoning_blocks(raw);
+        let mut s = stripped.trim();
+        const PAIRS: &[(char, char)] = &[('"', '"'), ('“', '”'), ('\'', '\''), ('«', '»')];
+        for (open, close) in PAIRS {
+            if s.chars().count() >= 2 && s.starts_with(*open) && s.ends_with(*close) {
+                let inner = &s[open.len_utf8()..s.len() - close.len_utf8()];
+                // Only strip when the quotes wrap the WHOLE reply (no unbalanced
+                // inner quote of the same kind at the edges, e.g. `"a" and "b"`).
+                if !inner.contains(*close) || open == close && !inner.contains(*open) {
+                    s = inner.trim();
+                }
+                break;
+            }
+        }
+        s.to_string()
+    }
+
+    /// Token the model must answer with when it will not rewrite the draft.
+    /// Appended to EVERY system prompt (default or custom) via
+    /// [`system_prompt_with_protocol`]; [`finalize_reply`] turns it into
+    /// [`AiError::Refusal`] (→ 422) so a refusal never reaches the composer
+    /// looking like a rewrite. Providers that signal refusals out-of-band
+    /// (Anthropic `stop_reason`, OpenAI `content_filter`) are still caught
+    /// earlier in the parsers; this covers models that refuse in prose.
+    pub const REFUSAL_SENTINEL: &str = "[[REFUSED]]";
+
+    /// Fixed protocol paragraph appended after the (default or custom) system
+    /// prompt. Kept out of the user-editable prompt so it can't be lost.
+    pub const SYSTEM_PROTOCOL_SUFFIX: &str = "\n\nResponse protocol (always applies): \
+        output only the final message text — no preamble, no quotes, no commentary, \
+        and never include your reasoning or <think> tags. If for any reason you will \
+        not rewrite the draft, reply with exactly [[REFUSED]] and nothing else.";
+
+    /// The system prompt actually sent: `effective_system_prompt()` +
+    /// [`SYSTEM_PROTOCOL_SUFFIX`].
+    pub fn system_prompt_with_protocol(cfg: &AiConfig) -> String {
+        format!("{}{}", cfg.effective_system_prompt(), SYSTEM_PROTOCOL_SUFFIX)
+    }
+
+    /// [`clean_reply`] + refusal-sentinel detection. A reply that is (or
+    /// contains) [`REFUSAL_SENTINEL`], or that is empty after cleaning, is a
+    /// refusal — never hand that back as a rewrite.
+    pub fn finalize_reply(raw: &str) -> Result<String, AiError> {
+        let cleaned = clean_reply(raw);
+        if cleaned.is_empty() || cleaned.contains(REFUSAL_SENTINEL) {
+            return Err(AiError::Refusal);
+        }
+        Ok(cleaned)
+    }
+
+    /// Tags some OpenAI-compatible reasoning models (DeepSeek-R1, Qwen3, …)
+    /// use to inline their chain of thought in `message.content`.
+    const REASONING_TAGS: &[&str] = &["think", "thinking", "reasoning", "thought"];
+
+    /// Drop inlined chain-of-thought from a reply: `<think>…</think>` blocks
+    /// (any of `REASONING_TAGS`, case-insensitive) are removed wherever they
+    /// appear; an unterminated opening tag drops everything after it; a stray
+    /// closing tag with no opener drops everything before it (the model started
+    /// mid-thought). Anthropic never puts thinking in text blocks, so this only
+    /// matters for the OpenAI-compatible path — but it is harmless there.
+    pub fn strip_reasoning_blocks(raw: &str) -> String {
+        let mut out = raw.to_string();
+        for tag in REASONING_TAGS {
+            let open = format!("<{tag}>");
+            let close = format!("</{tag}>");
+            loop {
+                let lower = out.to_ascii_lowercase();
+                match (lower.find(&open), lower.find(&close)) {
+                    (Some(o), Some(c)) if c > o => {
+                        out.replace_range(o..c + close.len(), "");
+                    }
+                    (Some(o), Some(_)) | (Some(o), None) => {
+                        // Closing tag before the opener (or none at all): the
+                        // opener starts an unterminated thought → cut the tail.
+                        out.truncate(o);
+                        break;
+                    }
+                    (None, Some(c)) => {
+                        // Stray closer: everything before it was thought.
+                        out.replace_range(..c + close.len(), "");
+                    }
+                    (None, None) => break,
+                }
+            }
+        }
+        out
+    }
+
+    /// Why a provider call failed. `api.rs` maps `Refusal` → 422 and everything
+    /// else → 502 (`"ai upstream: …"`). Never carries the API key.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum AiError {
+        /// Non-2xx from the provider (after retries), with an excerpt of its
+        /// error message.
+        Upstream { status: u16, message: String },
+        /// The model declined to rewrite (Anthropic `stop_reason: "refusal"`,
+        /// or an OpenAI `finish_reason: "content_filter"`).
+        Refusal,
+        /// Network / TLS failure talking to the provider (retried).
+        Transport(String),
+        /// The provider didn't answer within [`REQUEST_TIMEOUT`] (not retried).
+        Timeout,
+        /// The model hit `max_tokens` before finishing (Anthropic `stop_reason:
+        /// "max_tokens"`, OpenAI `finish_reason: "length"`). The partial text
+        /// is discarded rather than handed back as a "rewrite".
+        Truncated,
+        /// 2xx but the body wasn't in the expected shape (or was empty).
+        BadResponse(String),
+    }
+
+    impl std::fmt::Display for AiError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                AiError::Upstream { status, message } => {
+                    write!(f, "ai upstream: {status} {message}")
+                }
+                AiError::Refusal => write!(f, "ai declined to rewrite this text"),
+                AiError::Transport(m) => write!(f, "ai upstream: request failed: {m}"),
+                AiError::Timeout => write!(f, "ai upstream: request timed out"),
+                AiError::Truncated => {
+                    write!(f, "ai upstream: reply was cut off (max_tokens); try a shorter draft")
+                }
+                AiError::BadResponse(m) => write!(f, "ai upstream: unexpected response: {m}"),
+            }
+        }
+    }
+
+    impl AiError {
+        /// HTTP status the API surfaces this error as.
+        pub fn http_status(&self) -> u16 {
+            match self {
+                AiError::Refusal => 422,
+                _ => 502,
+            }
+        }
+    }
+
+    /// Should the Anthropic request opt into server-side refusal fallbacks?
+    /// Only the Opus 5 / Fable 5 family supports (and needs) them.
+    pub fn anthropic_uses_fallbacks(model: &str) -> bool {
+        model.starts_with("claude-opus-5") || model.starts_with("claude-fable-5")
+    }
+
+    /// Anthropic Messages API request body. No `temperature`/`top_p`/`thinking`
+    /// — Opus 5 runs adaptive thinking by default and rejects sampling params.
+    pub fn anthropic_request_body(model: &str, system: &str, user: &str) -> Value {
+        let mut body = json!({
+            "model": model,
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "system": system,
+            "messages": [{ "role": "user", "content": user }],
+        });
+        if anthropic_uses_fallbacks(model) {
+            body["fallbacks"] = json!("default");
+        }
+        body
+    }
+
+    /// OpenAI-compatible `/chat/completions` request body.
+    pub fn openai_request_body(model: &str, system: &str, user: &str) -> Value {
+        json!({
+            "model": model,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+        })
+    }
+
+    /// Extract the reply text from an Anthropic Messages response: the
+    /// concatenation of every `content[].text` where `type == "text"`.
+    /// `stop_reason: "refusal"` → [`AiError::Refusal`].
+    pub fn parse_anthropic_response(v: &Value) -> Result<String, AiError> {
+        match v.get("stop_reason").and_then(Value::as_str) {
+            Some("refusal") => return Err(AiError::Refusal),
+            Some("max_tokens") => return Err(AiError::Truncated),
+            _ => {}
+        }
+        let content = v
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AiError::BadResponse("missing content[]".into()))?;
+        let text: String = content
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect();
+        if text.trim().is_empty() {
+            return Err(AiError::BadResponse("empty reply".into()));
+        }
+        Ok(text)
+    }
+
+    /// Extract `choices[0].message.content` from an OpenAI-compatible response.
+    /// `finish_reason: "content_filter"` → [`AiError::Refusal`].
+    pub fn parse_openai_response(v: &Value) -> Result<String, AiError> {
+        let choice = v
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|c| c.first())
+            .ok_or_else(|| AiError::BadResponse("missing choices[0]".into()))?;
+        match choice.get("finish_reason").and_then(Value::as_str) {
+            Some("content_filter") => return Err(AiError::Refusal),
+            Some("length") => return Err(AiError::Truncated),
+            _ => {}
+        }
+        let content = choice.get("message").and_then(|m| m.get("content"));
+        let text = match content {
+            Some(Value::String(s)) => s.clone(),
+            // Some gateways return content as an array of typed parts.
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect(),
+            _ => String::new(),
+        };
+        if text.trim().is_empty() {
+            return Err(AiError::BadResponse("empty reply".into()));
+        }
+        Ok(text)
+    }
+
+    /// Distil a non-2xx provider body into a short, safe error excerpt:
+    /// `error.message` (Anthropic + OpenAI both nest it there) when present,
+    /// else the raw body, capped at [`ERROR_EXCERPT_CHARS`] and flattened to one
+    /// line. The API key never appears in provider error bodies, but we cap and
+    /// flatten regardless.
+    pub fn upstream_error_message(body: &str) -> String {
+        let msg = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| body.to_string());
+        let flat: String = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.chars().count() > ERROR_EXCERPT_CHARS {
+            let cut: String = flat.chars().take(ERROR_EXCERPT_CHARS).collect();
+            format!("{cut}…")
+        } else {
+            flat
+        }
+    }
+
+    /// Outcome of [`AiClient::test`]: the model's reply + round-trip latency.
+    #[derive(Debug, Clone)]
+    pub struct TestOutcome {
+        pub reply: String,
+        pub latency_ms: u64,
+    }
+
+    /// HTTP client for the configured provider. Cheap to build; the API builds
+    /// one per request (a `reqwest::Client` is an `Arc` internally).
+    #[derive(Clone)]
+    pub struct AiClient {
+        http: reqwest::Client,
+    }
+
+    impl Default for AiClient {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl AiClient {
+        pub fn new() -> Self {
+            let http = reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default();
+            Self { http }
+        }
+
+        /// Rewrite `text` per `mode` (+ `language` / `instruction`). `Err(String)`
+        /// from the instruction builder is a caller error (400) and is surfaced
+        /// by the API before any network call.
+        pub async fn improve(
+            &self,
+            cfg: &AiConfig,
+            mode: AiMode,
+            language: Option<&str>,
+            instruction: Option<&str>,
+            text: &str,
+        ) -> Result<Result<String, AiError>, String> {
+            let ins = mode_instruction(mode, language, instruction)?;
+            let user = build_user_prompt(&ins, text);
+            let system = system_prompt_with_protocol(cfg);
+            Ok(self
+                .complete(cfg, &system, &user)
+                .await
+                .and_then(|r| finalize_reply(&r)))
+        }
+
+        /// Connectivity check: a tiny "Reply with OK" round-trip.
+        pub async fn test(&self, cfg: &AiConfig) -> Result<TestOutcome, AiError> {
+            let start = Instant::now();
+            let reply = self
+                .complete(
+                    cfg,
+                    "You are a connectivity check. Reply with exactly: OK",
+                    "Reply with OK",
+                )
+                .await?;
+            Ok(TestOutcome {
+                reply: clean_reply(&reply),
+                latency_ms: start.elapsed().as_millis() as u64,
+            })
+        }
+
+        /// One system+user completion against the configured provider, with
+        /// retries on 429 / 5xx / transport errors. Returns the raw reply text.
+        pub async fn complete(
+            &self,
+            cfg: &AiConfig,
+            system: &str,
+            user: &str,
+        ) -> Result<String, AiError> {
+            let mut attempt = 0u32;
+            loop {
+                let res = self.complete_once(cfg, system, user).await;
+                let retryable = match &res {
+                    Err(AiError::Upstream { status, .. }) => {
+                        *status == 429 || (500..600).contains(status)
+                    }
+                    Err(AiError::Transport(_)) => true,
+                    _ => false,
+                };
+                if !retryable || attempt >= MAX_RETRIES {
+                    return res;
+                }
+                attempt += 1;
+                tokio::time::sleep(RETRY_BASE * attempt).await;
+            }
+        }
+
+        async fn complete_once(
+            &self,
+            cfg: &AiConfig,
+            system: &str,
+            user: &str,
+        ) -> Result<String, AiError> {
+            let base = cfg.effective_base_url();
+            let req = match cfg.provider {
+                Provider::Anthropic => {
+                    let mut r = self
+                        .http
+                        .post(format!("{base}/v1/messages"))
+                        .header("x-api-key", cfg.api_key.as_str())
+                        .header("anthropic-version", ANTHROPIC_VERSION)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json");
+                    if anthropic_uses_fallbacks(&cfg.model) {
+                        r = r.header("anthropic-beta", ANTHROPIC_FALLBACK_BETA);
+                    }
+                    r.json(&anthropic_request_body(&cfg.model, system, user))
+                }
+                Provider::Openai => self
+                    .http
+                    .post(format!("{base}/chat/completions"))
+                    .header(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {}", cfg.api_key),
+                    )
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .json(&openai_request_body(&cfg.model, system, user)),
+            };
+            let resp = req.send().await.map_err(transport_error)?;
+            let status = resp.status().as_u16();
+            let body = resp.text().await.map_err(transport_error)?;
+            if !(200..300).contains(&status) {
+                return Err(AiError::Upstream {
+                    status,
+                    message: upstream_error_message(&body),
+                });
+            }
+            let v: Value = serde_json::from_str(&body)
+                .map_err(|e| AiError::BadResponse(format!("invalid JSON: {e}")))?;
+            match cfg.provider {
+                Provider::Anthropic => parse_anthropic_response(&v),
+                Provider::Openai => parse_openai_response(&v),
+            }
+        }
+    }
+
+    /// Map a reqwest error: timeouts get their own (non-retried) variant; the
+    /// rest becomes a short, URL-free `Transport` description (the URL could
+    /// carry a gateway path the operator considers private; the key is never
+    /// in it, but keep the excerpt minimal regardless).
+    fn transport_error(e: reqwest::Error) -> AiError {
+        if e.is_timeout() {
+            AiError::Timeout
+        } else if e.is_connect() {
+            AiError::Transport("connection failed".to_string())
+        } else {
+            let mut s = e.without_url().to_string();
+            if s.chars().count() > ERROR_EXCERPT_CHARS {
+                s = s.chars().take(ERROR_EXCERPT_CHARS).collect::<String>() + "…";
+            }
+            AiError::Transport(s)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn cfg(provider: Provider, model: &str) -> AiConfig {
+            AiConfig {
+                provider,
+                api_key: "sk-test-not-a-real-key-1234".into(),
+                model: model.into(),
+                base_url: None,
+                system_prompt: None,
+            }
+        }
+
+        #[test]
+        fn config_defaults_and_hint() {
+            let c = cfg(Provider::Anthropic, DEFAULT_ANTHROPIC_MODEL);
+            assert_eq!(c.effective_base_url(), "https://api.anthropic.com");
+            assert_eq!(c.effective_system_prompt(), DEFAULT_SYSTEM_PROMPT);
+            assert_eq!(c.api_key_hint(), "••••1234");
+            let mut o = cfg(Provider::Openai, "gpt-4o-mini");
+            assert_eq!(o.effective_base_url(), "https://api.openai.com/v1");
+            o.base_url = Some("https://openrouter.ai/api/v1/".into());
+            assert_eq!(o.effective_base_url(), "https://openrouter.ai/api/v1");
+            o.system_prompt = Some("  custom  ".into());
+            assert_eq!(o.effective_system_prompt(), "custom");
+            // Blank base_url/system_prompt fall back to defaults.
+            o.base_url = Some("   ".into());
+            o.system_prompt = Some("".into());
+            assert_eq!(o.effective_base_url(), "https://api.openai.com/v1");
+            assert_eq!(o.effective_system_prompt(), DEFAULT_SYSTEM_PROMPT);
+            // Short keys are fully masked.
+            assert_eq!(api_key_hint("abc"), "••••");
+            assert_eq!(api_key_hint("abcdefg"), "••••");
+            assert_eq!(api_key_hint("abcdefgh"), "••••efgh");
+        }
+
+        #[test]
+        fn config_json_roundtrip_and_lenient_optional_fields() {
+            let c = AiConfig {
+                provider: Provider::Openai,
+                api_key: "k".into(),
+                model: "m".into(),
+                base_url: Some("https://x/v1".into()),
+                system_prompt: Some("sp".into()),
+            };
+            let s = serde_json::to_string(&c).unwrap();
+            assert!(s.contains("\"provider\":\"openai\""));
+            assert_eq!(serde_json::from_str::<AiConfig>(&s).unwrap(), c);
+            // Minimal stored shape (older rows without optional keys) parses.
+            let min: AiConfig =
+                serde_json::from_str(r#"{"provider":"anthropic","api_key":"k","model":"m"}"#)
+                    .unwrap();
+            assert_eq!(min.provider, Provider::Anthropic);
+            assert!(min.base_url.is_none() && min.system_prompt.is_none());
+            assert!(serde_json::from_str::<AiConfig>(
+                r#"{"provider":"gemini","api_key":"k","model":"m"}"#
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn mode_instructions_and_user_prompt() {
+            assert_eq!(
+                mode_instruction(AiMode::Improve, None, None).unwrap(),
+                "Improve clarity, flow and correctness while keeping the same length and tone."
+            );
+            assert_eq!(
+                mode_instruction(AiMode::Formal, None, None).unwrap(),
+                "Make it more formal and professional."
+            );
+            assert_eq!(
+                mode_instruction(AiMode::Casual, None, None).unwrap(),
+                "Make it more casual and friendly."
+            );
+            assert_eq!(
+                mode_instruction(AiMode::Shorter, None, None).unwrap(),
+                "Make it significantly shorter without losing key information."
+            );
+            assert_eq!(
+                mode_instruction(AiMode::Grammar, None, None).unwrap(),
+                "Fix spelling, grammar and punctuation only; change nothing else."
+            );
+            assert_eq!(
+                mode_instruction(AiMode::Translate, Some("pt-BR"), None).unwrap(),
+                "Translate it to pt-BR."
+            );
+            assert!(mode_instruction(AiMode::Translate, None, None).is_err());
+            assert!(mode_instruction(AiMode::Translate, Some("  "), None).is_err());
+            let long_lang = "x".repeat(MAX_LANGUAGE_CHARS + 1);
+            assert!(mode_instruction(AiMode::Translate, Some(&long_lang), None).is_err());
+            assert_eq!(
+                mode_instruction(AiMode::Custom, None, Some(" add a greeting ")).unwrap(),
+                "add a greeting"
+            );
+            assert!(mode_instruction(AiMode::Custom, None, None).is_err());
+            let long = "x".repeat(MAX_INSTRUCTION_CHARS + 1);
+            assert!(mode_instruction(AiMode::Custom, None, Some(&long)).is_err());
+            assert_eq!(
+                build_user_prompt("Make it shorter.", "hello there\nfriend"),
+                "Instruction: Make it shorter.\n\nDraft:\nhello there\nfriend"
+            );
+            // Mode deserializes from its lowercase wire name; default is improve.
+            assert_eq!(serde_json::from_str::<AiMode>("\"shorter\"").unwrap(), AiMode::Shorter);
+            assert_eq!(AiMode::default(), AiMode::Improve);
+        }
+
+        #[test]
+        fn finalize_reply_maps_sentinel_and_empty_to_refusal() {
+            assert_eq!(finalize_reply("[[REFUSED]]"), Err(AiError::Refusal));
+            assert_eq!(finalize_reply("<think>no</think>\n[[REFUSED]]"), Err(AiError::Refusal));
+            assert_eq!(finalize_reply("  Sorry. [[REFUSED]]"), Err(AiError::Refusal));
+            assert_eq!(finalize_reply("<think>only thought</think>"), Err(AiError::Refusal));
+            assert_eq!(finalize_reply("\"Olá!\""), Ok("Olá!".to_string()));
+            let cfg = AiConfig {
+                provider: Provider::Anthropic,
+                api_key: "k".into(),
+                model: "m".into(),
+                base_url: None,
+                system_prompt: Some("custom".into()),
+            };
+            let sys = system_prompt_with_protocol(&cfg);
+            assert!(sys.starts_with("custom"));
+            assert!(sys.contains(REFUSAL_SENTINEL));
+        }
+
+        #[test]
+        fn clean_reply_strips_inlined_reasoning_blocks() {
+            // Closed block before the answer (DeepSeek/Qwen style).
+            assert_eq!(
+                clean_reply("<think>\nI should fix the accent.\n</think>\n\nOlá, tudo bem?"),
+                "Olá, tudo bem?"
+            );
+            // Case-insensitive + other tag names + block in the middle.
+            assert_eq!(clean_reply("Oi <THINKING>hmm</THINKING> tudo bem"), "Oi  tudo bem");
+            assert_eq!(clean_reply("<reasoning>x</reasoning><thought>y</thought>ok"), "ok");
+            // Unterminated opener: drop the tail.
+            assert_eq!(clean_reply("Olá!<think>and then I"), "Olá!");
+            // Stray closer (model started mid-thought): keep what follows.
+            assert_eq!(clean_reply("…so the fix is\n</think>\nOlá!"), "Olá!");
+            // Wrapping quotes are still stripped after the block is removed.
+            assert_eq!(clean_reply("<think>q</think>\"Olá\""), "Olá");
+            // Untagged text is untouched.
+            assert_eq!(clean_reply("I think so <thinks>"), "I think so <thinks>");
+        }
+
+        #[test]
+        fn clean_reply_strips_wrapping_quotes_only() {
+            assert_eq!(clean_reply("  \"Hi there!\" \n"), "Hi there!");
+            assert_eq!(clean_reply("“Olá, tudo bem?”"), "Olá, tudo bem?");
+            assert_eq!(clean_reply("'ok'"), "ok");
+            // Quotes that are part of the text (not wrapping it) survive.
+            assert_eq!(clean_reply("\"a\" and \"b\""), "\"a\" and \"b\"");
+            assert_eq!(clean_reply("plain"), "plain");
+            assert_eq!(clean_reply("\""), "\"");
+            assert_eq!(clean_reply(""), "");
+        }
+
+        #[test]
+        fn anthropic_request_shape() {
+            let b = anthropic_request_body("claude-opus-5", "SYS", "USER");
+            assert_eq!(b["model"], "claude-opus-5");
+            assert_eq!(b["max_tokens"], MAX_OUTPUT_TOKENS);
+            assert_eq!(b["system"], "SYS");
+            assert_eq!(b["messages"][0]["role"], "user");
+            assert_eq!(b["messages"][0]["content"], "USER");
+            assert_eq!(b["fallbacks"], "default");
+            // No sampling / thinking params (rejected by Opus 5).
+            for k in ["temperature", "top_p", "top_k", "thinking"] {
+                assert!(b.get(k).is_none(), "{k} must not be sent");
+            }
+            // Fallbacks only on the Opus 5 / Fable 5 family.
+            assert!(anthropic_uses_fallbacks("claude-fable-5"));
+            assert!(anthropic_uses_fallbacks("claude-opus-5-20260701"));
+            assert!(!anthropic_uses_fallbacks("claude-sonnet-4-6"));
+            let b = anthropic_request_body("claude-sonnet-4-6", "S", "U");
+            assert!(b.get("fallbacks").is_none());
+        }
+
+        #[test]
+        fn openai_request_shape() {
+            let b = openai_request_body("gpt-4o-mini", "SYS", "USER");
+            assert_eq!(b["model"], "gpt-4o-mini");
+            assert_eq!(b["messages"][0]["role"], "system");
+            assert_eq!(b["messages"][0]["content"], "SYS");
+            assert_eq!(b["messages"][1]["role"], "user");
+            assert_eq!(b["messages"][1]["content"], "USER");
+        }
+
+        #[test]
+        fn anthropic_response_parsing() {
+            let ok = json!({
+                "id": "msg_01", "type": "message", "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": "x"},
+                    {"type": "text", "text": "Hello "},
+                    {"type": "text", "text": "world"}
+                ],
+                "stop_reason": "end_turn", "stop_details": null,
+                "usage": {"input_tokens": 10, "output_tokens": 3}
+            });
+            assert_eq!(parse_anthropic_response(&ok).unwrap(), "Hello world");
+
+            let refusal = json!({
+                "id": "msg_02", "type": "message", "role": "assistant",
+                "content": [],
+                "stop_reason": "refusal",
+                "stop_details": {"type": "refusal", "category": "other", "explanation": "…"}
+            });
+            assert_eq!(parse_anthropic_response(&refusal), Err(AiError::Refusal));
+            assert_eq!(AiError::Refusal.http_status(), 422);
+
+            let empty = json!({"content": [], "stop_reason": "end_turn"});
+            assert!(matches!(
+                parse_anthropic_response(&empty),
+                Err(AiError::BadResponse(_))
+            ));
+            // Hitting max_tokens is reported, not returned as a half rewrite.
+            let cut = json!({
+                "content": [{"type": "text", "text": "Hello wor"}],
+                "stop_reason": "max_tokens"
+            });
+            assert_eq!(parse_anthropic_response(&cut), Err(AiError::Truncated));
+            assert_eq!(AiError::Truncated.http_status(), 502);
+            assert!(matches!(
+                parse_anthropic_response(&json!({"type": "error"})),
+                Err(AiError::BadResponse(_))
+            ));
+        }
+
+        #[test]
+        fn openai_response_parsing() {
+            let ok = json!({
+                "id": "chatcmpl-1", "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Olá!"},
+                    "finish_reason": "stop"
+                }]
+            });
+            assert_eq!(parse_openai_response(&ok).unwrap(), "Olá!");
+            // Array-of-parts content (some gateways).
+            let parts = json!({
+                "choices": [{"message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]}}]
+            });
+            assert_eq!(parse_openai_response(&parts).unwrap(), "AB");
+            let filtered = json!({
+                "choices": [{"message": {"role": "assistant", "content": null},
+                             "finish_reason": "content_filter"}]
+            });
+            assert_eq!(parse_openai_response(&filtered), Err(AiError::Refusal));
+            let cut = json!({
+                "choices": [{"message": {"role": "assistant", "content": "Hello wor"},
+                             "finish_reason": "length"}]
+            });
+            assert_eq!(parse_openai_response(&cut), Err(AiError::Truncated));
+            assert!(matches!(
+                parse_openai_response(&json!({"choices": []})),
+                Err(AiError::BadResponse(_))
+            ));
+            assert!(matches!(
+                parse_openai_response(&json!({
+                    "choices": [{"message": {"role": "assistant", "content": "  "}}]
+                })),
+                Err(AiError::BadResponse(_))
+            ));
+        }
+
+        #[test]
+        fn upstream_error_excerpt_and_display() {
+            // Anthropic-style error envelope.
+            let m = upstream_error_message(
+                r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+            );
+            assert_eq!(m, "invalid x-api-key");
+            // OpenAI-style.
+            let m = upstream_error_message(
+                r#"{"error":{"message":"Incorrect API key provided","type":"invalid_request_error"}}"#,
+            );
+            assert_eq!(m, "Incorrect API key provided");
+            // Non-JSON body is flattened + capped.
+            let m = upstream_error_message(&format!("<html>\n {} </html>", "x".repeat(500)));
+            assert!(m.starts_with("<html> xxx"));
+            assert!(!m.contains('\n'));
+            assert_eq!(m.chars().count(), ERROR_EXCERPT_CHARS + 1); // + ellipsis
+            let e = AiError::Upstream { status: 401, message: "invalid x-api-key".into() };
+            assert_eq!(e.to_string(), "ai upstream: 401 invalid x-api-key");
+            assert_eq!(e.http_status(), 502);
+            assert_eq!(
+                AiError::Transport("connection failed".into()).to_string(),
+                "ai upstream: request failed: connection failed"
+            );
+            assert_eq!(AiError::Timeout.to_string(), "ai upstream: request timed out");
+            assert_eq!(AiError::Timeout.http_status(), 502);
+        }
+
+        #[test]
+        fn debug_never_prints_the_key() {
+            let c = cfg(Provider::Anthropic, DEFAULT_ANTHROPIC_MODEL);
+            let dbg = format!("{c:?}");
+            assert!(!dbg.contains("sk-test-not-a-real-key"), "{dbg}");
+            assert!(dbg.contains("••••1234"), "{dbg}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +1760,22 @@ mod tests {
         assert_eq!(
             event_type(&SessionEvent::Disconnected { reason: "bye".into() }),
             "disconnected"
+        );
+        assert_eq!(
+            event_type(&SessionEvent::CallOffer {
+                call_id: "c1".into(),
+                from: "j@s.whatsapp.net".into(),
+                media: None
+            }),
+            "call_offer"
+        );
+        assert_eq!(
+            event_type(&SessionEvent::CallTerminate {
+                call_id: "c1".into(),
+                from: "j@s.whatsapp.net".into(),
+                reason: Some("timeout".into())
+            }),
+            "call_terminate"
         );
     }
 

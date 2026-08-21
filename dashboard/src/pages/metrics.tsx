@@ -277,11 +277,22 @@ function InstanceMetrics({ inst }: { inst: SessionMeta }) {
         <div className="mt-0.5 text-xs text-muted-foreground">Scoped to {inst.label ?? inst.id}</div>
       </div>
       <Group label="This instance">
-        <StatCard label="Last rx" value={fmtAgeShort(d?.seconds_since_rx ?? null)} />
-        <StatCard label="Reconnects" value={d?.reconnect_count ?? "—"} />
-        <StatCard label="Prekeys available" value={d?.prekeys_available ?? "—"} accent={d && d.prekeys_available < 20 ? "hsl(var(--st-warn))" : undefined} />
-        <StatCard label="Connected" value={d?.connected ? "yes" : "no"} accent={d?.connected ? "hsl(var(--st-ok))" : "hsl(var(--st-down))"} />
-        <StatCard label="Proxy" value={d?.proxy_configured ? "configured" : "none"} />
+        {inst.kind === "cloud" ? (
+          <>
+            <StatCard label="Backend" value="cloud" />
+            <StatCard label="Last webhook" value={fmtAgeShort(d?.seconds_since_rx ?? null)} />
+            <StatCard label="Ready" value={d?.connected ? "yes" : "no"} accent={d?.connected ? "hsl(var(--st-ok))" : "hsl(var(--st-down))"} />
+            <StatCard label="Proxy" value={d?.proxy_configured ? "configured" : "none"} />
+          </>
+        ) : (
+          <>
+            <StatCard label="Last rx" value={fmtAgeShort(d?.seconds_since_rx ?? null)} />
+            <StatCard label="Reconnects" value={d?.reconnect_count ?? "—"} />
+            <StatCard label="Prekeys available" value={d?.prekeys_available ?? "—"} accent={d && d.prekeys_available < 20 ? "hsl(var(--st-warn))" : undefined} />
+            <StatCard label="Connected" value={d?.connected ? "yes" : "no"} accent={d?.connected ? "hsl(var(--st-ok))" : "hsl(var(--st-down))"} />
+            <StatCard label="Proxy" value={d?.proxy_configured ? "configured" : "none"} />
+          </>
+        )}
       </Group>
       <p className="text-xs text-muted-foreground">Fleet-wide counters are on the global Metrics page (process RAM/CPU/latency, message totals, webhook health).</p>
     </div>

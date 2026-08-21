@@ -241,6 +241,39 @@ pub fn build_video_message(
     msg.encode_to_vec()
 }
 
+/// Duration (seconds, rounded) of an Ogg/Opus stream, read from the last
+/// page's granule position. Opus granule positions are always in 48kHz
+/// units per RFC 7845 §4, independent of the stream's actual encoded sample
+/// rate, so this needs no codec-specific decoding — just walking the Ogg
+/// page framing to find the final granule position.
+///
+/// WhatsApp clients use `AudioMessage.seconds` to render the voice-note
+/// bubble (waveform + "0:07" label); a PTT sent without it doesn't render
+/// the same way a real client's does. Returns `None` for anything that
+/// isn't a well-formed Ogg stream (falls back to omitting the field, same
+/// as before this existed).
+pub fn ogg_opus_duration_secs(data: &[u8]) -> Option<u32> {
+    const OPUS_RATE: u64 = 48_000;
+    let mut pos = 0usize;
+    let mut last_granule: Option<u64> = None;
+    while pos + 27 <= data.len() {
+        if &data[pos..pos + 4] != b"OggS" {
+            break;
+        }
+        let granule_position = u64::from_le_bytes(data[pos + 6..pos + 14].try_into().ok()?);
+        let page_segments = data[pos + 26] as usize;
+        let header_len = 27 + page_segments;
+        if pos + header_len > data.len() {
+            break;
+        }
+        let body_len: usize =
+            data[pos + 27..pos + header_len].iter().map(|&b| b as usize).sum();
+        last_granule = Some(granule_position);
+        pos += header_len + body_len;
+    }
+    last_granule.map(|g| ((g as f64) / (OPUS_RATE as f64)).round() as u32)
+}
+
 pub fn build_audio_message(
     enc: &EncryptedMedia,
     upload: &UploadedMedia,
@@ -601,6 +634,51 @@ pub async fn put_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ogg_opus_duration_secs_reads_last_page_granule() {
+        // Minimal single-page Ogg stream: 27-byte page header + zero-length
+        // segment table (page_segments=0, no body). Granule position is
+        // 3 seconds in Opus's fixed 48kHz timebase.
+        let mut page = Vec::new();
+        page.extend_from_slice(b"OggS");
+        page.push(0); // version
+        page.push(0x04); // header_type
+        page.extend_from_slice(&(144_000u64).to_le_bytes()); // granule = 3s * 48000
+        page.extend_from_slice(&[0u8; 4]); // serial
+        page.extend_from_slice(&[0u8; 4]); // sequence
+        page.extend_from_slice(&[0u8; 4]); // crc
+        page.push(0); // page_segments
+        assert_eq!(ogg_opus_duration_secs(&page), Some(3));
+    }
+
+    #[test]
+    fn ogg_opus_duration_secs_uses_last_of_multiple_pages() {
+        // Two pages: an initial header page (granule=0) followed by a
+        // second page carrying the real end-of-stream granule position.
+        // Duration must come from the LAST page, not the first.
+        fn page(granule: u64) -> Vec<u8> {
+            let mut p = Vec::new();
+            p.extend_from_slice(b"OggS");
+            p.push(0);
+            p.push(0x00);
+            p.extend_from_slice(&granule.to_le_bytes());
+            p.extend_from_slice(&[0u8; 4]);
+            p.extend_from_slice(&[0u8; 4]);
+            p.extend_from_slice(&[0u8; 4]);
+            p.push(0);
+            p
+        }
+        let mut stream = page(0);
+        stream.extend_from_slice(&page(96_000)); // 2 seconds
+        assert_eq!(ogg_opus_duration_secs(&stream), Some(2));
+    }
+
+    #[test]
+    fn ogg_opus_duration_secs_rejects_non_ogg_data() {
+        assert_eq!(ogg_opus_duration_secs(b"not an ogg stream"), None);
+        assert_eq!(ogg_opus_duration_secs(&[]), None);
+    }
 
     #[test]
     fn sigv4_matches_aws_get_object_test_vector() {

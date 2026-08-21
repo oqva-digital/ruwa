@@ -20,6 +20,8 @@ const TYPE_TINT: Record<string, string> = {
   message: "progress",
   message_sent: "ok",
   message_delivered: "ok",
+  message_read: "ok",
+  message_failed: "down",
   connected: "ok",
   connecting: "progress",
   qr: "progress",
@@ -31,7 +33,16 @@ const TYPE_TINT: Record<string, string> = {
 
 function summarize(ev: SessionEvent): string {
   const o = ev as Record<string, unknown>
-  if (typeof o.body === "object" && o.body && "text" in o.body) return String((o.body as Record<string, unknown>).text)
+  if (typeof o.body === "object" && o.body) {
+    const b = o.body as Record<string, unknown>
+    if (typeof b.text === "string" && b.text) return b.text
+    // Cloud API structured bodies: template name, tapped button / list row title.
+    if (typeof b.name === "string" && b.type === "template") return `template: ${b.name}`
+    const inter = b.interactive as Record<string, unknown> | undefined
+    if (inter && typeof inter.title === "string") return `reply: ${inter.title}`
+    const btn = b.button as Record<string, unknown> | undefined
+    if (btn && typeof btn.text === "string") return `quick reply: ${btn.text}`
+  }
   if (typeof o.reason === "string") return o.reason
   if (typeof o.id === "string") return o.id
   return ""

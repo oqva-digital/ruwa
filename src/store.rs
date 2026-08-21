@@ -141,6 +141,7 @@ store_delegate! {
     messages_insert_batch(rows: &[NewMessage], ignore_conflict: bool) -> rusqlite::Result<usize>;
     prune(msg_age_cutoff: Option<i64>, messages_per_chat: Option<u32>, signal_age_cutoff: Option<i64>) -> rusqlite::Result<(usize, usize, usize)>;
     message_set_status(session_id: &str, message_id: &str, status: &str) -> rusqlite::Result<()>;
+    message_advance_status(session_id: &str, message_id: &str, status: &str) -> rusqlite::Result<bool>;
     messages_mark_self_from_me(session_id: &str, own_pn_user: &str, own_lid_user: Option<&str>) -> rusqlite::Result<usize>;
     consolidate_lid_chats(session_id: &str) -> rusqlite::Result<usize>;
     create_session(s: &NewSession, prekeys: &[(u32, &[u8], &[u8])]) -> rusqlite::Result<()>;
@@ -148,6 +149,7 @@ store_delegate! {
     device_keys_load(id: &str) -> rusqlite::Result<Option<DeviceKeyRow>>;
     device_keys_set_adv_secret(id: &str, adv_secret: &[u8]) -> rusqlite::Result<()>;
     sessions_all() -> rusqlite::Result<Vec<SessionRow>>;
+    session_row(id: &str) -> rusqlite::Result<Option<SessionRow>>;
     session_delete(id: &str) -> rusqlite::Result<()>;
     session_api_key(id: &str) -> rusqlite::Result<Option<String>>;
     session_set_proxy(id: &str, proxy_url: Option<&str>, updated_at: i64) -> rusqlite::Result<()>;
@@ -158,10 +160,21 @@ store_delegate! {
     session_account_pb(id: &str) -> rusqlite::Result<Option<Vec<u8>>>;
     session_nct_salt(id: &str) -> rusqlite::Result<Option<Vec<u8>>>;
     session_set_nct_salt(id: &str, salt: &[u8]) -> rusqlite::Result<()>;
+    session_history_synced_at(id: &str) -> rusqlite::Result<Option<i64>>;
+    session_set_history_synced_at(id: &str, at: i64) -> rusqlite::Result<()>;
     session_push_name(id: &str) -> rusqlite::Result<Option<String>>;
     session_set_push_name(id: &str, name: &str) -> rusqlite::Result<()>;
     session_mark_logged_out(id: &str, updated_at: i64) -> rusqlite::Result<()>;
     session_apply_pair_success(id: &str, account_pb: &[u8], biz_name: Option<&str>, platform: Option<&str>, jid: Option<&str>, updated_at: i64) -> rusqlite::Result<()>;
+    session_set_status(id: &str, status: &str, updated_at: i64) -> rusqlite::Result<()>;
+    session_set_jid_and_push_name(id: &str, jid: Option<&str>, push_name: Option<&str>, updated_at: i64) -> rusqlite::Result<()>;
+    session_cloud_creds(id: &str) -> rusqlite::Result<Option<CloudCredsRow>>;
+    create_cloud_session(s: &NewCloudSession) -> rusqlite::Result<()>;
+    session_set_cloud_creds(id: &str, c: &CloudCredsRow, updated_at: i64) -> rusqlite::Result<()>;
+    cloud_session_id_by_phone_number_id(pnid: &str) -> rusqlite::Result<Option<String>>;
+    cloud_verify_token_matches(token: &str) -> rusqlite::Result<bool>;
+    message_exists(session_id: &str, chat_jid: &str, message_id: &str) -> rusqlite::Result<bool>;
+    latest_inbound_message_id(session_id: &str, chat_jid: &str) -> rusqlite::Result<Option<String>>;
     lease_acquire(session_id: &str, owner: &str, ttl: i64, now: i64) -> rusqlite::Result<bool>;
     lease_renew(session_id: &str, owner: &str, now: i64) -> rusqlite::Result<bool>;
     lease_release(session_id: &str, owner: &str) -> rusqlite::Result<()>;
@@ -201,6 +214,9 @@ store_delegate! {
     log_ring_insert_batch(rows: &[(i64, i32, &str, &str, &str)]) -> rusqlite::Result<usize>;
     log_ring_query(min_sev: i32, before_id: i64, limit: u32) -> rusqlite::Result<Vec<LogRow>>;
     log_ring_prune(keep_max: i64, age_cutoff_ms: i64) -> rusqlite::Result<usize>;
+    setting_get(key: &str) -> rusqlite::Result<Option<Vec<u8>>>;
+    setting_set(key: &str, value: &[u8], updated_at: i64) -> rusqlite::Result<()>;
+    setting_delete(key: &str) -> rusqlite::Result<()>;
 }
 
 // Egress-target delegators. Kept out of `store_delegate!` so each can carry
@@ -965,6 +981,34 @@ impl SqliteStore {
         })
     }
 
+    /// Monotonic variant of `message_set_status` for status feeds that are
+    /// neither ordered nor deduplicated (Meta's `statuses[]` webhooks: a retried
+    /// or delayed `delivered` may follow `read`). The row only moves FORWARD
+    /// along `sent < delivered < read < failed` (`failed` is terminal); an
+    /// equal-or-lower status, or an unknown message id, changes nothing.
+    /// Returns whether the row was actually updated — the caller emits its
+    /// lifecycle event only then, so retries never re-emit.
+    pub fn message_advance_status(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        status: &str,
+    ) -> rusqlite::Result<bool> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                &format!(
+                    "UPDATE messages SET status = ?1 \
+                      WHERE session_id = ?2 AND message_id = ?3 \
+                        AND {new} > {stored}",
+                    new = status_rank_sql("?1"),
+                    stored = status_rank_sql("status")
+                ),
+                rusqlite::params![status, session_id, message_id],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     /// One-time backfill: flip `from_me` for already-stored messages whose
     /// sender is our own account. Own group fan-outs were saved `from_me=0`
     /// before the participant-based self-check landed; a message whose sender is
@@ -1233,7 +1277,9 @@ impl SqliteStore {
     pub fn sessions_all(&self) -> rusqlite::Result<Vec<SessionRow>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, label, status, jid, push_name, created_at, updated_at, proxy_url, mark_online FROM sessions",
+                "SELECT id, label, status, jid, push_name, created_at, updated_at, proxy_url, mark_online, \
+                        kind, cloud_phone_number_id, cloud_waba_id, cloud_graph_version \
+                   FROM sessions",
             )?;
             let rows = stmt
                 .query_map([], |r| {
@@ -1247,10 +1293,50 @@ impl SqliteStore {
                         updated_at: r.get(6)?,
                         proxy_url: r.get(7)?,
                         mark_online: r.get::<_, i64>(8)? != 0,
+                        kind: r.get(9)?,
+                        cloud_phone_number_id: r.get(10)?,
+                        cloud_waba_id: r.get(11)?,
+                        cloud_graph_version: r.get(12)?,
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
             Ok(rows)
+        })
+    }
+
+    /// One session's restore-time metadata row (same shape as `sessions_all`),
+    /// or `None` for an unknown id. Lets an instance lazily pick up a session
+    /// another replica created after this one booted.
+    pub fn session_row(&self, id: &str) -> rusqlite::Result<Option<SessionRow>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, label, status, jid, push_name, created_at, updated_at, proxy_url, mark_online, \
+                        kind, cloud_phone_number_id, cloud_waba_id, cloud_graph_version \
+                   FROM sessions WHERE id = ?",
+                rusqlite::params![id],
+                |r| {
+                    Ok(SessionRow {
+                        id: r.get(0)?,
+                        label: r.get(1)?,
+                        status: r.get(2)?,
+                        jid: r.get(3)?,
+                        push_name: r.get(4)?,
+                        created_at: r.get(5)?,
+                        updated_at: r.get(6)?,
+                        proxy_url: r.get(7)?,
+                        mark_online: r.get::<_, i64>(8)? != 0,
+                        kind: r.get(9)?,
+                        cloud_phone_number_id: r.get(10)?,
+                        cloud_waba_id: r.get(11)?,
+                        cloud_graph_version: r.get(12)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(e),
+            })
         })
     }
 
@@ -1386,6 +1472,32 @@ impl SqliteStore {
         })
     }
 
+    /// When this session last persisted a heavy history-sync chunk
+    /// (INITIAL_BOOTSTRAP/FULL/RECENT), or `None` if it never has.
+    pub fn session_history_synced_at(&self, id: &str) -> rusqlite::Result<Option<i64>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT history_synced_at FROM sessions WHERE id = ?",
+                rusqlite::params![id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(e),
+            })
+        })
+    }
+
+    pub fn session_set_history_synced_at(&self, id: &str, at: i64) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET history_synced_at = ? WHERE id = ?",
+                rusqlite::params![at, id],
+            )
+            .map(|_| ())
+        })
+    }
+
     /// Our own push (profile) name, or `None`.
     pub fn session_push_name(&self, id: &str) -> rusqlite::Result<Option<String>> {
         self.with_conn(|conn| {
@@ -1449,6 +1561,227 @@ impl SqliteStore {
                 rusqlite::params![account_pb, biz_name, platform, jid, updated_at, id],
             )?;
             Ok(())
+        })
+    }
+
+    /// Persist a session's lifecycle status verbatim (`connected`,
+    /// `disconnected`, `logged_out`, …). Generic twin of the web-only
+    /// `session_apply_pair_success` / `session_mark_logged_out` — cloud sessions
+    /// have no pairing/companion state to touch, only the status column.
+    pub fn session_set_status(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?",
+                rusqlite::params![status, updated_at, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Set the session's `jid` + `push_name` in one write (cloud connect learns
+    /// both from Graph `GET /{phone_number_id}`: display number → jid, verified
+    /// name → push_name). `None` clears the respective column.
+    pub fn session_set_jid_and_push_name(
+        &self,
+        id: &str,
+        jid: Option<&str>,
+        push_name: Option<&str>,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET jid = ?, push_name = ?, updated_at = ? WHERE id = ?",
+                rusqlite::params![jid, push_name, updated_at, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    // ---- cloud (Meta Cloud API) sessions ----------------------------------
+
+    /// Create a `kind='cloud'` session row: no device keys / prekeys, just the
+    /// Graph credentials. `access_token` + `app_secret` are SEALED here
+    /// (`vault::seal`, same treatment as private keys) — this is their single
+    /// write choke point together with `session_set_cloud_creds`.
+    pub fn create_cloud_session(&self, s: &NewCloudSession) -> rusqlite::Result<()> {
+        let token = vault::seal(s.access_token.as_bytes());
+        let secret = s.app_secret.map(|v| vault::seal(v.as_bytes()));
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO sessions (\
+                    id, label, status, jid, api_key, proxy_url, created_at, updated_at, \
+                    kind, cloud_phone_number_id, cloud_waba_id, cloud_access_token, \
+                    cloud_app_secret, cloud_verify_token, cloud_graph_version\
+                 ) VALUES (?,?,?,?,?,?,?,?, 'cloud',?,?,?,?,?,?)",
+                rusqlite::params![
+                    s.id,
+                    s.label,
+                    s.status,
+                    s.jid,
+                    s.api_key,
+                    s.proxy_url,
+                    s.created_at,
+                    s.updated_at,
+                    s.phone_number_id,
+                    s.waba_id,
+                    token,
+                    secret,
+                    s.verify_token,
+                    s.graph_version,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The (unsealed) Cloud API credentials of a `kind='cloud'` session, or
+    /// `None` for an unknown id / a web session.
+    pub fn session_cloud_creds(&self, id: &str) -> rusqlite::Result<Option<CloudCredsRow>> {
+        let row = self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT cloud_phone_number_id, cloud_waba_id, cloud_access_token, \
+                        cloud_app_secret, cloud_verify_token, cloud_graph_version \
+                   FROM sessions WHERE id = ? AND kind = 'cloud'",
+                rusqlite::params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<Vec<u8>>>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(e),
+            })
+        })?;
+        row.map(cloud_creds_from_cols).transpose()
+    }
+
+    /// Replace a cloud session's credentials wholesale (the caller merges a
+    /// partial update over `session_cloud_creds` first). Secrets are re-sealed.
+    pub fn session_set_cloud_creds(
+        &self,
+        id: &str,
+        c: &CloudCredsRow,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        let token = vault::seal(c.access_token.as_bytes());
+        let secret = c.app_secret.as_deref().map(|v| vault::seal(v.as_bytes()));
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE sessions SET \
+                    cloud_phone_number_id = ?, cloud_waba_id = ?, cloud_access_token = ?, \
+                    cloud_app_secret = ?, cloud_verify_token = ?, cloud_graph_version = ?, \
+                    updated_at = ? \
+                 WHERE id = ? AND kind = 'cloud'",
+                rusqlite::params![
+                    c.phone_number_id,
+                    c.waba_id,
+                    token,
+                    secret,
+                    c.verify_token,
+                    c.graph_version,
+                    updated_at,
+                    id,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Resolve the cloud session owning a Meta `phone_number_id` (inbound
+    /// webhooks carry it as `metadata.phone_number_id`).
+    pub fn cloud_session_id_by_phone_number_id(
+        &self,
+        pnid: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id FROM sessions WHERE kind = 'cloud' AND cloud_phone_number_id = ? \
+                  ORDER BY created_at ASC LIMIT 1",
+                rusqlite::params![pnid],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(e),
+            })
+        })
+    }
+
+    /// Whether ANY cloud session's webhook verify token equals `token` (the
+    /// Meta `GET …?hub.verify_token=` handshake). Empty tokens never match.
+    pub fn cloud_verify_token_matches(&self, token: &str) -> rusqlite::Result<bool> {
+        if token.is_empty() {
+            return Ok(false);
+        }
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM sessions WHERE kind = 'cloud' AND cloud_verify_token = ? LIMIT 1",
+                rusqlite::params![token],
+                |_| Ok(()),
+            )
+            .map(|_| true)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                _ => Err(e),
+            })
+        })
+    }
+
+    /// Whether a message row exists (webhook-retry dedupe).
+    pub fn message_exists(
+        &self,
+        session_id: &str,
+        chat_jid: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<bool> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM messages WHERE session_id = ? AND chat_jid = ? AND message_id = ?",
+                rusqlite::params![session_id, chat_jid, message_id],
+                |_| Ok(()),
+            )
+            .map(|_| true)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                _ => Err(e),
+            })
+        })
+    }
+
+    /// The newest inbound (`from_me=0`) message id in a chat — the Cloud API
+    /// typing indicator must be attached to an inbound message id.
+    pub fn latest_inbound_message_id(
+        &self,
+        session_id: &str,
+        chat_jid: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT message_id FROM messages \
+                  WHERE session_id = ? AND chat_jid = ? AND from_me = 0 \
+                  ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+                rusqlite::params![session_id, chat_jid],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(e),
+            })
         })
     }
 
@@ -1694,6 +2027,51 @@ impl SqliteStore {
             Some(b) => Ok(Some(unseal(b)?)),
             None => Ok(None),
         }
+    }
+
+    // ---- instance-wide settings (app_settings) ----
+
+    /// Read an instance-wide setting (unsealed plaintext bytes), or `None`.
+    pub fn setting_get(&self, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+        let raw = self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT value FROM app_settings WHERE key = ?",
+                rusqlite::params![key],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                _ => Err(e),
+            })
+        })?;
+        match raw {
+            Some(b) => Ok(Some(unseal(b)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Upsert an instance-wide setting. The value is sealed at rest (it may
+    /// carry third-party API keys — e.g. the AI assistant config).
+    pub fn setting_set(&self, key: &str, value: &[u8], updated_at: i64) -> rusqlite::Result<()> {
+        let sealed = vault::seal(value);
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                 updated_at = excluded.updated_at",
+                rusqlite::params![key, sealed, updated_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Delete an instance-wide setting (no-op when absent).
+    pub fn setting_delete(&self, key: &str) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute("DELETE FROM app_settings WHERE key = ?", rusqlite::params![key])?;
+            Ok(())
+        })
     }
 
     // ---- contacts / chats (app-state mirror tables) -------------------------
@@ -3242,6 +3620,27 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn message_advance_status(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        status: &str,
+    ) -> rusqlite::Result<bool> {
+        let n = self
+            .conn()?
+            .execute(
+                &format!(
+                    "UPDATE messages SET status=$1 WHERE session_id=$2 AND message_id=$3 \
+                       AND {new} > {stored}",
+                    new = status_rank_sql("$1::text"),
+                    stored = status_rank_sql("status")
+                ),
+                &[&status, &session_id, &message_id],
+            )
+            .map_err(pg_err)?;
+        Ok(n > 0)
+    }
+
     pub fn message_mark_edited(
         &self,
         session_id: &str,
@@ -3525,7 +3924,8 @@ impl PgStore {
         let rows = self
             .conn()?
             .query(
-                "SELECT id,label,status,jid,push_name,created_at,updated_at,proxy_url,mark_online FROM sessions",
+                "SELECT id,label,status,jid,push_name,created_at,updated_at,proxy_url,mark_online, \
+                        kind,cloud_phone_number_id,cloud_waba_id,cloud_graph_version FROM sessions",
                 &[],
             )
             .map_err(pg_err)?;
@@ -3541,8 +3941,39 @@ impl PgStore {
                 updated_at: r.get(6),
                 proxy_url: r.get(7),
                 mark_online: r.get::<_, i32>(8) != 0,
+                kind: r.get(9),
+                cloud_phone_number_id: r.get(10),
+                cloud_waba_id: r.get(11),
+                cloud_graph_version: r.get(12),
             })
             .collect())
+    }
+
+    pub fn session_row(&self, id: &str) -> rusqlite::Result<Option<SessionRow>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT id,label,status,jid,push_name,created_at,updated_at,proxy_url,mark_online, \
+                        kind,cloud_phone_number_id,cloud_waba_id,cloud_graph_version \
+                   FROM sessions WHERE id=$1",
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        Ok(row.map(|r| SessionRow {
+            id: r.get(0),
+            label: r.get(1),
+            status: r.get(2),
+            jid: r.get(3),
+            push_name: r.get(4),
+            created_at: r.get(5),
+            updated_at: r.get(6),
+            proxy_url: r.get(7),
+            mark_online: r.get::<_, i32>(8) != 0,
+            kind: r.get(9),
+            cloud_phone_number_id: r.get(10),
+            cloud_waba_id: r.get(11),
+            cloud_graph_version: r.get(12),
+        }))
     }
 
     pub fn session_mark_online(&self, id: &str) -> rusqlite::Result<bool> {
@@ -3640,6 +4071,24 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn session_history_synced_at(&self, id: &str) -> rusqlite::Result<Option<i64>> {
+        let row = self
+            .conn()?
+            .query_opt("SELECT history_synced_at FROM sessions WHERE id=$1", &[&id])
+            .map_err(pg_err)?;
+        Ok(row.and_then(|r| r.get::<_, Option<i64>>(0)))
+    }
+
+    pub fn session_set_history_synced_at(&self, id: &str, at: i64) -> rusqlite::Result<()> {
+        self.conn()?
+            .execute(
+                "UPDATE sessions SET history_synced_at = $1 WHERE id = $2",
+                &[&at, &id],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
     pub fn session_push_name(&self, id: &str) -> rusqlite::Result<Option<String>> {
         let row = self
             .conn()?
@@ -3687,6 +4136,184 @@ impl PgStore {
             )
             .map_err(pg_err)?;
         Ok(())
+    }
+
+    pub fn session_set_status(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn()?
+            .execute(
+                "UPDATE sessions SET status=$1, updated_at=$2 WHERE id=$3",
+                &[&status, &updated_at, &id],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn session_set_jid_and_push_name(
+        &self,
+        id: &str,
+        jid: Option<&str>,
+        push_name: Option<&str>,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn()?
+            .execute(
+                "UPDATE sessions SET jid=$1, push_name=$2, updated_at=$3 WHERE id=$4",
+                &[&jid, &push_name, &updated_at, &id],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    // ---- cloud (Meta Cloud API) sessions ----
+    pub fn create_cloud_session(&self, s: &NewCloudSession) -> rusqlite::Result<()> {
+        let token = vault::seal(s.access_token.as_bytes());
+        let secret = s.app_secret.map(|v| vault::seal(v.as_bytes()));
+        self.conn()?
+            .execute(
+                "INSERT INTO sessions (\
+                    id,label,status,jid,api_key,proxy_url,created_at,updated_at, \
+                    kind,cloud_phone_number_id,cloud_waba_id,cloud_access_token, \
+                    cloud_app_secret,cloud_verify_token,cloud_graph_version) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'cloud',$9,$10,$11,$12,$13,$14)",
+                &[
+                    &s.id,
+                    &s.label,
+                    &s.status,
+                    &s.jid,
+                    &s.api_key,
+                    &s.proxy_url,
+                    &s.created_at,
+                    &s.updated_at,
+                    &s.phone_number_id,
+                    &s.waba_id,
+                    &token,
+                    &secret,
+                    &s.verify_token,
+                    &s.graph_version,
+                ],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn session_cloud_creds(&self, id: &str) -> rusqlite::Result<Option<CloudCredsRow>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT cloud_phone_number_id,cloud_waba_id,cloud_access_token, \
+                        cloud_app_secret,cloud_verify_token,cloud_graph_version \
+                   FROM sessions WHERE id=$1 AND kind='cloud'",
+                &[&id],
+            )
+            .map_err(pg_err)?;
+        row.map(|r| {
+            cloud_creds_from_cols((
+                r.get::<_, Option<String>>(0),
+                r.get::<_, Option<String>>(1),
+                r.get::<_, Option<Vec<u8>>>(2),
+                r.get::<_, Option<Vec<u8>>>(3),
+                r.get::<_, Option<String>>(4),
+                r.get::<_, Option<String>>(5),
+            ))
+        })
+        .transpose()
+    }
+
+    pub fn session_set_cloud_creds(
+        &self,
+        id: &str,
+        c: &CloudCredsRow,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        let token = vault::seal(c.access_token.as_bytes());
+        let secret = c.app_secret.as_deref().map(|v| vault::seal(v.as_bytes()));
+        self.conn()?
+            .execute(
+                "UPDATE sessions SET \
+                    cloud_phone_number_id=$1, cloud_waba_id=$2, cloud_access_token=$3, \
+                    cloud_app_secret=$4, cloud_verify_token=$5, cloud_graph_version=$6, \
+                    updated_at=$7 \
+                 WHERE id=$8 AND kind='cloud'",
+                &[
+                    &c.phone_number_id,
+                    &c.waba_id,
+                    &token,
+                    &secret,
+                    &c.verify_token,
+                    &c.graph_version,
+                    &updated_at,
+                    &id,
+                ],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn cloud_session_id_by_phone_number_id(
+        &self,
+        pnid: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT id FROM sessions WHERE kind='cloud' AND cloud_phone_number_id=$1 \
+                 ORDER BY created_at ASC LIMIT 1",
+                &[&pnid],
+            )
+            .map_err(pg_err)?;
+        Ok(row.map(|r| r.get::<_, String>(0)))
+    }
+
+    pub fn cloud_verify_token_matches(&self, token: &str) -> rusqlite::Result<bool> {
+        if token.is_empty() {
+            return Ok(false);
+        }
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT 1 FROM sessions WHERE kind='cloud' AND cloud_verify_token=$1 LIMIT 1",
+                &[&token],
+            )
+            .map_err(pg_err)?;
+        Ok(row.is_some())
+    }
+
+    pub fn message_exists(
+        &self,
+        session_id: &str,
+        chat_jid: &str,
+        message_id: &str,
+    ) -> rusqlite::Result<bool> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT 1 FROM messages WHERE session_id=$1 AND chat_jid=$2 AND message_id=$3",
+                &[&session_id, &chat_jid, &message_id],
+            )
+            .map_err(pg_err)?;
+        Ok(row.is_some())
+    }
+
+    pub fn latest_inbound_message_id(
+        &self,
+        session_id: &str,
+        chat_jid: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT message_id FROM messages \
+                 WHERE session_id=$1 AND chat_jid=$2 AND from_me=0 \
+                 ORDER BY timestamp DESC LIMIT 1",
+                &[&session_id, &chat_jid],
+            )
+            .map_err(pg_err)?;
+        Ok(row.map(|r| r.get::<_, String>(0)))
     }
 
     // ---- leases ----
@@ -3894,6 +4521,38 @@ impl PgStore {
             Some(r) => Ok(Some(unseal(r.get::<_, Vec<u8>>(0))?)),
             None => Ok(None),
         }
+    }
+
+    // ---- instance-wide settings (app_settings) ----
+    pub fn setting_get(&self, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+        let row = self
+            .conn()?
+            .query_opt("SELECT value FROM app_settings WHERE key=$1", &[&key])
+            .map_err(pg_err)?;
+        match row {
+            Some(r) => Ok(Some(unseal(r.get::<_, Vec<u8>>(0))?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn setting_set(&self, key: &str, value: &[u8], updated_at: i64) -> rusqlite::Result<()> {
+        let sealed = vault::seal(value);
+        self.conn()?
+            .execute(
+                "INSERT INTO app_settings (key,value,updated_at) VALUES ($1,$2,$3) \
+                 ON CONFLICT (key) DO UPDATE SET value=excluded.value, \
+                 updated_at=excluded.updated_at",
+                &[&key, &sealed, &updated_at],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn setting_delete(&self, key: &str) -> rusqlite::Result<()> {
+        self.conn()?
+            .execute("DELETE FROM app_settings WHERE key=$1", &[&key])
+            .map_err(pg_err)?;
+        Ok(())
     }
 
     // ---- contacts / chats / groups ----
@@ -4626,6 +5285,17 @@ fn pg_row_to_egress(r: &postgres::Row) -> EgressTarget {
     }
 }
 
+/// SQL `CASE` ranking a message lifecycle status for the monotonic
+/// `message_advance_status` update (`sent < delivered < read < failed`;
+/// anything else — NULL, `pending`, … — ranks lowest). `expr` is a column
+/// name or a bound-parameter placeholder.
+fn status_rank_sql(expr: &str) -> String {
+    format!(
+        "(CASE {expr} WHEN 'sent' THEN 1 WHEN 'delivered' THEN 2 \
+                      WHEN 'read' THEN 3 WHEN 'failed' THEN 4 ELSE 0 END)"
+    )
+}
+
 /// A session's restore-time metadata row (status is the raw stored string).
 pub struct SessionRow {
     pub id: String,
@@ -4637,6 +5307,78 @@ pub struct SessionRow {
     pub updated_at: i64,
     pub proxy_url: Option<String>,
     pub mark_online: bool,
+    /// Backend discriminator: `"web"` (companion device) or `"cloud"` (Meta
+    /// Cloud API). Pre-0021 rows read back as `"web"` via the column default.
+    pub kind: String,
+    /// Non-secret cloud identifiers (None for web sessions).
+    pub cloud_phone_number_id: Option<String>,
+    pub cloud_waba_id: Option<String>,
+    pub cloud_graph_version: Option<String>,
+}
+
+/// Columns for a fresh `kind='cloud'` session row (no device keys). Secrets are
+/// passed PLAINTEXT and sealed inside `create_cloud_session`.
+pub struct NewCloudSession<'a> {
+    pub id: &'a str,
+    pub label: Option<&'a str>,
+    pub status: &'a str,
+    pub jid: Option<&'a str>,
+    pub api_key: &'a str,
+    pub proxy_url: Option<&'a str>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub phone_number_id: &'a str,
+    pub waba_id: Option<&'a str>,
+    pub access_token: &'a str,
+    pub app_secret: Option<&'a str>,
+    pub verify_token: Option<&'a str>,
+    pub graph_version: &'a str,
+}
+
+/// A cloud session's credentials as read from the store (secrets UNSEALED).
+/// Never serialized to the API — `session.rs` maps the non-secret part into
+/// `CloudPublic`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudCredsRow {
+    pub phone_number_id: String,
+    pub waba_id: Option<String>,
+    pub access_token: String,
+    pub app_secret: Option<String>,
+    pub verify_token: Option<String>,
+    pub graph_version: String,
+}
+
+/// Shared column→row mapping for `session_cloud_creds` (both backends):
+/// unseals the two secret blobs, defaults a missing graph version.
+#[allow(clippy::type_complexity)]
+fn cloud_creds_from_cols(
+    (pnid, waba_id, token, secret, verify_token, graph_version): (
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+    ),
+) -> rusqlite::Result<CloudCredsRow> {
+    let access_token = match token {
+        Some(b) => String::from_utf8(unseal(b)?).unwrap_or_default(),
+        None => String::new(),
+    };
+    let app_secret = match secret {
+        Some(b) => Some(String::from_utf8(unseal(b)?).unwrap_or_default()).filter(|s| !s.is_empty()),
+        None => None,
+    };
+    Ok(CloudCredsRow {
+        phone_number_id: pnid.unwrap_or_default(),
+        waba_id: waba_id.filter(|s| !s.is_empty()),
+        access_token,
+        app_secret,
+        verify_token: verify_token.filter(|s| !s.is_empty()),
+        graph_version: graph_version
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::cloud::DEFAULT_GRAPH_VERSION.to_string()),
+    })
 }
 
 /// All columns needed to insert a fresh session row (borrowed; the byte slices
@@ -4732,6 +5474,10 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/0018_messages_revoked.sql")),
         M::up(include_str!("../migrations/0019_nct_salt.sql")),
         M::up(include_str!("../migrations/0020_privacy_tokens.sql")),
+        M::up(include_str!("../migrations/0021_cloud_sessions.sql")),
+        M::up(include_str!("../migrations/0022_cloud_pnid_unique.sql")),
+        M::up(include_str!("../migrations/0023_app_settings.sql")),
+        M::up(include_str!("../migrations/0024_history_synced.sql")),
     ])
 }
 
@@ -5773,5 +6519,296 @@ mod tests {
         let removed_age = store.event_log_prune("s1", 100, i64::MAX).unwrap();
         assert_eq!(removed_age, 2);
         assert!(store.event_log_list("s1", i64::MAX, None, 100).unwrap().is_empty());
+    }
+
+    // ---- cloud sessions ----------------------------------------------------
+
+    /// Seed a `kind='cloud'` session row (obviously-fake Meta ids/secrets).
+    fn seed_cloud_session(store: &Store, id: &str, pnid: &str, verify_token: Option<&str>) {
+        store
+            .create_cloud_session(&NewCloudSession {
+                id,
+                label: Some("cloud test"),
+                status: "pending",
+                jid: None,
+                api_key: "k-cloud",
+                proxy_url: None,
+                created_at: 10,
+                updated_at: 10,
+                phone_number_id: pnid,
+                waba_id: Some("102300000000000"),
+                access_token: "EAAG-fake-access-token",
+                app_secret: Some("fake-app-secret"),
+                verify_token,
+                graph_version: "v25.0",
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn cloud_session_creds_roundtrip_and_kind_in_sessions_all() {
+        let store = Store::open(":memory:").unwrap();
+        seed_cloud_session(&store, "c1", "106540352242922", Some("my-verify"));
+        seed_session(&store, "w1"); // a web session alongside
+
+        // Secrets round-trip through seal/unseal; non-secrets verbatim.
+        let creds = store.session_cloud_creds("c1").unwrap().expect("cloud creds");
+        assert_eq!(
+            creds,
+            CloudCredsRow {
+                phone_number_id: "106540352242922".into(),
+                waba_id: Some("102300000000000".into()),
+                access_token: "EAAG-fake-access-token".into(),
+                app_secret: Some("fake-app-secret".into()),
+                verify_token: Some("my-verify".into()),
+                graph_version: "v25.0".into(),
+            }
+        );
+        // A web session has no cloud creds; unknown ids neither.
+        assert!(store.session_cloud_creds("w1").unwrap().is_none());
+        assert!(store.session_cloud_creds("nope").unwrap().is_none());
+
+        // sessions_all carries kind + the non-secret cloud columns for BOTH kinds.
+        let rows = store.sessions_all().unwrap();
+        let c = rows.iter().find(|r| r.id == "c1").unwrap();
+        assert_eq!(c.kind, "cloud");
+        assert_eq!(c.cloud_phone_number_id.as_deref(), Some("106540352242922"));
+        assert_eq!(c.cloud_waba_id.as_deref(), Some("102300000000000"));
+        assert_eq!(c.cloud_graph_version.as_deref(), Some("v25.0"));
+        assert_eq!(c.status, "pending");
+        let w = rows.iter().find(|r| r.id == "w1").unwrap();
+        assert_eq!(w.kind, "web"); // column default for pre-0021 rows
+        assert!(w.cloud_phone_number_id.is_none());
+
+        // The per-tenant api key is stored like a web session's.
+        assert_eq!(store.session_api_key("c1").unwrap().as_deref(), Some("k-cloud"));
+        // No device keys were written (the key columns are NULL, so the web
+        // loader can't build a DeviceKeyRow — `connect` must branch on kind first).
+        assert!(store.device_keys_load("c1").is_err());
+    }
+
+    #[test]
+    fn cloud_session_set_creds_replaces_and_reseals() {
+        let store = Store::open(":memory:").unwrap();
+        seed_cloud_session(&store, "c1", "106540352242922", None);
+        let updated = CloudCredsRow {
+            phone_number_id: "106540352242923".into(),
+            waba_id: None,
+            access_token: "EAAG-rotated".into(),
+            app_secret: None,
+            verify_token: Some("vt2".into()),
+            graph_version: "v26.0".into(),
+        };
+        store.session_set_cloud_creds("c1", &updated, 20).unwrap();
+        assert_eq!(store.session_cloud_creds("c1").unwrap().unwrap(), updated);
+        // Lookup by phone_number_id follows the update.
+        assert_eq!(
+            store.cloud_session_id_by_phone_number_id("106540352242923").unwrap().as_deref(),
+            Some("c1")
+        );
+        assert!(store.cloud_session_id_by_phone_number_id("106540352242922").unwrap().is_none());
+        // updated_at bumped.
+        let row = store.sessions_all().unwrap().into_iter().find(|r| r.id == "c1").unwrap();
+        assert_eq!(row.updated_at, 20);
+    }
+
+    #[test]
+    fn cloud_session_lookup_by_phone_number_id_and_verify_token() {
+        let store = Store::open(":memory:").unwrap();
+        seed_cloud_session(&store, "c1", "106540352242922", Some("my-verify"));
+        seed_cloud_session(&store, "c2", "106540352242999", None);
+        seed_session(&store, "w1");
+
+        assert_eq!(
+            store.cloud_session_id_by_phone_number_id("106540352242922").unwrap().as_deref(),
+            Some("c1")
+        );
+        assert_eq!(
+            store.cloud_session_id_by_phone_number_id("106540352242999").unwrap().as_deref(),
+            Some("c2")
+        );
+        assert!(store.cloud_session_id_by_phone_number_id("000").unwrap().is_none());
+
+        assert!(store.cloud_verify_token_matches("my-verify").unwrap());
+        assert!(!store.cloud_verify_token_matches("other").unwrap());
+        assert!(!store.cloud_verify_token_matches("").unwrap());
+    }
+
+    #[test]
+    fn session_set_status_and_jid_push_name_persist() {
+        let store = Store::open(":memory:").unwrap();
+        seed_cloud_session(&store, "c1", "106540352242922", None);
+        store.session_set_status("c1", "connected", 30).unwrap();
+        store
+            .session_set_jid_and_push_name("c1", Some("5511999999999@s.whatsapp.net"), Some("Acme"), 31)
+            .unwrap();
+        let row = store.sessions_all().unwrap().into_iter().find(|r| r.id == "c1").unwrap();
+        assert_eq!(row.status, "connected");
+        assert_eq!(row.jid.as_deref(), Some("5511999999999@s.whatsapp.net"));
+        assert_eq!(row.push_name.as_deref(), Some("Acme"));
+        assert_eq!(row.updated_at, 31);
+        // Also works on a web session (generic status write).
+        seed_session(&store, "w1");
+        store.session_set_status("w1", "logged_out", 40).unwrap();
+        let w = store.sessions_all().unwrap().into_iter().find(|r| r.id == "w1").unwrap();
+        assert_eq!(w.status, "logged_out");
+    }
+
+    #[test]
+    fn message_exists_and_latest_inbound_message_id() {
+        let store = Store::open(":memory:").unwrap();
+        seed_cloud_session(&store, "c1", "106540352242922", None);
+        let chat = "5511999999999@s.whatsapp.net";
+        let insert = |id: &str, from_me: bool, ts: i64| {
+            store
+                .message_insert(
+                    &NewMessage {
+                        session_id: "c1",
+                        chat_jid: chat,
+                        message_id: id,
+                        sender_jid: if from_me { "self" } else { chat },
+                        from_me,
+                        timestamp: ts,
+                        msg_type: "text",
+                        body_text: Some("hi"),
+                        payload_json: r#"{"type":"text","text":"hi"}"#,
+                        status: None,
+                    },
+                    true,
+                )
+                .unwrap();
+        };
+        assert!(!store.message_exists("c1", chat, "wamid.HBgLAAA1").unwrap());
+        assert!(store.latest_inbound_message_id("c1", chat).unwrap().is_none());
+
+        insert("wamid.HBgLAAA1", false, 100);
+        insert("wamid.HBgLAAA2", true, 200); // ours — must not win
+        insert("wamid.HBgLAAA3", false, 150);
+
+        assert!(store.message_exists("c1", chat, "wamid.HBgLAAA1").unwrap());
+        assert!(!store.message_exists("c1", "other@s.whatsapp.net", "wamid.HBgLAAA1").unwrap());
+        assert_eq!(
+            store.latest_inbound_message_id("c1", chat).unwrap().as_deref(),
+            Some("wamid.HBgLAAA3")
+        );
+    }
+
+    #[test]
+    fn message_advance_status_is_monotonic_and_reports_changes() {
+        let store = Store::open(":memory:").unwrap();
+        seed_cloud_session(&store, "c1", "106540352242922", None);
+        let chat = "5511999999999@s.whatsapp.net";
+        store
+            .message_insert(
+                &NewMessage {
+                    session_id: "c1",
+                    chat_jid: chat,
+                    message_id: "wamid.HBgLOUT1",
+                    sender_jid: "self",
+                    from_me: true,
+                    timestamp: 100,
+                    msg_type: "text",
+                    body_text: Some("hi"),
+                    payload_json: r#"{"type":"text","text":"hi"}"#,
+                    status: Some("sent"),
+                },
+                true,
+            )
+            .unwrap();
+        let status_of = || -> String {
+            store
+                .with_conn(|c| {
+                    c.query_row(
+                        "SELECT status FROM messages WHERE session_id='c1' AND message_id='wamid.HBgLOUT1'",
+                        [],
+                        |r| r.get(0),
+                    )
+                })
+                .unwrap()
+        };
+        // Same status again (retried `sent` webhook) → no change.
+        assert!(!store.message_advance_status("c1", "wamid.HBgLOUT1", "sent").unwrap());
+        // Forward moves apply…
+        assert!(store.message_advance_status("c1", "wamid.HBgLOUT1", "read").unwrap());
+        assert_eq!(status_of(), "read");
+        // …but a late/duplicate `delivered` after `read` does not regress it.
+        assert!(!store.message_advance_status("c1", "wamid.HBgLOUT1", "delivered").unwrap());
+        assert!(!store.message_advance_status("c1", "wamid.HBgLOUT1", "read").unwrap());
+        assert_eq!(status_of(), "read");
+        // `failed` is terminal: it applies once and nothing overrides it.
+        assert!(store.message_advance_status("c1", "wamid.HBgLOUT1", "failed").unwrap());
+        assert!(!store.message_advance_status("c1", "wamid.HBgLOUT1", "sent").unwrap());
+        assert_eq!(status_of(), "failed");
+        // Unknown message id → no row touched, reported as unchanged.
+        assert!(!store.message_advance_status("c1", "wamid.HBgLNOPE", "delivered").unwrap());
+        assert!(!store.message_advance_status("other", "wamid.HBgLOUT1", "delivered").unwrap());
+        // The unconditional setter is untouched (web receipts arrive in order).
+        store.message_set_status("c1", "wamid.HBgLOUT1", "delivered").unwrap();
+        assert_eq!(status_of(), "delivered");
+    }
+
+    #[test]
+    fn cloud_phone_number_id_is_unique_across_sessions() {
+        let store = Store::open(":memory:").unwrap();
+        seed_cloud_session(&store, "c1", "106540352242922", None);
+        // Same number on a second row → constraint error (0022 unique index).
+        let err = store
+            .create_cloud_session(&NewCloudSession {
+                id: "c2",
+                label: None,
+                status: "pending",
+                jid: None,
+                api_key: "k-cloud-2",
+                proxy_url: None,
+                created_at: 11,
+                updated_at: 11,
+                phone_number_id: "106540352242922",
+                waba_id: None,
+                access_token: "EAAG-x",
+                app_secret: None,
+                verify_token: None,
+                graph_version: "v25.0",
+            })
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unique"), "{err}");
+        // A different number is fine, and web rows (NULL pnid) don't collide.
+        seed_cloud_session(&store, "c3", "106540352242999", None);
+        seed_session(&store, "w1");
+        seed_session(&store, "w2");
+        assert!(store.session_row("c3").unwrap().is_some_and(|r| r.kind == "cloud"));
+        assert!(store.session_row("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn app_settings_roundtrip_sealed_at_rest() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.setting_get("ai").unwrap().is_none());
+        let cfg = br#"{"provider":"anthropic","api_key":"sk-test-0000abcd"}"#;
+        store.setting_set("ai", cfg, 100).unwrap();
+        assert_eq!(store.setting_get("ai").unwrap().as_deref(), Some(&cfg[..]));
+        // Upsert replaces the value + timestamp.
+        store.setting_set("ai", b"{}", 200).unwrap();
+        assert_eq!(store.setting_get("ai").unwrap().as_deref(), Some(&b"{}"[..]));
+        let (raw, ts): (Vec<u8>, i64) = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT value, updated_at FROM app_settings WHERE key='ai'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(ts, 200);
+        // The raw column goes through the vault choke point: it opens back to
+        // the plaintext, and is the sealed envelope whenever a key is configured
+        // (pass-through otherwise — same contract as every other secret column).
+        assert_eq!(vault::open(&raw).unwrap(), b"{}".to_vec());
+        if vault::enabled() {
+            assert_ne!(raw, b"{}".to_vec());
+        }
+        // Delete is idempotent.
+        store.setting_delete("ai").unwrap();
+        store.setting_delete("ai").unwrap();
+        assert!(store.setting_get("ai").unwrap().is_none());
     }
 }

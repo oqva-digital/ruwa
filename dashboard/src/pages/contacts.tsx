@@ -4,6 +4,7 @@ import { toast } from "sonner"
 import { SearchCheck, Ban, Loader2 } from "lucide-react"
 import { api } from "@/lib/api"
 import type { SessionMeta, OnWhatsAppResult } from "@/lib/types"
+import { isCloud } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import { SectionCard } from "@/components/ui-bits"
 import { Card } from "@/components/ui/card"
@@ -18,6 +19,8 @@ export function ContactsPage({ inst, readonly }: { inst: SessionMeta; readonly: 
   const [numbers, setNumbers] = useState("")
   const [checking, setChecking] = useState(false)
   const [results, setResults] = useState<OnWhatsAppResult[] | null>(null)
+  // onWhatsApp lookups + block are WhatsApp-Web-only routes (501 on cloud).
+  const cloud = isCloud(inst)
 
   const data = useQuery({
     queryKey: [tab, inst.id],
@@ -52,7 +55,7 @@ export function ContactsPage({ inst, readonly }: { inst: SessionMeta; readonly: 
         <div className="mt-0.5 text-xs text-muted-foreground">Directory + tools for {inst.label ?? inst.id}</div>
       </div>
 
-      <SectionCard title="onWhatsApp check" icon={SearchCheck}>
+      {!cloud && <SectionCard title="onWhatsApp check" icon={SearchCheck}>
         <div className="space-y-3 p-4">
           <Textarea value={numbers} onChange={(e) => setNumbers(e.target.value)} placeholder="Paste numbers (one per line or comma-separated)…" className="mono h-20 text-xs" />
           <div className="flex justify-end">
@@ -72,11 +75,11 @@ export function ContactsPage({ inst, readonly }: { inst: SessionMeta; readonly: 
             </div>
           )}
         </div>
-      </SectionCard>
+      </SectionCard>}
 
       <div className="flex rounded-md bg-muted p-0.5 w-fit">
-        {(["contacts", "chats", "groups"] as Tab[]).map((t) => (
-          <button key={t} onClick={() => setTab(t)} className={cn("rounded px-3 py-1 text-xs font-medium capitalize", tab === t ? "bg-card text-foreground shadow-sm" : "text-muted-foreground")}>{t}</button>
+        {(cloud ? ["contacts", "chats"] : ["contacts", "chats", "groups"]).map((t) => (
+          <button key={t} onClick={() => setTab(t as Tab)} className={cn("rounded px-3 py-1 text-xs font-medium capitalize", tab === t ? "bg-card text-foreground shadow-sm" : "text-muted-foreground")}>{t}</button>
         ))}
       </div>
 
@@ -86,7 +89,7 @@ export function ContactsPage({ inst, readonly }: { inst: SessionMeta; readonly: 
             <TableHeader>
               <TableRow>
                 {cols.map((c) => <TableHead key={c} className="capitalize">{c.replace("_", " ")}</TableHead>)}
-                {tab === "contacts" && <TableHead className="w-10" />}
+                {tab === "contacts" && !cloud && <TableHead className="w-10" />}
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -98,7 +101,7 @@ export function ContactsPage({ inst, readonly }: { inst: SessionMeta; readonly: 
                       {String(r[c] ?? "—")}
                     </TableCell>
                   ))}
-                  {tab === "contacts" && (
+                  {tab === "contacts" && !cloud && (
                     <TableCell>
                       <Button size="icon" variant="ghost" className="h-7 w-7" disabled={readonly} onClick={() => block(String(r.jid))} title="Block">
                         <Ban className="h-3.5 w-3.5" />

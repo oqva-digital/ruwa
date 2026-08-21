@@ -133,7 +133,7 @@ function App() {
   const fullHeight = ipage === "logs" || ipage === "messaging"
   let body
   if (ipage === "overview") body = <OverviewPage inst={current} onNav={setIpage} readonly={readonly} />
-  else if (ipage === "pairing") body = <PairingPage inst={current} />
+  else if (ipage === "pairing") body = <PairingPage inst={current} readonly={readonly} />
   else if (ipage === "messaging") body = <MessagingPage inst={current} />
   else if (ipage === "contacts") body = <ContactsPage inst={current} readonly={readonly} />
   else if (ipage === "logs") body = <LogsPage scope="instance" instances={[current]} label={current.label ?? current.id} />
@@ -161,6 +161,7 @@ function App() {
           onToggle={() => setCollapsed((c) => !c)}
           mobileOpen={mobileNav}
           onMobileClose={() => setMobileNav(false)}
+          kind={current.kind}
         />
         <main className={"flex min-w-0 flex-1 flex-col " + (fullHeight ? "overflow-hidden p-4 sm:p-6" : "overflow-auto px-4 pb-10 pt-5 sm:px-6")}>
           {body}

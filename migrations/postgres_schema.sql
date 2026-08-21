@@ -35,6 +35,23 @@ CREATE TABLE IF NOT EXISTS sessions (
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS mark_online INTEGER NOT NULL DEFAULT 0;
 -- Idempotent add for the NCT salt (cstoken derivation), added later.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS nct_salt BYTEA;
+-- When the session last persisted a heavy history-sync chunk (mirror of SQLite
+-- migration 0024). NULL = never bootstrapped.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS history_synced_at BIGINT;
+-- Session backend discriminator + Meta Cloud API credentials (mirror of SQLite
+-- migration 0021). `kind` = 'web' | 'cloud'; secrets are sealed BYTEA.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'web';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_phone_number_id TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_waba_id TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_access_token BYTEA;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_app_secret BYTEA;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_verify_token TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_graph_version TEXT;
+-- One cloud session per phone_number_id (mirror of SQLite migration 0022):
+-- webhooks resolve their session by it, so duplicates would shadow each other.
+DROP INDEX IF EXISTS idx_sessions_cloud_pnid;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_cloud_pnid_unique
+    ON sessions(cloud_phone_number_id) WHERE cloud_phone_number_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS prekeys (
     session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -259,4 +276,13 @@ CREATE TABLE IF NOT EXISTS privacy_tokens (
     timestamp        BIGINT NOT NULL DEFAULT 0,
     sender_timestamp BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, peer_lid)
+);
+
+-- Instance-wide key/value settings (mirror of SQLite migration 0023): first
+-- consumer is the Console's AI text assistant config (key 'ai', JSON). `value`
+-- is sealed at rest via the vault (it can carry third-party API keys).
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT   PRIMARY KEY,
+    value      BYTEA  NOT NULL,
+    updated_at BIGINT NOT NULL
 );

@@ -4,18 +4,24 @@ An **MCP server** exposing ruwa (RUWA — Rust WhatsApp) as agent tools, so any 
 client (Claude Desktop, Claude Code, …) can drive WhatsApp. A thin wrapper over
 the `/v1` HTTP API — the ruwa core stays lean.
 
-## Tools (38)
+## Tools (45)
 
 An agent can run a WhatsApp account end-to-end — spin up an instance, pair it,
 read/search history (keyword **and** semantic), hold a conversation, manage
-contacts/profile, and wire up event delivery.
+contacts/profile, and wire up event delivery. Instances come in two kinds:
+`web` (a WhatsApp Web linked device, paired via QR / phone code) and `cloud`
+(a Meta WhatsApp Cloud API number — no pairing, credentials instead; supports
+templates + interactive messages, and must open conversations with a template
+outside the 24h customer-service window).
 
 **Instance lifecycle**
-- `create_session` — create a new instance (optional label + proxy)
+- `create_session` — create a new instance (optional label + proxy); `kind: "web"` (default) or `kind: "cloud"` + `cloud` credentials (`phone_number_id`, `access_token`, `waba_id`, `app_secret`, `verify_token`, `graph_version`)
+- `update_cloud_creds` — rotate/replace a cloud session's Meta credentials (cloud only)
 - `get_qr` — pairing QR payload to scan in WhatsApp → Linked devices
 - `pair_phone` — 8-char "Link with phone number" code (QR alternative, no scanning)
 - `get_session` — one instance's status / JID / proxy
-- `connect_session` — (re)connect a disconnected session
+- `connect_session` — (re)connect a disconnected session (cloud: validates the credentials against Graph)
+- `reconnect_session` — force a fresh reconnect even while connected (web: socket bounce / rekey; cloud: re-validate rotated credentials)
 - `logout_session` — unlink the device
 - `delete_session` — delete an instance + its data (destructive)
 
@@ -26,10 +32,12 @@ contacts/profile, and wire up event delivery.
 - `list_contacts` (search by name/number) · `on_whatsapp` (real round-trip check)
 - `download_media` (save a message's media to a local file)
 - `backfill_history` (pull older history once) · `sync_history` (deep-backfill a chat to its start)
+- `list_templates` (cloud only — approved/pending templates of the WABA, paginated)
 
 **Send**
 - `send_text` (with @mentions + quote/reply) · `send_media` · `send_location`
 - `send_contact` · `send_poll` · `send_reaction` · `edit_message` · `revoke_message`
+- `send_template` (cloud only — approved template with body params / header / buttons; the only way to start a chat outside the 24h window) · `send_interactive` (cloud only — reply buttons, list menu, CTA URL)
 
 **Act human**
 - `mark_read` (blue ticks) · `set_typing` (composing/paused) · `set_presence`

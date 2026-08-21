@@ -2001,6 +2001,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -2133,7 +2134,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "ruwa"
-version = "0.3.20"
+version = "0.4.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2173,8 +2174,10 @@ dependencies = [
  "rusqlite_migration",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "snow",
+ "subtle",
  "thiserror 2.0.18",
  "tokio",
  "tokio-native-tls",
