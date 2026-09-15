@@ -1,7 +1,7 @@
 # Installing ruwa as an MCP server
 
 `ruwa-mcp` exposes a running [ruwa](../README.md) server to any **Model Context
-Protocol** client (Claude Code, Claude Desktop, Cursor, …) as 45 tools, so an AI
+Protocol** client (Claude Code, Claude Desktop, Cursor, …) as 47 tools, so an AI
 agent can create WhatsApp instances, pair them, send messages, search history by
 meaning, and more.
 
@@ -120,7 +120,7 @@ The agent should call `list_sessions` / `create_session` / `get_qr` / `send_text
 
 ## 5. Tools
 
-45 tools across instance lifecycle (WhatsApp Web **and** Meta Cloud API
+47 tools across instance lifecycle (WhatsApp Web **and** Meta Cloud API
 instances), sending (incl. Cloud API templates + interactive messages),
 human-like actions, reads (keyword **and** semantic search, plus deep history
 backfill), and webhooks — see [`README.md`](README.md#tools-45) for the full list. Semantic search needs one

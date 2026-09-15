@@ -57,13 +57,18 @@ ruwa/
 GET  /health
 GET  /v1/sessions
 POST /v1/sessions                     {"label": "...", "kind": "web"|"cloud",
-                                       "cloud": {"phone_number_id","waba_id","access_token","app_secret","verify_token","graph_version"}}
-GET  /v1/sessions/:id                 (SessionMeta carries "kind" and, for cloud, "cloud": {phone_number_id, waba_id, graph_version, display_phone_number?, verified_name?} — never secrets)
+                                       "cloud": {"provider":"meta"|"kapso", "phone_number_id","waba_id","access_token","app_secret","verify_token","graph_version",
+                                                 (kapso create-only) "connection_type":"dedicated"|"coexistence","country_isos":["BR",..],"language","provision_phone_number",
+                                                 "success_redirect_url","failure_redirect_url"}}
+GET  /v1/sessions/:id                 (SessionMeta carries "kind" and, for cloud, "cloud": {provider, phone_number_id, waba_id, graph_version, display_phone_number?, verified_name?,
+                                       (kapso) onboarding_status:"pending"|"connected", setup_link} — never secrets)
 PUT  /v1/sessions/:id/cloud           {same "cloud" object; only provided fields replace}  (cloud only; 501 on web)
-DELETE /v1/sessions/:id
+POST /v1/sessions/:id/cloud/setup-link  -> 200 {"setup_link": "https://app.kapso.ai/setup/…"}  (kapso + still-pending only; regenerate)
+DELETE /v1/sessions/:id                 (kapso: also offboards the number + deletes the Kapso customer, best-effort; ?keep_remote=1 to skip)
 
 POST /v1/sessions/:id/connect         (initiates pairing if unpaired, else reconnects)
-POST /v1/sessions/:id/reconnect       (force a real socket bounce + re-login without re-pairing)
+POST /v1/sessions/:id/reconnect       (force a real socket bounce + re-login without re-pairing;
+                                       also rescues a session stuck in `connecting` by restarting its driver)
 POST /v1/sessions/:id/resync-appstate (force a full app-state snapshot; repopulates NCT salt / tokens)
 GET  /v1/sessions/:id/qr              -> {"code":"...", "image_png_base64":"..."}
 POST /v1/sessions/:id/pair-phone      {"phone":"15551234567"} -> {"code":"ABCD-1234"}  (Link with phone number; alternative to QR)
@@ -74,11 +79,13 @@ POST /v1/sessions/:id/messages/media  multipart: file + JSON metadata
 GET  /v1/sessions/:id/events          SSE stream (qr, paired, message, ...)
 GET  /v1/sessions/:id/messages?chat=...&q=...&limit=...
 GET  /v1/sessions/:id/contacts
-GET  /v1/sessions/:id/chats
+GET  /v1/sessions/:id/chats            (cloud: each row carries "window_expires_at" — unix secs the 24h customer-service window closes, or null)
 GET  /v1/sessions/:id/groups
 POST /v1/sessions/:id/groups/:jid/participants  add|remove|promote|demote
 POST /v1/sessions/:id/presence        {"to":"...","state":"typing|paused"}
 POST /v1/sessions/:id/history/backfill {"chat":"...","count":50,"requests":10}
+GET  /v1/sessions/:id/calls   -> [{call_id, from, is_video, audio_rates}]  (calls currently ringing; populated from inbound offers, cleared on terminate. Never exposes the callKey)
+GET  /v1/sessions/:id/calls/:call_id/audio   WS upgrade (bearer header or ?token=): ANSWERS the call (decrypt callKey → preaccept/accept → connect relay) and bridges audio. Binary frames = 20ms s16le 16kHz mono (640B); ruwa aggregates 3→60ms WA frames. First text frame: {"event":"start",...}. web only
 POST /v1/sessions/:id/calls/:call_id/reject {"peer":"5511..."}  (decline an incoming call; call_id + peer come from the call_offer event. Inbound calls emit call_offer / call_terminate events; no media plane — web only)
 
 # cloud sessions only (501 on web):
@@ -88,9 +95,25 @@ GET  /v1/sessions/:id/templates?status=&limit=&after=   -> {"templates":[{id,nam
 POST /v1/sessions/:id/templates             {"name","language","category","components":[..],"allow_category_change"?} -> 201 {id,status,category}
 DELETE /v1/sessions/:id/templates/:name     (?hsm_id=)  -> {"success":true}
 
+# Broadcasts — bulk-template campaigns (kapso provider only; 501 on web AND on meta cloud):
+POST   /v1/sessions/:id/broadcasts                    {"name","template_id"}  -> 201 broadcast (draft; phone_number_id injected from the session)
+GET    /v1/sessions/:id/broadcasts                    ?status=&page=&per_page=  -> {"items":[broadcast], page, per_page, total_pages, total_count}
+GET    /v1/sessions/:id/broadcasts/:bid               -> broadcast (status + running counts: total/pending/sent/delivered/read/failed/suppressed/responded_count, response_rate)
+POST   /v1/sessions/:id/broadcasts/:bid/recipients    {"recipients":[{phone_number|whatsapp_contact_id,"components":[..Meta..]}]} (<=1000)  -> 201 {added,duplicates,errors:[..]}
+DELETE /v1/sessions/:id/broadcasts/:bid/recipients    -> broadcast (clears the list; a scheduled broadcast returns to draft)
+GET    /v1/sessions/:id/broadcasts/:bid/recipients    ?page=&per_page=  -> {"items":[{phone_number,status,sent_at,delivered_at,read_at,error_message,..}], meta..}
+POST   /v1/sessions/:id/broadcasts/:bid/send          -> 202 broadcast (async; poll GET :bid every 5-10s)
+POST   /v1/sessions/:id/broadcasts/:bid/schedule      {"scheduled_at": ISO-8601 future}  -> 202 broadcast
+POST   /v1/sessions/:id/broadcasts/:bid/cancel        -> broadcast (scheduled -> draft; only while scheduled)
+POST   /v1/sessions/:id/broadcasts/:bid/stop          -> broadcast (halt a sending broadcast; pending recipients stay pending)
+
 # Meta webhook (no bearer; verify-token / HMAC-signature guarded):
 GET  /v1/cloud/webhook                ?hub.mode=subscribe&hub.verify_token=&hub.challenge=  -> 200 raw challenge | 403
 POST /v1/cloud/webhook                raw JSON + X-Hub-Signature-256; routed by metadata.phone_number_id -> 200 | 401 bad signature
+
+# Kapso webhooks (no bearer; X-Webhook-Signature HMAC-SHA256 guarded):
+GET|POST /v1/cloud/kapso/webhook          Kapso native message envelope; routed by phone_number_id; per-number secret_key -> 200 | 401 bad signature
+GET|POST /v1/cloud/kapso/project-webhook  connection lifecycle (whatsapp.phone_number.created, …); RUWA_KAPSO_PROJECT_WEBHOOK_SECRET -> 200 | 401
 
 # AI text assistant (instance-wide; ADMIN token only — a per-session key gets 401):
 GET    /v1/settings/ai                -> {"configured","provider":"anthropic"|"openai"|null,"model","base_url","system_prompt","api_key_hint":"••••abcd"|null}  (never the key)
@@ -169,6 +192,43 @@ All `/v1/*` require `Authorization: Bearer $RUWA_API_TOKEN` — except
   `Error::NotImplemented` = **501** with a clear message. `groups` returns `[]`.
 - Graph version defaults to `v25.0` (per-session `graph_version`). Webhook verify
   token: `RUWA_CLOUD_VERIFY_TOKEN` if set, else any cloud session's `verify_token`.
+
+**Kapso provider.** `sessions.cloud_provider` is `meta` (default) | `kapso`.
+A `kapso` session carries no per-session Meta credentials: `create` calls the
+Kapso Platform API (`RUWA_KAPSO_API_KEY`, base `RUWA_KAPSO_BASE_URL` default
+`https://api.kapso.ai`) to mint a hosted **setup link**, persists it, and parks
+the session `pending_onboarding` with an empty `phone_number_id`.
+`POST /v1/sessions/:id/cloud/setup-link` regenerates the link while still
+pending. The customer completes Meta embedded-signup on Kapso; Kapso then POSTs
+`whatsapp.phone_number.created` to `POST /v1/cloud/kapso/project-webhook`
+(guarded by `RUWA_KAPSO_PROJECT_WEBHOOK_SECRET`), at which point ruwa records the
+`phone_number_id`, registers the per-number message webhook
+(`<RUWA_PUBLIC_BASE_URL>/v1/cloud/kapso/webhook`), validates the number and moves
+the session `pending_onboarding` → `connected` (emits `paired` + `connected`).
+Inbound messages + receipts arrive at `POST /v1/cloud/kapso/webhook` in Kapso's
+native envelope, verified with **`X-Webhook-Signature`** (HMAC-SHA256 of the raw
+body under the per-number `secret_key`) instead of Meta's `X-Hub-Signature-256`.
+Kapso also delivers `whatsapp.message.sent` echoes for messages sent from the
+same number **outside** ruwa — typed in the WhatsApp Business App
+(`origin: business_app`) or dispatched by another system. ruwa ingests these as
+`from_me` rows and forwards `message` + `message_sent`/`message_delivered`/
+`message_read` on the registered webhook, so an externally-driven chat still
+shows up complete. (Meta-provider sessions get no such echo — Meta's status
+webhooks carry no body.)
+Sends go through Kapso's meta-compatible proxy (`/meta/whatsapp/{version}/…`,
+`X-API-Key`), so the payload builders, template/interactive routes and error
+mapping are shared with the Meta provider unchanged. Capability matrix is
+identical to the Meta cloud provider.
+
+**Broadcasts** (bulk-template campaigns) are a Kapso-only surface — a thin proxy
+over the Kapso Platform Broadcasts API with no local state. `SessionManager`
+resolves the session's `phone_number_id` and provider, then forwards to
+`cloud::KapsoPlatform`; a `meta` cloud session (or a web session) gets `501`.
+Recipient parameters are passed through as Meta component objects verbatim
+(`components:[…]` per recipient, ≤1000 per request). Tracking is by polling
+`GET …/broadcasts/:bid` (running counts) and `GET …/broadcasts/:bid/recipients`
+(per-recipient status) — no events are emitted. Template is selected by
+`template_id` (the Meta id returned from `GET/POST …/templates`).
 
 ### AI text assistant design (`egress::ai` + `api.rs`)
 
@@ -400,31 +460,53 @@ references (MIT): `oxidezap/whatsapp-rust` `wacore/src/voip` + `src/voip`
 (primary), `purpshell/meowcaller` (media-loop model); spec at wacrg.org.
 1:1 audio only in v1 — no video, no group calls.
 
-### Lifecycle & control (HTTP + existing egress plane)
+### Lifecycle & control — IMPLEMENTED (v1)
 
-- Events on SSE/webhooks: `call_offer` (shipped), `call_terminate` (shipped),
-  plus `call_active` (media flowing) when the media plane lands.
-- `POST /v1/sessions/:id/calls/:call_id/reject` (shipped).
-- `POST /v1/sessions/:id/calls/:call_id/accept` — answers; media starts when
-  the audio WS is connected (or dialed out). Optional `{"codec":"auto"|"opus"}`.
-- `POST /v1/sessions/:id/calls/:call_id/hangup` — terminate an active call.
+The shipped surface is deliberately small: control is HTTP + the existing
+egress plane; answering, dialing, and hanging up are the audio WebSocket
+itself (open = answer/dial, close = hang up). See `docs/CALLS.md` for the
+full consumer contract + a client example.
 
-### Audio bridge (WebSocket, Twilio-Media-Streams-shaped)
+- Events on SSE/webhooks: `call_offer` `{call_id, from, media?}` and
+  `call_terminate` `{call_id, from, reason?}`.
+- `GET /v1/sessions/:id/calls` — list the calls currently ringing
+  (`call_id`, `from`, `is_video`, `audio_rates`); empty when idle.
+- `POST /v1/sessions/:id/calls/:call_id/reject` — decline a ringing call
+  (body `{"peer": "<caller jid or digits>"}`).
+- `GET /v1/sessions/:id/calls/:call_id/audio` — WS upgrade that ANSWERS a
+  ringing inbound call and bridges its audio. Web sessions only.
+- `GET /v1/sessions/:id/calls/dial?peer=<number>` — WS upgrade that PLACES an
+  outbound 1:1 audio call (offer with per-device Signal-encrypted callKey →
+  relay from the offer-ack → wait for the peer's `<accept>` → bridge audio).
+  **Live-verified** end to end against a real WhatsApp callee.
 
-- `GET /v1/sessions/:id/calls/:call_id/audio` → WS upgrade (bearer). Later:
-  optional outbound mode (ruwa dials the agent's WS on answer).
+### Audio bridge (WebSocket) — IMPLEMENTED (v1)
+
+- Both `.../audio` (answer) and `.../dial` (originate) are WS upgrades; auth
+  via bearer header **or** `?token=` (browsers can't set WS headers).
 - **Binary frame = 20 ms of s16le PCM, 16 kHz mono = 640 bytes, headerless.**
-  Multiples of 640 allowed (bulk TTS); ruwa paces. Non-multiple → close 4008.
-  ruwa aggregates 3×20 ms → one 60 ms WA codec frame; slices inbound the
-  same way. 16 kHz native = WA's codec rate; PCM16@16k is what voice-agent
-  stacks (OpenAI Realtime, Deepgram, Pipecat) consume directly.
-- Text control frames (JSON): ruwa→agent `start` (format + codec + from),
-  `active`, `peer_muted`, `mark` (echo), `stop{reason}`, `underrun`/`overrun`;
-  agent→ruwa `mark`, `clear` (barge-in: flush outbound buffer), `stop` (=hangup).
-- **ruwa owns the clock**: a 60 ms ticker always feeds WA. Agent underrun →
-  encode silence (DTX). Overflow (>~5 s buffered) → drop-oldest + `overrun`.
-  Inbound to a slow agent: drop after ~2 s, never stall the SRTP loop.
-  WS disconnect ≠ hangup: ~10 s silence grace + one reconnect (`resumed`).
+  Multiples of 640 allowed; the client should pace to ~real time. ruwa
+  aggregates 3×20 ms → one 60 ms WA Opus frame and slices inbound the same
+  way. 16 kHz native = WA's codec rate; PCM16@16k is what voice-agent stacks
+  (OpenAI Realtime, Deepgram, Pipecat) consume directly.
+- One text control frame today: server→client `{"event":"start", call_id,
+  from, audio:{encoding,rate,channels,frame_ms}, codec}` — sent when the media
+  path is live (on a dial, that is when the peer answers). A client should not
+  stream mic audio before `start` (audio sent during ringing would buffer and
+  replay). **Closing the socket hangs the call up**; a peer hangup closes it
+  from the server side.
+- **ruwa owns the clock**: a 60 ms ticker always feeds WA (silence/DTX on
+  agent underrun). The agent→WA buffer is shallow (drop-newest past ~480 ms)
+  so clock drift can't accumulate latency.
+
+### Roadmap (NOT yet implemented)
+
+- `POST .../accept` / `POST .../hangup` HTTP control (today: open/close the WS).
+- `call_active` event; richer control frames (`peer_muted`, `mark`, `clear`
+  barge-in, `stop`, `underrun`/`overrun`); WS-disconnect grace + `resumed`.
+- Outbound mode where ruwa dials the agent's WS on answer.
+- `codec_mismatch` teardown when a peer forces MLOW (today the standard-Opus
+  path is forced and assumed accepted).
 
 ### Codec
 

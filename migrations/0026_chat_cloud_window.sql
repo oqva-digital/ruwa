@@ -1,0 +1,11 @@
+-- Per-chat WhatsApp customer-service window expiry (cloud sessions only).
+--
+-- On the Cloud API a business may send free-form messages to a user only within
+-- 24 h of that user's last inbound message; outside it, only templates. ruwa
+-- records when the window closes for each chat, refreshed on every inbound cloud
+-- message: from Meta's `statuses[].conversation.expiration_timestamp` when it is
+-- present, from Kapso's `conversation.kapso.last_inbound_at + 24 h`, otherwise
+-- the inbound message timestamp + 24 h. NULL = unknown / never opened. Web
+-- sessions never set it. Surfaced as `window_expires_at` (unix seconds) on the
+-- `GET /v1/sessions/:id/chats` rows.
+ALTER TABLE chats ADD COLUMN cloud_window_expires_at INTEGER;

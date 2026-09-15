@@ -1,0 +1,57 @@
+
+ç
+tables.protomlow.tables"‘
+
+HeapWindow-
+regions (2.mlow.tables.RegionRregions
+g_cc (RgCc
+g_nrg (RgNrg
+g_pitch (RgPitch
+g_clk (RgClk"0
+Region
+base (Rbase
+data (Rdata"½
+LsfSeed
+rot_8 (Rrot8
+
+rot_cond_8 (RrotCond8%
+st2_all_qlvls_8 (Rst2AllQlvls8+
+st2_all_qlvl_dcmfs (Rst2AllQlvlDcmfs
+
+st2_min_qi (Rst2MinQi
+
+st2_max_qi (Rst2MaxQi
+cb_16 (Rcb16
+cinv_16 (Rcinv16
+cmf	 (Rcmf
+cmf_cond
+ (RcmfCond
+lsf_sel (RlsfSel
+	lsf_extra (RlsfExtra
+mean (Rmean
+min_dist (RminDist
+reg_cond (RregCond
+qstep (Rqstep"¸
+	PitchSeed/
+blocksegs_bitstream (RblocksegsBitstream$
+blocksegs2idx (Rblocksegs2idx!
+blocksegs_ix (RblocksegsIx)
+firstblock_range (RfirstblockRange*
+blockseg_idx_dcmf (RblocksegIdxDcmf&
+delta_lag_dcmfs (RdeltaLagDcmfs2
+block_transition_dcmf (RblockTransitionDcmf"€
+CcSeed*
+nrgres_gain4_dcmf (RnrgresGain4Dcmf,
+nrgres_shape4_dcmf (RnrgresShape4Dcmf(
+fcbg_offset_dcmf (RfcbgOffsetDcmf(
+acbgains_hr_dcmf (RacbgainsHrDcmf&
+fcbgains_v_dcmf (RfcbgainsVDcmf1
+fcbgains_v_delta_dcmf (RfcbgainsVDeltaDcmf+
+acbgains_cb_hr_q14 (RacbgainsCbHrQ14&
+gain_recon_base (RgainReconBase
+
+gain_recon	 (R	gainRecon)
+n_pulses_dcmf_bgn
+ (RnPulsesDcmfBgn'
+n_pulses_dcmf_uv (RnPulsesDcmfUv%
+n_pulses_dcmf_v (RnPulsesDcmfVbproto3

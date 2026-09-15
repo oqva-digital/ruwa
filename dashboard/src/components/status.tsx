@@ -74,18 +74,20 @@ export function StatusDot({ st, pulse }: { st: StatusKey; pulse?: boolean }) {
   )
 }
 
-/** Session backend pill — "web" (WhatsApp Web socket) or "cloud" (Meta Cloud API). */
-export function KindBadge({ kind, className }: { kind?: string | null; className?: string }) {
+/** Session backend pill — "web" (WhatsApp Web socket) or "cloud" (official API).
+ *  For cloud sessions, `provider` appends the backend ("cloud · kapso"). */
+export function KindBadge({ kind, provider, className }: { kind?: string | null; provider?: string | null; className?: string }) {
   const cloud = kind === "cloud"
   const Ico = cloud ? Cloud : Smartphone
+  const kapso = cloud && provider === "kapso"
   return (
     <span
       data-st={cloud ? "progress" : "neutral"}
       className={cn("inline-flex h-5 items-center gap-1 rounded-full px-2 text-[11px] font-medium leading-none", className)}
-      title={cloud ? "Meta WhatsApp Cloud API" : "WhatsApp Web (linked device)"}
+      title={cloud ? (kapso ? "Kapso Business Platform (Cloud API)" : "Meta WhatsApp Cloud API") : "WhatsApp Web (linked device)"}
     >
       <Ico className="h-3 w-3" />
-      {cloud ? "cloud" : "web"}
+      {cloud ? (kapso ? "cloud · kapso" : "cloud") : "web"}
     </span>
   )
 }

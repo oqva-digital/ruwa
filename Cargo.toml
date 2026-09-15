@@ -1,6 +1,6 @@
 [package]
 name = "ruwa"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "API-first multi-tenant WhatsApp Web client in Rust (port of whatsmeow)"
 license = "MIT"
@@ -15,6 +15,7 @@ path = "src/main.rs"
 # default: normal `cargo run`/tests serve the console from disk via ServeDir.
 # Enabled for prebuilt release binaries (CI builds the dashboard first).
 # Also enable vendored OpenSSL so Linux release builds are self-contained.
+mlow-kat = []  # gate MLow per-stage KAT tests (heavy vendored vectors, not committed)
 console = []
 vendored-tls = ["native-tls/vendored"]
 
@@ -59,6 +60,24 @@ hmac = "0.12"
 sha2 = "0.10"
 sha1 = "0.10"        # WARP MESSAGE-INTEGRITY tag (call media plane)
 subtle = "2"         # constant-time tag comparison (SRTP/SRTCP auth)
+
+# Voice-call media transport: the WA relay speaks the WebRTC data-channel
+# protocol (UDP→DTLS→SCTP→DataChannel), so there's no raw-UDP shortcut. All
+# pure-Rust (ring has asm, no cmake). DTLS is only an opaque tunnel — SRTP keys
+# come from the callKey, not DTLS.
+webrtc-dtls = "0.12"
+webrtc-sctp = "0.17"
+webrtc-data = "0.17"
+webrtc-util = "0.17"
+# webrtc-dtls exposes the older util 0.11 `Conn`; webrtc-sctp consumes 0.17.
+# This alias lets the DTLS→SCTP bridge name the 0.11 trait (they're identical).
+webrtc-util-011 = { package = "webrtc-util", version = "0.11" }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Voice-call codec: standard Opus (we force it on accept). This is the one C
+# dependency in the tree — the build links libopus (Railway: add libopus-dev to
+# the build image before merge; dev machines via `brew install opus`).
+opus = "0.3"
+log = "0.4"
 md-5 = "0.10"
 hkdf = "0.12"
 rand = "0.8"
@@ -90,6 +109,13 @@ parking_lot = "0.12"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+mimalloc = "0.1"
+
+[dev-dependencies]
+# `test-util` is not part of tokio's `full`. It lets time-sensitive tests drive
+# the clock instead of sleeping through a real deadline (the transport-connect
+# timeout is 30s of wall time otherwise).
+tokio = { version = "1.40", features = ["full", "test-util"] }
 
 [build-dependencies]
 prost-build = "0.13"

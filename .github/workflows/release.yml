@@ -72,7 +72,14 @@ jobs:
         with:
           name: dashboard-dist
           path: dashboard/dist
+      # The voice-call stack pulls `opus` → `audiopus_sys`, which builds vendored
+      # libopus via CMake and (on linux-gnu) links it dynamically by default.
+      # OPUS_STATIC=1 forces static linking so every prebuilt binary stays
+      # self-contained. macOS/Windows already default to static; Linux needs it.
+      # GitHub runners ship CMake preinstalled on all three OS images.
       - name: Build
+        env:
+          OPUS_STATIC: "1"
         run: cargo build --release --locked --target ${{ matrix.target }} --features ${{ matrix.features }}
       - name: Stage binary
         shell: bash

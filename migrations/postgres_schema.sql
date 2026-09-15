@@ -53,6 +53,21 @@ DROP INDEX IF EXISTS idx_sessions_cloud_pnid;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_cloud_pnid_unique
     ON sessions(cloud_phone_number_id) WHERE cloud_phone_number_id IS NOT NULL;
 
+-- Kapso provider for cloud sessions (mirror of SQLite migration 0025).
+-- `cloud_provider` = 'meta' (Graph direct, default) | 'kapso' (Kapso Business
+-- Platform). Kapso sessions onboard via a hosted setup link and get their
+-- phone_number_id from a project-webhook callback matched on `cloud_setup_ref`.
+-- `cloud_webhook_secret` is the sealed per-number X-Webhook-Signature key.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_provider TEXT NOT NULL DEFAULT 'meta';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_internal_id TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_customer_id TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_base_url TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_setup_ref TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_setup_link TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS cloud_webhook_secret BYTEA;
+CREATE INDEX IF NOT EXISTS idx_sessions_cloud_setup_ref
+    ON sessions(cloud_setup_ref) WHERE cloud_setup_ref IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS prekeys (
     session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     key_id      BIGINT NOT NULL,
@@ -158,8 +173,11 @@ CREATE TABLE IF NOT EXISTS chats (
     archived    BIGINT NOT NULL DEFAULT 0,
     pinned      BIGINT NOT NULL DEFAULT 0,
     muted_until BIGINT,
+    cloud_window_expires_at BIGINT,
     PRIMARY KEY (session_id, jid)
 );
+-- Existing deploys: add the cloud customer-service window column in place.
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS cloud_window_expires_at BIGINT;
 
 CREATE TABLE IF NOT EXISTS groups (
     session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

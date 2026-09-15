@@ -2543,7 +2543,7 @@ pub mod msg_secret {
     //! whatsmeow `generateMsgSecretKey` + `decryptMsgSecret` (msgsecret.go).
 
     use super::hkdf;
-    use aes_gcm::aead::Aead;
+    use aes_gcm::aead::{Aead, Payload};
     use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 
     /// Use-case strings, byte-identical to whatsmeow's `MsgSecretType`. They are
@@ -2551,6 +2551,13 @@ pub mod msg_secret {
     pub const USE_CASE_MESSAGE_EDIT: &str = "Message Edit";
     pub const USE_CASE_POLL_EDIT: &str = "Poll Edit";
     pub const USE_CASE_EVENT_EDIT: &str = "Event Edit";
+    pub const USE_CASE_POLL_VOTE: &str = "Poll Vote";
+
+    /// The GCM additional data a poll vote is sealed with:
+    /// `poll_msg_id ++ 0x00 ++ voter` (voter in `ToNonAD` form). Edits use none.
+    pub fn poll_vote_aad(poll_msg_id: &str, voter: &str) -> Vec<u8> {
+        format!("{poll_msg_id}\x00{voter}").into_bytes()
+    }
 
     /// Derive the 32-byte AES key: `HKDF-SHA256(ikm = orig_secret, salt = nil,
     /// info = orig_msg_id ++ orig_sender ++ mod_sender ++ use_case)`. The two
@@ -2582,11 +2589,23 @@ pub mod msg_secret {
     /// Returns `None` on a wrong key / tampered input (GCM auth failure) so the
     /// caller can try the next sender candidate.
     pub fn decrypt(key: &[u8; 32], iv: &[u8], ct_with_tag: &[u8]) -> Option<Vec<u8>> {
+        decrypt_with_aad(key, iv, ct_with_tag, &[])
+    }
+
+    /// [`decrypt`] with GCM additional data (poll votes: [`poll_vote_aad`]).
+    pub fn decrypt_with_aad(
+        key: &[u8; 32],
+        iv: &[u8],
+        ct_with_tag: &[u8],
+        aad: &[u8],
+    ) -> Option<Vec<u8>> {
         if iv.len() != 12 {
             return None;
         }
         let cipher = Aes256Gcm::new_from_slice(key).ok()?;
-        cipher.decrypt(Nonce::from_slice(iv), ct_with_tag).ok()
+        cipher
+            .decrypt(Nonce::from_slice(iv), Payload { msg: ct_with_tag, aad })
+            .ok()
     }
 
     #[cfg(test)]
@@ -2616,6 +2635,27 @@ pub mod msg_secret {
             assert!(decrypt(&wrong, &iv, &ct).is_none());
             // Non-12-byte IV is rejected outright.
             assert!(decrypt(&key, &[7u8; 16], &ct).is_none());
+        }
+
+        /// A poll vote is bound to its AAD (poll id + voter): the right AAD
+        /// opens it, a different voter or no AAD at all fails authentication.
+        #[test]
+        fn poll_vote_requires_matching_aad() {
+            use aes_gcm::aead::Payload;
+            let secret = [9u8; 32];
+            let (poll, creator, voter) = ("POLL1", "111@s.whatsapp.net", "222@s.whatsapp.net");
+            let key = derive_key(&secret, poll, creator, voter, USE_CASE_POLL_VOTE);
+            let iv = [3u8; 12];
+            let aad = poll_vote_aad(poll, voter);
+            let ct = Aes256Gcm::new_from_slice(&key)
+                .unwrap()
+                .encrypt(Nonce::from_slice(&iv), Payload { msg: b"vote", aad: &aad })
+                .unwrap();
+
+            assert_eq!(decrypt_with_aad(&key, &iv, &ct, &aad).as_deref(), Some(&b"vote"[..]));
+            assert!(decrypt(&key, &iv, &ct).is_none());
+            let other = poll_vote_aad(poll, "333@s.whatsapp.net");
+            assert!(decrypt_with_aad(&key, &iv, &ct, &other).is_none());
         }
     }
 }

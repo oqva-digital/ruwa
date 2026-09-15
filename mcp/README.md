@@ -4,19 +4,23 @@ An **MCP server** exposing ruwa (RUWA — Rust WhatsApp) as agent tools, so any 
 client (Claude Desktop, Claude Code, …) can drive WhatsApp. A thin wrapper over
 the `/v1` HTTP API — the ruwa core stays lean.
 
-## Tools (45)
+## Tools (46)
 
 An agent can run a WhatsApp account end-to-end — spin up an instance, pair it,
 read/search history (keyword **and** semantic), hold a conversation, manage
 contacts/profile, and wire up event delivery. Instances come in two kinds:
 `web` (a WhatsApp Web linked device, paired via QR / phone code) and `cloud`
-(a Meta WhatsApp Cloud API number — no pairing, credentials instead; supports
-templates + interactive messages, and must open conversations with a template
-outside the 24h customer-service window).
+(an official WhatsApp Business Platform number — no pairing; supports templates +
+interactive messages, and must open conversations with a template outside the
+24h customer-service window). A `cloud` session runs on one of two providers:
+`meta` (direct Meta Cloud API credentials) or `kapso` (ruwa as a BSP on the
+Kapso Business Platform — the customer connects their own number via a hosted
+setup link).
 
 **Instance lifecycle**
-- `create_session` — create a new instance (optional label + proxy); `kind: "web"` (default) or `kind: "cloud"` + `cloud` credentials (`phone_number_id`, `access_token`, `waba_id`, `app_secret`, `verify_token`, `graph_version`)
-- `update_cloud_creds` — rotate/replace a cloud session's Meta credentials (cloud only)
+- `create_session` — create a new instance (optional label + proxy); `kind: "web"` (default) or `kind: "cloud"`. For cloud: `provider: "meta"` (default) + `cloud` credentials (`phone_number_id`, `access_token`, `waba_id`, `app_secret`, `verify_token`, `graph_version`), or `provider: "kapso"` + optional kapso fields (`connection_type`, `country_isos`, `language`, `provision_phone_number`, `success_redirect_url`, `failure_redirect_url`) → response carries `cloud.setup_link`
+- `update_cloud_creds` — rotate/replace a cloud session's Meta credentials (meta-provider cloud only)
+- `kapso_setup_link` — regenerate the Kapso onboarding setup link (kapso-provider cloud, still `pending_onboarding`)
 - `get_qr` — pairing QR payload to scan in WhatsApp → Linked devices
 - `pair_phone` — 8-char "Link with phone number" code (QR alternative, no scanning)
 - `get_session` — one instance's status / JID / proxy

@@ -199,6 +199,21 @@ pub struct CloudPublic {
     /// Verified business name, learned on `connect` (mirrors `push_name`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_name: Option<String>,
+    /// Upstream backing this cloud session: `"meta"` (Graph direct) or
+    /// `"kapso"` (onboarded through the Kapso Business Platform).
+    #[serde(default = "cloud_provider_default")]
+    pub provider: String,
+    /// Kapso onboarding state: `"pending"` (setup link outstanding) or
+    /// `"connected"`. `None` for `provider = "meta"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding_status: Option<String>,
+    /// Last-issued hosted setup-link URL (kapso, pending onboarding only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_link: Option<String>,
+}
+
+fn cloud_provider_default() -> String {
+    "meta".to_string()
 }
 
 /// Partial update for a cloud session's credentials (`PUT /sessions/:id/cloud`):
@@ -275,6 +290,11 @@ pub struct SessionHealth {
 pub enum SessionStatus {
     /// Created but no pairing attempted yet.
     Pending,
+    /// A `kind = cloud`, `provider = kapso` session whose customer has not yet
+    /// completed the hosted setup link — no `phone_number_id` yet, nothing to
+    /// connect. Treated like `Pending` for liveness/health. Flips to `Connected`
+    /// (or `Disconnected`) from the Kapso onboarding project-webhook.
+    PendingOnboarding,
     /// Background task is running the WS connect + Noise handshake.
     Connecting,
     /// Pairing in progress, QR available.
@@ -513,6 +533,11 @@ pub enum SessionEvent {
     /// device rejected it. `reason` is the server's word ("timeout",
     /// "reject", …) when present.
     CallTerminate { call_id: String, from: String, reason: Option<String> },
+    /// A contact's chat state / availability, straight off the wire
+    /// (`<chatstate><composing|paused/>` and `<presence type=…>`). Ephemeral:
+    /// emitted, never stored. `jid` is the contact in PN form when the LID↔PN
+    /// map knows it; `state` ∈ composing | paused | available | unavailable.
+    Presence { jid: String, state: String },
     LoggedOut,
 }
 
@@ -758,6 +783,70 @@ fn delete_outbound_queue_row(
 }
 
 /// A single tenant's WhatsApp session. Wraps shared state + an event bus.
+/// One page of the server's offline queue, requested via
+/// `<ib><offline_batch count="N"/></ib>`.
+const OFFLINE_PAGE_SIZE: u32 = 100;
+/// A page is also considered complete when no `offline`-tagged stanza has
+/// arrived for this long (the server sends no end marker for a partial page).
+const OFFLINE_PAGE_IDLE: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Give up waiting for a page that never starts (queue already drained, or
+/// the server declined the request).
+const OFFLINE_PAGE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Paged drain of the server-side offline queue.
+///
+/// After `<success>` the server announces the queue it holds for this device
+/// with `<ib><offline_preview count=… message=… notification=… receipt=…/>`.
+/// A small queue is streamed unprompted, but a large one is only delivered
+/// in pages: the client sends `<ib><offline_batch count="N"/></ib>`, the
+/// server delivers N `offline`-attributed stanzas and then WAITS for the next
+/// page request — it sends no end marker for a partial page, and it holds
+/// LIVE inbound `<message>`s behind the undrained queue. `<ib><offline
+/// count=…/>` arrives only once the queue is empty.
+///
+/// Ruwa used to send exactly one `offline_batch` (Baileys behaviour), so any
+/// session whose backlog exceeded one page drained 100 stanzas per
+/// connection and never received anything live again (prod 2026-09-01: a
+/// busy account with a 12,940-stanza queue saw messages 4h..27h late, only
+/// right after each socket bounce). This state machine keeps requesting
+/// pages — on page-full by count, or after [`OFFLINE_PAGE_IDLE`] of silence —
+/// until the end marker lands.
+#[derive(Default)]
+struct OfflineDrain {
+    /// A drain is in progress on the current connection.
+    active: bool,
+    /// Bumped per `offline_preview`; a watchdog exits when it sees a newer
+    /// generation (a reconnect started a fresh drain).
+    generation: u64,
+    /// Total stanzas the preview announced (informational).
+    announced: u64,
+    /// `offline` stanzas received since the last page request.
+    page_seen: u32,
+    /// `offline` stanzas received over the whole drain.
+    seen: u64,
+    /// Pages requested so far.
+    pages: u32,
+    /// When the current page was requested.
+    requested_at: Option<std::time::Instant>,
+    /// When the last `offline` stanza arrived.
+    last_rx: Option<std::time::Instant>,
+}
+
+fn build_offline_batch_node(count: u32) -> crate::protocol::binary::Node {
+    use crate::protocol::binary::{Attrs, Content, Node};
+    let mut batch_attrs = Attrs::new();
+    batch_attrs.insert("count".into(), count.to_string());
+    Node {
+        tag: "ib".into(),
+        attrs: Attrs::new(),
+        content: Content::Nodes(vec![Node {
+            tag: "offline_batch".into(),
+            attrs: batch_attrs,
+            content: Content::None,
+        }]),
+    }
+}
+
 pub struct Session {
     pub meta: RwLock<SessionMeta>,
     /// Subscribed by `GET /v1/sessions/:id/events` (M4) and the connection
@@ -804,6 +893,17 @@ pub struct Session {
     /// reconnects IMMEDIATELY (no backoff) and resets the backoff, instead of
     /// treating it as a generic failure — mirrors whatsmeow's instant restart.
     restart_required: std::sync::atomic::AtomicBool,
+    /// Last emitted `composing` per contact jid — a phone re-sends
+    /// `<composing/>` every few seconds while the user keeps typing, so
+    /// consecutive ones inside `PRESENCE_DEBOUNCE` are collapsed.
+    presence_last_composing: PlMutex<HashMap<String, std::time::Instant>>,
+    /// Consecutive QR-window timeouts (`<stream:error><ping/>`) on an UNPAIRED
+    /// session this `POST /connect`. Each one costs a full TLS + Noise +
+    /// `pair-device` round trip through the session's (metered) proxy; an
+    /// abandoned QR would otherwise loop every ~20–40s forever. Once it hits
+    /// `qr_refresh_limit()` the loop parks `Disconnected` (a new connect
+    /// reopens the window). Reset by `run_with_reconnect` on entry.
+    qr_timeouts: std::sync::atomic::AtomicU32,
     /// Set once a connection reaches `<success>`. Signals the reconnect loop the
     /// connection was healthy, so a later drop starts from the initial backoff
     /// rather than inheriting a compounded value.
@@ -825,6 +925,12 @@ pub struct Session {
     /// How many times this session's connection has dropped + retried since the
     /// process started. Bumped by `run_with_reconnect`.
     reconnect_count: std::sync::atomic::AtomicU32,
+    /// True only while the connection's main select loop is running. That loop
+    /// is the sole listener on `reconnect_notify`, so a `request_reconnect`
+    /// raised while this is false lands on nobody and is silently lost. Callers
+    /// use it to tell a bounceable connection from a driver parked between
+    /// attempts (or wedged inside one) that has to be restarted instead.
+    socket_live: std::sync::atomic::AtomicBool,
     /// Handle to the spawned `run_with_reconnect` driver task, set by
     /// `SessionManager::connect`. Taken + awaited by `SessionManager::shutdown`
     /// so a SIGTERM can wait for connection tasks to close their sockets.
@@ -906,6 +1012,9 @@ pub struct Session {
     /// process restart between import and first login just skips the auto-rekey
     /// (the manual Reconnect button remains).
     import_rekey_pending: std::sync::atomic::AtomicBool,
+    /// Paged drain of the server's offline queue for the live connection. See
+    /// [`OfflineDrain`] and the `<ib><offline_preview>` handler.
+    offline_drain: PlMutex<OfflineDrain>,
     /// Set by `import_session`; consumed once when the imported session first
     /// reaches READY (app-state synced, so the chat list exists). Triggers an
     /// on-demand history-sync backfill of the most-recently-active chats so a
@@ -925,7 +1034,28 @@ pub struct Session {
     /// signals completion (missing key share, stalled fetch, …) so a session can
     /// never get stuck in `Syncing`. Armed by `begin_sync`, aborted by `mark_ready`.
     sync_deadline_handle: PlMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Incoming calls currently ringing on this companion, keyed by `call-id`.
+    /// Populated (raw, NOT decrypted) when an `<offer>` arrives; the callKey is
+    /// decrypted only if/when the operator answers (so an unanswered/spam call
+    /// never consumes a prekey). Removed on `<terminate>`/`<reject>`. In-memory;
+    /// bounded — a burst of offers can't grow it without limit.
+    pending_calls: PlMutex<HashMap<String, crate::call::ParsedOffer>>,
+    /// Answered calls whose media loop is running, keyed by `call-id` → its
+    /// shutdown `Notify`. Lets an inbound peer `<terminate>` tear down the live
+    /// media loop (otherwise it lingers until the relay socket errors). Set by
+    /// the audio-bridge on answer, removed when it ends.
+    active_calls: PlMutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    /// Outbound calls waiting for the peer to answer, keyed by `call-id` → a
+    /// oneshot that delivers the answering device's JID when the peer's
+    /// `<accept>` lands (or is dropped on `<terminate>`/`<reject>`). The dial
+    /// audio-bridge parks on this to learn which device answered before
+    /// deriving the recv SRTP keys. In-memory.
+    outbound_accepts: PlMutex<HashMap<String, oneshot::Sender<String>>>,
 }
+
+/// Cap on [`Session::pending_calls`]: calls are low-volume and cleared on
+/// terminate, so this only backstops a pathological offer burst.
+const PENDING_CALLS_MAX: usize = 64;
 
 /// One entry in [`Session::recent_sends`] — enough to rebuild and resend a
 /// message on retry: the unpadded inner proto plus where it was headed.
@@ -986,11 +1116,14 @@ impl Session {
             keepalive_handle: PlMutex::new(None),
             expect_disconnect: std::sync::atomic::AtomicBool::new(false),
             restart_required: std::sync::atomic::AtomicBool::new(false),
+            presence_last_composing: PlMutex::new(HashMap::new()),
+            qr_timeouts: std::sync::atomic::AtomicU32::new(0),
             reached_success: std::sync::atomic::AtomicBool::new(false),
             wa_blocked: std::sync::atomic::AtomicBool::new(false),
             last_rx: std::sync::atomic::AtomicI64::new(0),
             conn_established_at: std::sync::atomic::AtomicI64::new(0),
             reconnect_count: std::sync::atomic::AtomicU32::new(0),
+            socket_live: std::sync::atomic::AtomicBool::new(false),
             task_handle: PlMutex::new(None),
             prekey_topup_handle: PlMutex::new(None),
             egress_started: std::sync::atomic::AtomicBool::new(false),
@@ -1005,11 +1138,86 @@ impl Session {
             group_name_fetched: PlMutex::new(HashSet::new()),
             reconnect_notify: Arc::new(tokio::sync::Notify::new()),
             import_rekey_pending: std::sync::atomic::AtomicBool::new(false),
+            offline_drain: PlMutex::new(OfflineDrain::default()),
             import_history_pending: std::sync::atomic::AtomicBool::new(false),
             synced_collections: PlMutex::new(HashSet::new()),
             sync_ready: std::sync::atomic::AtomicBool::new(false),
             sync_deadline_handle: PlMutex::new(None),
+            pending_calls: PlMutex::new(HashMap::new()),
+            active_calls: PlMutex::new(HashMap::new()),
+            outbound_accepts: PlMutex::new(HashMap::new()),
         }
+    }
+
+    /// Register a running call's shutdown handle (the audio-bridge calls this on
+    /// answer). A peer `<terminate>` then fires it via [`Self::active_call_end`].
+    pub(crate) fn active_call_register(&self, call_id: &str, shutdown: Arc<tokio::sync::Notify>) {
+        self.active_calls.lock().insert(call_id.to_string(), shutdown);
+    }
+
+    /// End a running call: remove it and notify its media loop to tear down.
+    /// Returns true if a live call was found (so callers can skip sending a
+    /// redundant `<terminate>` when the peer already ended it).
+    pub(crate) fn active_call_end(&self, call_id: &str) -> bool {
+        if let Some(shutdown) = self.active_calls.lock().remove(call_id) {
+            shutdown.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a ringing incoming call (raw parsed offer), so a later `accept`
+    /// can decrypt its callKey and answer. Bounded: a pathological burst evicts
+    /// an arbitrary older entry rather than growing without limit.
+    pub(crate) fn pending_call_insert(&self, offer: crate::call::ParsedOffer) {
+        let mut map = self.pending_calls.lock();
+        if map.len() >= PENDING_CALLS_MAX && !map.contains_key(&offer.call_id) {
+            if let Some(k) = map.keys().next().cloned() {
+                map.remove(&k);
+            }
+        }
+        map.insert(offer.call_id.clone(), offer);
+    }
+
+    /// Fetch a ringing call's parsed offer by `call-id` (for the accept path).
+    #[allow(dead_code)] // consumed by the accept endpoint (next call slice).
+    pub(crate) fn pending_call_get(&self, call_id: &str) -> Option<crate::call::ParsedOffer> {
+        self.pending_calls.lock().get(call_id).cloned()
+    }
+
+    /// Snapshot of the currently-ringing calls (call-id, caller, video, rates)
+    /// for the read-only `GET /calls` listing. Excludes the callKey ciphertext.
+    pub(crate) fn pending_calls_snapshot(&self) -> Vec<crate::call::ParsedOffer> {
+        self.pending_calls.lock().values().cloned().collect()
+    }
+
+    /// Drop a call from the ringing set (on terminate/reject/answer).
+    pub(crate) fn pending_call_remove(&self, call_id: &str) {
+        self.pending_calls.lock().remove(call_id);
+    }
+
+    /// Register an outbound call awaiting the peer's `<accept>`. Returns the
+    /// receiver that resolves with the answering device's JID. The dial bridge
+    /// registers this before shipping the offer.
+    pub(crate) fn outbound_accept_register(&self, call_id: &str) -> oneshot::Receiver<String> {
+        let (tx, rx) = oneshot::channel();
+        self.outbound_accepts.lock().insert(call_id.to_string(), tx);
+        rx
+    }
+
+    /// Deliver the answering device's JID to a waiting dial bridge. Returns true
+    /// if a waiter was present (i.e. this `<accept>` answers OUR outbound call).
+    pub(crate) fn outbound_accept_fire(&self, call_id: &str, answering_jid: &str) -> bool {
+        match self.outbound_accepts.lock().remove(call_id) {
+            Some(tx) => tx.send(answering_jid.to_string()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Drop an outbound-accept waiter without firing (on terminate/reject/cancel).
+    pub(crate) fn outbound_accept_cancel(&self, call_id: &str) {
+        self.outbound_accepts.lock().remove(call_id);
     }
 
     /// Returns true the FIRST time `group_jid` is seen this process — the caller
@@ -1172,20 +1380,43 @@ impl Session {
         *self.iq_client.lock() = None;
     }
 
+    /// Clone the live connection's dispatcher, or `None` when offline. The dial
+    /// path needs it to register an ack-node waiter + ship the offer directly.
+    pub(crate) fn iq_client_clone(&self) -> Option<ConnDispatcher> {
+        self.iq_client.lock().clone()
+    }
+
     /// Issue a synchronous IQ request/reply against the live connection. Errors
     /// if the session isn't currently connected.
     pub(crate) async fn iq_request(
         &self,
         iq: crate::protocol::binary::Node,
     ) -> Result<crate::protocol::binary::Node> {
+        self.iq_request_timeout(iq, IQ_REPLY_TIMEOUT).await
+    }
+
+    /// [`Self::iq_request`] with a caller-chosen deadline. A missed deadline is
+    /// a `504 Gateway Timeout` (WhatsApp didn't answer), NOT a generic 500 —
+    /// consumers back off differently on "upstream silent" vs "we broke".
+    pub(crate) async fn iq_request_timeout(
+        &self,
+        iq: crate::protocol::binary::Node,
+        timeout: std::time::Duration,
+    ) -> Result<crate::protocol::binary::Node> {
         let client = self.iq_client.lock().clone();
         let client = client.ok_or_else(|| {
             Error::BadRequest("session is not connected (no live socket for IQ)".into())
         })?;
-        client
-            .iq_request(iq)
-            .await
-            .map_err(|e| Error::Internal(anyhow::anyhow!("iq request failed: {e}")))
+        client.iq_request_timeout(iq, timeout).await.map_err(|e| {
+            if e == IQ_TIMEOUT_ERR {
+                Error::GatewayTimeout(format!(
+                    "WhatsApp did not answer the request within {}s",
+                    timeout.as_secs()
+                ))
+            } else {
+                Error::Internal(anyhow::anyhow!("iq request failed: {e}"))
+            }
+        })
     }
 
     /// Phone-number pairing ("Link with phone number"): ask WhatsApp for an
@@ -1382,6 +1613,29 @@ impl Session {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether the connection's select loop is currently running — i.e. whether
+    /// [`Session::request_reconnect`] has a listener. See the `socket_live` field.
+    pub fn socket_live(&self) -> bool {
+        self.socket_live.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_socket_live(&self, live: bool) {
+        self.socket_live
+            .store(live, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Abort the `run_with_reconnect` driver task, if one is registered. Used to
+    /// rescue a driver stuck in an await that no signal can interrupt; the
+    /// caller is responsible for starting a fresh one.
+    pub fn abort_task(&self) {
+        if let Some(h) = self.task_handle.lock().take() {
+            h.abort();
+        }
+        // An aborted task never reaches `run_connection`'s cleanup, so clear the
+        // listener flag here or a later reconnect would signal into the void.
+        self.set_socket_live(false);
+    }
+
     /// Replace the running keepalive task, aborting any prior one. Called
     /// once per connection by `run_connection` after the handshake.
     pub fn set_keepalive_handle(&self, h: tokio::task::JoinHandle<()>) {
@@ -1424,6 +1678,7 @@ impl Session {
         if let Some(h) = self.task_handle.lock().take() {
             h.abort();
         }
+        self.set_socket_live(false);
         if let Some(h) = self.sync_deadline_handle.lock().take() {
             h.abort();
         }
@@ -1440,7 +1695,141 @@ impl Session {
     /// session can never get stuck in `Syncing` if a sync signal never arrives.
     /// Readiness (`Syncing → Connected`) is reached via `mark_collection_synced`
     /// once every app-state collection is applied.
-    pub fn begin_sync(self: &Arc<Self>) {
+     /// `<ib><offline_preview>` landed: start (or restart) the paged drain of
+    /// the offline queue and ship the first `<ib><offline_batch>`. A watchdog
+    /// re-requests on idle so a partial page (no end marker) can't stall the
+    /// drain. See [`OfflineDrain`].
+    pub(crate) fn begin_offline_drain(self: &Arc<Self>, announced: u64, d: &ConnDispatcher) {
+        let generation = {
+            let mut od = self.offline_drain.lock();
+            od.generation += 1;
+            od.active = true;
+            od.announced = announced;
+            od.page_seen = 0;
+            od.seen = 0;
+            od.pages = 0;
+            od.requested_at = None;
+            od.last_rx = None;
+            od.generation
+        };
+        self.request_offline_page(d, "preview");
+        // Idle watchdog. Only when a runtime is present (unit tests drive the
+        // count-based path synchronously).
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let s = self.clone();
+            rt.spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let action = {
+                        let od = s.offline_drain.lock();
+                        if !od.active || od.generation != generation {
+                            break;
+                        }
+                        let now = std::time::Instant::now();
+                        let since_req = od.requested_at.map(|t| now.duration_since(t));
+                        let since_rx = od.last_rx.map(|t| now.duration_since(t));
+                        if od.page_seen == 0 {
+                            if since_req.is_some_and(|d| d > OFFLINE_PAGE_START_TIMEOUT) {
+                                Some("stall")
+                            } else {
+                                None
+                            }
+                        } else if since_rx.is_some_and(|d| d > OFFLINE_PAGE_IDLE) {
+                            Some("idle")
+                        } else {
+                            None
+                        }
+                    };
+                    match action {
+                        Some("idle") => match s.iq_client_clone() {
+                            Some(d) => s.request_offline_page(&d, "idle"),
+                            None => break,
+                        },
+                        Some(_) => {
+                            let mut od = s.offline_drain.lock();
+                            if od.generation == generation {
+                                tracing::info!(
+                                    session = %s.meta.read().id,
+                                    pages = od.pages,
+                                    seen = od.seen,
+                                    announced = od.announced,
+                                    "offline drain: page never started — assuming queue empty",
+                                );
+                                od.active = false;
+                            }
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+            });
+        }
+    }
+
+    /// Ship the next `<ib><offline_batch count=…/>` page request.
+    fn request_offline_page(&self, d: &ConnDispatcher, why: &str) {
+        let (pages, seen, announced) = {
+            let mut od = self.offline_drain.lock();
+            if !od.active {
+                return;
+            }
+            od.pages += 1;
+            od.page_seen = 0;
+            od.requested_at = Some(std::time::Instant::now());
+            (od.pages, od.seen, od.announced)
+        };
+        d.send_node(build_offline_batch_node(OFFLINE_PAGE_SIZE));
+        tracing::info!(
+            session = %self.meta.read().id,
+            page = pages,
+            seen,
+            announced,
+            why,
+            "offline drain: requested <ib><offline_batch count={}>",
+            OFFLINE_PAGE_SIZE,
+        );
+    }
+
+    /// Every inbound stanza carrying an `offline` attr counts toward the
+    /// current page; a full page triggers the next request immediately.
+    pub(crate) fn note_offline_stanza(&self, d: &ConnDispatcher) {
+        let page_full = {
+            let mut od = self.offline_drain.lock();
+            if !od.active {
+                return;
+            }
+            od.page_seen += 1;
+            od.seen += 1;
+            od.last_rx = Some(std::time::Instant::now());
+            od.page_seen >= OFFLINE_PAGE_SIZE
+        };
+        if page_full {
+            self.request_offline_page(d, "page-full");
+        }
+    }
+
+    /// `<ib><offline count=N/>`: the server's queue is empty — stop paging.
+    pub(crate) fn finish_offline_drain(&self, server_count: &str) {
+        let mut od = self.offline_drain.lock();
+        let was_active = od.active;
+        od.active = false;
+        tracing::info!(
+            session = %self.meta.read().id,
+            server_count,
+            pages = od.pages,
+            seen = od.seen,
+            announced = od.announced,
+            was_active,
+            "offline drain: complete — <ib><offline> received",
+        );
+    }
+
+    #[cfg(test)]
+    fn offline_drain_active(&self) -> bool {
+        self.offline_drain.lock().active
+    }
+
+   pub fn begin_sync(self: &Arc<Self>) {
         /// Hard cap on the SYNC phase. App-state usually lands in 1–3s; on a
         /// first pair it can wait on a key-share. Past this we promote to READY
         /// anyway (a consumer waiting forever is worse than possibly-incomplete
@@ -1883,21 +2272,49 @@ impl SessionManager {
         };
         let kind = SessionKind::parse(&row.kind);
         let cloud = match kind {
-            SessionKind::Cloud => Some(CloudPublic {
-                phone_number_id: row.cloud_phone_number_id.unwrap_or_default(),
-                waba_id: row.cloud_waba_id.filter(|s| !s.is_empty()),
-                graph_version: row
-                    .cloud_graph_version
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| crate::cloud::DEFAULT_GRAPH_VERSION.to_string()),
-                // The validated number / name persist as jid + push_name.
-                display_phone_number: row
-                    .jid
-                    .as_deref()
-                    .map(crate::cloud::to_digits)
-                    .filter(|d| !d.is_empty()),
-                verified_name: row.push_name.clone().filter(|s| !s.is_empty()),
-            }),
+            SessionKind::Cloud => {
+                let provider = if row.cloud_provider.is_empty() {
+                    "meta".to_string()
+                } else {
+                    row.cloud_provider.clone()
+                };
+                let is_kapso = provider == "kapso";
+                let onboarding_status = if is_kapso {
+                    Some(
+                        if matches!(status, SessionStatus::PendingOnboarding) {
+                            "pending"
+                        } else {
+                            "connected"
+                        }
+                        .to_string(),
+                    )
+                } else {
+                    None
+                };
+                let setup_link = if is_kapso {
+                    row.cloud_setup_link.clone().filter(|s| !s.is_empty())
+                } else {
+                    None
+                };
+                Some(CloudPublic {
+                    phone_number_id: row.cloud_phone_number_id.unwrap_or_default(),
+                    waba_id: row.cloud_waba_id.filter(|s| !s.is_empty()),
+                    graph_version: row
+                        .cloud_graph_version
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| crate::cloud::DEFAULT_GRAPH_VERSION.to_string()),
+                    // The validated number / name persist as jid + push_name.
+                    display_phone_number: row
+                        .jid
+                        .as_deref()
+                        .map(crate::cloud::to_digits)
+                        .filter(|d| !d.is_empty()),
+                    verified_name: row.push_name.clone().filter(|s| !s.is_empty()),
+                    provider,
+                    onboarding_status,
+                    setup_link,
+                })
+            }
             SessionKind::Web => None,
         };
         SessionMeta {
@@ -1957,7 +2374,10 @@ impl SessionManager {
                         // the Graph token on boot (and starts its egress worker, so
                         // webhooks landing on this instance fan out). Only a
                         // deliberate logout parks it.
-                        SessionKind::Cloud => !matches!(m.status, SessionStatus::LoggedOut),
+                        SessionKind::Cloud => !matches!(
+                            m.status,
+                            SessionStatus::LoggedOut | SessionStatus::PendingOnboarding
+                        ),
                         SessionKind::Web => {
                             m.jid.is_some() && matches!(m.status, SessionStatus::Disconnected)
                         }
@@ -2124,6 +2544,9 @@ impl SessionManager {
                 graph_version,
                 display_phone_number: None,
                 verified_name: None,
+                provider: "meta".into(),
+                onboarding_status: None,
+                setup_link: None,
             }),
             created_at: now,
             updated_at: now,
@@ -2133,6 +2556,376 @@ impl SessionManager {
             .write()
             .insert(session.meta.read().id.clone(), session.clone());
         Ok(session)
+    }
+
+    /// Create a `kind = cloud`, `provider = kapso` session: no Meta credentials
+    /// yet — the customer completes a hosted Kapso setup link, then Kapso's
+    /// project-webhook (`kapso_onboarding_complete`) fills in the number and
+    /// flips the session to `Connected`. Starts `PendingOnboarding`; the
+    /// returned session's `cloud.setup_link` is the URL to hand the customer.
+    pub async fn create_kapso(
+        &self,
+        label: Option<String>,
+        req: KapsoCreateReq,
+    ) -> Result<Arc<Session>> {
+        let cfg = kapso_config()?;
+        let plat = self.kapso_platform()?;
+        let now = chrono::Utc::now().timestamp();
+        let id = uuid_v4();
+        // The session id doubles as the Kapso correlation ref.
+        let setup_ref = id.clone();
+        let api_key = format!("{}{}", uuid_v4_simple(), uuid_v4_simple());
+        let webhook_secret = format!("{}{}", uuid_v4_simple(), uuid_v4_simple());
+        let graph_version = normalize_graph_version(
+            req.graph_version
+                .as_deref()
+                .unwrap_or(crate::cloud::DEFAULT_GRAPH_VERSION),
+        )?;
+
+        let customer = plat
+            .create_customer(label.as_deref().unwrap_or(&id), Some(&setup_ref))
+            .await?;
+
+        let opts = crate::cloud::SetupLinkOpts {
+            provision_phone_number: req.provision_phone_number,
+            connection_type: req.connection_type,
+            meta_billing_mode: None,
+            success_redirect_url: req.success_redirect_url,
+            failure_redirect_url: req.failure_redirect_url,
+            country_isos: req.country_isos,
+            language: req.language,
+        };
+        let link = plat.create_setup_link(&customer.id, opts).await?;
+
+        self.store.create_kapso_session(&crate::store::NewKapsoSession {
+            id: &id,
+            label: label.as_deref(),
+            status: SessionStatus::PendingOnboarding.as_str(),
+            api_key: &api_key,
+            proxy_url: None,
+            created_at: now,
+            updated_at: now,
+            customer_id: &customer.id,
+            setup_ref: &setup_ref,
+            setup_link: Some(&link.url),
+            base_url: cfg.wa_base.as_deref(),
+            graph_version: &graph_version,
+            webhook_secret: &webhook_secret,
+        })?;
+
+        let meta = SessionMeta {
+            id: id.clone(),
+            label,
+            status: SessionStatus::PendingOnboarding,
+            jid: None,
+            push_name: None,
+            proxy_url: None,
+            mark_online: false,
+            kind: SessionKind::Cloud,
+            cloud: Some(CloudPublic {
+                phone_number_id: String::new(),
+                waba_id: None,
+                graph_version,
+                display_phone_number: None,
+                verified_name: None,
+                provider: "kapso".into(),
+                onboarding_status: Some("pending".into()),
+                setup_link: Some(link.url.clone()),
+            }),
+            created_at: now,
+            updated_at: now,
+        };
+        let session = Arc::new(Session::new(meta));
+        self.sessions.write().insert(id.clone(), session.clone());
+
+        // Best-effort: register the project-level lifecycle webhook. This is a
+        // one-time project setup — a 409/already-exists is expected and fine, so
+        // never fail the create on it.
+        let hook_url = format!("{}/v1/cloud/kapso/project-webhook", cfg.public_base_url);
+        let hook_secret = cfg
+            .project_webhook_secret
+            .as_deref()
+            .unwrap_or(&webhook_secret);
+        if let Err(e) = plat.register_project_webhook(&hook_url, hook_secret, None).await {
+            tracing::warn!(
+                session = %id,
+                error = %e,
+                "kapso: project webhook registration failed (best-effort, continuing)"
+            );
+        }
+
+        Ok(session)
+    }
+
+    /// Re-issue the hosted setup link for a kapso session still in
+    /// `PendingOnboarding` (`Conflict` once onboarded). Updates the in-memory
+    /// `cloud.setup_link` and returns the new URL.
+    pub async fn regenerate_kapso_setup_link(&self, id: &str) -> Result<String> {
+        let session = self.get(id)?;
+        if session.kind() != SessionKind::Cloud {
+            return Err(Error::NotImplemented(
+                "setup links are only available on kapso cloud sessions",
+            ));
+        }
+        let row = self
+            .store
+            .session_cloud_creds(id)?
+            .ok_or_else(|| Error::NotFound(format!("cloud credentials for session {id}")))?;
+        if row.provider != "kapso" {
+            return Err(Error::NotImplemented(
+                "setup links are only available on kapso cloud sessions",
+            ));
+        }
+        if session.meta.read().status != SessionStatus::PendingOnboarding {
+            return Err(Error::Conflict("session already onboarded".into()));
+        }
+        let customer_id = row
+            .customer_id
+            .as_deref()
+            .ok_or_else(|| Error::Internal(anyhow::anyhow!("kapso session {id} has no customer id")))?;
+        let plat = self.kapso_platform()?;
+        let link = plat
+            .create_setup_link(customer_id, crate::cloud::SetupLinkOpts::default())
+            .await?;
+        // NOTE: `session_set_cloud_creds` does not carry `cloud_setup_link`, so
+        // the persisted link is only refreshed on the next onboarding write;
+        // update the in-memory view and hand the caller the fresh URL.
+        if let Some(c) = session.meta.write().cloud.as_mut() {
+            c.setup_link = Some(link.url.clone());
+        }
+        Ok(link.url)
+    }
+
+    /// Apply a successful Cloud-API credential validation to a session: persist
+    /// jid / push_name / status, refresh the in-memory meta (incl. the kapso
+    /// `onboarding_status` + `phone_number_id`), and emit `Paired` + `Connected`.
+    /// Shared by the Kapso onboarding-complete path (`cloud_validate_task` keeps
+    /// its own inline copy for the Meta connect flow).
+    async fn cloud_apply_validated(
+        &self,
+        sid: &str,
+        session: &Arc<Session>,
+        info: &crate::cloud::PhoneInfo,
+        pnid: Option<&str>,
+        now: i64,
+    ) {
+        let prev_jid = session.meta.read().jid.clone();
+        let jid = info
+            .display_phone_number
+            .as_deref()
+            .map(crate::cloud::to_digits)
+            .filter(|d| !d.is_empty())
+            .map(|d| crate::cloud::to_jid(&d))
+            .or(prev_jid);
+        let push_name = info.verified_name.clone().filter(|s| !s.is_empty());
+        if let Err(e) = self.store.session_set_jid_and_push_name(
+            sid,
+            jid.as_deref(),
+            push_name.as_deref(),
+            now,
+        ) {
+            tracing::warn!(session = %sid, error = %e, "cloud: persist jid/push_name failed");
+        }
+        if let Err(e) = self
+            .store
+            .session_set_status(sid, SessionStatus::Connected.as_str(), now)
+        {
+            tracing::warn!(session = %sid, error = %e, "cloud: persist status failed");
+        }
+        {
+            let mut m = session.meta.write();
+            m.jid = jid.clone();
+            m.push_name = push_name.clone();
+            m.status = SessionStatus::Connected;
+            m.updated_at = now;
+            if let Some(c) = m.cloud.as_mut() {
+                c.display_phone_number = jid
+                    .as_deref()
+                    .map(crate::cloud::to_digits)
+                    .filter(|d| !d.is_empty());
+                c.verified_name = push_name;
+                if let Some(p) = pnid {
+                    c.phone_number_id = p.to_string();
+                }
+                if c.provider == "kapso" {
+                    c.onboarding_status = Some("connected".into());
+                }
+            }
+        }
+        session.mark_rx();
+        if let Some(j) = jid {
+            let _ = session.events.send(SessionEvent::Paired { jid: j });
+        }
+        let _ = session.events.send(SessionEvent::Connected);
+    }
+
+    /// Handle a Kapso project-webhook lifecycle event. `whatsapp.phone_number.created`
+    /// finishes onboarding: resolve the session (by `customer.id`, then
+    /// `phone_number_id`), fill in `phone_number_id` / `internal_id`, register the
+    /// per-number message webhook, validate the credentials through the Kapso
+    /// proxy and flip to `Connected`. Disconnect/offboard/delete events park the
+    /// session. Anything unresolvable is acked (`Ok(())`) — the webhook must 200.
+    pub async fn kapso_onboarding_complete(
+        &self,
+        ev: &crate::cloud::KapsoProjectEvent,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+
+        // Resolve the session: customer id first, then the Meta phone_number_id.
+        let sid = match ev.customer_id.as_deref() {
+            Some(cid) => self.store.kapso_session_id_by_customer_id(cid)?,
+            None => None,
+        };
+        let sid = match sid {
+            Some(s) => Some(s),
+            None => match ev.phone_number_id.as_deref() {
+                Some(pnid) => self.store.cloud_session_id_by_phone_number_id(pnid)?,
+                None => None,
+            },
+        };
+        let Some(sid) = sid else {
+            tracing::warn!(
+                event = %ev.event,
+                customer = ?ev.customer_id,
+                phone_number_id = ?ev.phone_number_id,
+                "kapso project webhook: no session resolved — acking"
+            );
+            return Ok(());
+        };
+
+        match ev.event.as_str() {
+            "whatsapp.phone_number.created" => {}
+            "whatsapp.phone_number.disconnected"
+            | "whatsapp.phone_number.offboarded"
+            | "whatsapp.phone_number.deleted" => {
+                if let Ok(session) = self.get_or_restore(&sid) {
+                    session.ensure_egress_worker(self.store.clone(), &sid);
+                    let terminal = ev.event != "whatsapp.phone_number.disconnected";
+                    let new_status = if terminal {
+                        SessionStatus::LoggedOut
+                    } else {
+                        SessionStatus::Disconnected
+                    };
+                    let _ = self.store.session_set_status(&sid, new_status.as_str(), now);
+                    session.set_status(new_status);
+                    let _ = session.events.send(SessionEvent::Disconnected {
+                        reason: ev.event.clone(),
+                    });
+                }
+                return Ok(());
+            }
+            other => {
+                tracing::info!(session = %sid, event = %other, "kapso project webhook: event ignored");
+                return Ok(());
+            }
+        }
+
+        let cfg = kapso_config()?;
+        let session = self.get_or_restore(&sid)?;
+        session.ensure_egress_worker(self.store.clone(), &sid);
+        let plat = self.kapso_platform()?;
+
+        let row = self
+            .store
+            .session_cloud_creds(&sid)?
+            .ok_or_else(|| Error::NotFound(format!("cloud credentials for session {sid}")))?;
+        let customer_id = row.customer_id.clone().or_else(|| ev.customer_id.clone());
+
+        // Resolve phone_number_id + internal_id + display fields. Prefer the
+        // event's phone_number_id; fill the rest from the customer's number list.
+        let want_pnid = ev.phone_number_id.clone();
+        let numbers = match customer_id.as_deref() {
+            Some(cid) => plat.list_customer_phone_numbers(cid).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let chosen = numbers
+            .iter()
+            .find(|n| want_pnid.as_deref().is_some_and(|w| w == n.phone_number_id))
+            .or_else(|| numbers.first());
+        let (pnid, internal_id, waba_id, display_phone_number, verified_name) = match chosen {
+            Some(n) => (
+                if n.phone_number_id.is_empty() {
+                    want_pnid.clone().unwrap_or_default()
+                } else {
+                    n.phone_number_id.clone()
+                },
+                Some(n.internal_id.clone()),
+                n.business_account_id.clone().filter(|s| !s.is_empty()),
+                n.display_phone_number.clone(),
+                n.verified_name.clone(),
+            ),
+            None => (want_pnid.clone().unwrap_or_default(), None, None, None, None),
+        };
+
+        if pnid.is_empty() {
+            tracing::warn!(session = %sid, "kapso onboarding: no phone_number_id available — acking");
+            return Ok(());
+        }
+
+        if let Err(e) = self.store.session_set_cloud_phone_number(
+            &sid,
+            &pnid,
+            internal_id.as_deref(),
+            waba_id.as_deref(),
+            now,
+        ) {
+            tracing::warn!(session = %sid, error = %e, "kapso onboarding: persist phone_number_id failed");
+        }
+        if let Some(c) = session.meta.write().cloud.as_mut() {
+            c.phone_number_id = pnid.clone();
+            if waba_id.is_some() {
+                c.waba_id = waba_id.clone();
+            }
+        }
+
+        // Register the per-number message webhook (best-effort). Keyed by the
+        // Meta phone_number_id, which is always resolved by this point.
+        {
+            let webhook_secret = row.webhook_secret.clone().unwrap_or_default();
+            let url = format!("{}/v1/cloud/kapso/webhook", cfg.public_base_url);
+            if let Err(e) = plat
+                .register_number_webhook(&pnid, &url, &webhook_secret, None)
+                .await
+            {
+                tracing::warn!(session = %sid, error = %e, "kapso onboarding: number webhook registration failed");
+            }
+        }
+
+        // Validate through the Kapso proxy, then flip to connected.
+        let mut creds = self.cloud_creds_for_client(row)?;
+        creds.provider = crate::cloud::CloudProvider::Kapso;
+        creds.phone_number_id = pnid.clone();
+        creds.api_key = Some(cfg.api_key.clone());
+        let proxy = session.meta.read().proxy_url.clone();
+        let outcome = match crate::cloud::CloudClient::new(creds, proxy.as_deref()) {
+            Ok(client) => client.validate().await,
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(mut info) => {
+                if info.display_phone_number.is_none() {
+                    info.display_phone_number = display_phone_number;
+                }
+                if info.verified_name.is_none() {
+                    info.verified_name = verified_name;
+                }
+                self.cloud_apply_validated(&sid, &session, &info, Some(&pnid), now)
+                    .await;
+                tracing::info!(session = %sid, phone_number_id = %pnid, "kapso onboarding complete — connected");
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                let _ = self
+                    .store
+                    .session_set_status(&sid, SessionStatus::Disconnected.as_str(), now);
+                session.set_status(SessionStatus::Disconnected);
+                let _ = session
+                    .events
+                    .send(SessionEvent::Disconnected { reason: reason.clone() });
+                tracing::warn!(session = %sid, error = %reason, "kapso onboarding: credential validation failed");
+            }
+        }
+        Ok(())
     }
 
     /// The full (unsealed) Cloud API credentials of a cloud session — for the
@@ -2148,7 +2941,77 @@ impl SessionManager {
             .store
             .session_cloud_creds(id)?
             .ok_or_else(|| Error::NotFound(format!("cloud credentials for session {id}")))?;
-        Ok(cloud_creds_from_row(row))
+        self.cloud_creds_for_client(row)
+    }
+
+    /// `cloud_creds_from_row` + the server-wide Kapso `X-API-Key` injected for
+    /// `provider = kapso` sessions (Meta sessions are untouched). Every place
+    /// that builds a `CloudClient` from a stored row goes through here so the
+    /// key is never forgotten. Errs (`kapso not configured`) if a kapso session
+    /// is used while `RUWA_KAPSO_API_KEY` / `RUWA_PUBLIC_BASE_URL` are unset.
+    fn cloud_creds_for_client(
+        &self,
+        row: crate::store::CloudCredsRow,
+    ) -> Result<crate::cloud::CloudCreds> {
+        let mut creds = cloud_creds_from_row(row);
+        if creds.provider == crate::cloud::CloudProvider::Kapso {
+            creds.api_key = Some(kapso_config()?.api_key);
+        }
+        Ok(creds)
+    }
+
+    /// A [`crate::cloud::KapsoPlatform`] client built from the server-wide Kapso
+    /// config (`RUWA_KAPSO_*`). Errs when Kapso is not configured.
+    fn kapso_platform(&self) -> Result<crate::cloud::KapsoPlatform> {
+        let cfg = kapso_config()?;
+        crate::cloud::KapsoPlatform::new(cfg.api_key, cfg.platform_base.as_deref(), None)
+    }
+
+    /// Best-effort: fill a Kapso session's `cloud_waba_id` from the Platform API
+    /// when it's missing (sessions onboarded before the id was captured). The
+    /// WABA id is required for `/v1/sessions/:id/templates` management.
+    async fn kapso_backfill_waba(&self, id: &str) {
+        let Ok(Some(row)) = self.store.session_cloud_creds(id) else {
+            return;
+        };
+        if !row.waba_id.as_deref().unwrap_or_default().is_empty() {
+            return;
+        }
+        let Some(cid) = row.customer_id.as_deref() else {
+            return;
+        };
+        if row.phone_number_id.is_empty() {
+            return;
+        }
+        let Ok(plat) = self.kapso_platform() else {
+            return;
+        };
+        let waba = plat
+            .list_customer_phone_numbers(cid)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|n| n.phone_number_id == row.phone_number_id)
+            .and_then(|n| n.business_account_id)
+            .filter(|s| !s.is_empty());
+        let Some(w) = waba else { return };
+        let now = chrono::Utc::now().timestamp();
+        if let Err(e) = self.store.session_set_cloud_phone_number(
+            id,
+            &row.phone_number_id,
+            row.internal_id.as_deref(),
+            Some(&w),
+            now,
+        ) {
+            tracing::warn!(session = %id, error = %e, "kapso: waba backfill persist failed");
+            return;
+        }
+        tracing::info!(session = %id, waba_id = %w, "kapso: backfilled WABA id");
+        if let Ok(session) = self.get(id) {
+            if let Some(c) = session.meta.write().cloud.as_mut() {
+                c.waba_id = Some(w);
+            }
+        }
     }
 
     /// Merge a partial credential update over a cloud session's stored creds
@@ -2204,10 +3067,17 @@ impl SessionManager {
         let now = chrono::Utc::now().timestamp();
         self.store.session_set_cloud_creds(id, &row, now)?;
         let mut m = session.meta.write();
-        let (display_phone_number, verified_name) = m
+        let (display_phone_number, verified_name, onboarding_status, setup_link) = m
             .cloud
             .as_ref()
-            .map(|c| (c.display_phone_number.clone(), c.verified_name.clone()))
+            .map(|c| {
+                (
+                    c.display_phone_number.clone(),
+                    c.verified_name.clone(),
+                    c.onboarding_status.clone(),
+                    c.setup_link.clone(),
+                )
+            })
             .unwrap_or_default();
         m.cloud = Some(CloudPublic {
             phone_number_id: row.phone_number_id,
@@ -2215,6 +3085,13 @@ impl SessionManager {
             graph_version: row.graph_version,
             display_phone_number,
             verified_name,
+            provider: if row.provider.is_empty() {
+                "meta".into()
+            } else {
+                row.provider
+            },
+            onboarding_status,
+            setup_link,
         });
         m.updated_at = now;
         Ok(())
@@ -2689,6 +3566,180 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Best-effort teardown of the Kapso-side resources for a `provider=kapso`
+    /// session: offboard the number, then delete the customer record ruwa minted
+    /// in `create_kapso`. Never fails the caller — logs and moves on. No-op for
+    /// non-Kapso sessions or when Kapso is unconfigured. Call BEFORE [`delete`],
+    /// while the credential row still exists.
+    ///
+    /// [`delete`]: Self::delete
+    pub async fn kapso_teardown(&self, id: &str) {
+        let row = match self.store.session_cloud_creds(id) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+        if crate::cloud::CloudProvider::parse(&row.provider)
+            != crate::cloud::CloudProvider::Kapso
+        {
+            return;
+        }
+        let plat = match self.kapso_platform() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "kapso teardown: platform unavailable — skipping");
+                return;
+            }
+        };
+        if !row.phone_number_id.is_empty() {
+            if let Err(e) = plat.delete_phone_number(&row.phone_number_id).await {
+                tracing::warn!(session = %id, error = %e, "kapso teardown: offboard number failed");
+            }
+        }
+        if let Some(cid) = row.customer_id.as_deref().filter(|s| !s.is_empty()) {
+            if let Err(e) = plat.delete_customer(cid).await {
+                tracing::warn!(session = %id, error = %e, "kapso teardown: delete customer failed");
+            }
+        }
+    }
+
+    /// Resolve the Kapso Broadcasts context for `id`: a Platform client plus the
+    /// session's Meta `phone_number_id`. Centralizes the provider + onboarding
+    /// gate shared by every `/v1/sessions/:id/broadcasts` route.
+    ///
+    /// - no cloud credentials → [`Error::NotFound`]
+    /// - `provider != kapso` → [`Error::NotImplemented`] (501)
+    /// - kapso session still onboarding (empty `phone_number_id`) → [`Error::BadRequest`]
+    async fn kapso_broadcast_ctx(
+        &self,
+        id: &str,
+    ) -> Result<(crate::cloud::KapsoPlatform, String)> {
+        let row = self
+            .store
+            .session_cloud_creds(id)?
+            .ok_or_else(|| Error::NotFound(format!("cloud credentials for session {id}")))?;
+        if crate::cloud::CloudProvider::parse(&row.provider)
+            != crate::cloud::CloudProvider::Kapso
+        {
+            return Err(Error::NotImplemented(
+                "broadcasts are only available on Kapso cloud sessions",
+            ));
+        }
+        if row.phone_number_id.is_empty() {
+            return Err(Error::BadRequest(
+                "kapso session is still onboarding — finish the setup link first".into(),
+            ));
+        }
+        Ok((self.kapso_platform()?, row.phone_number_id))
+    }
+
+    /// `POST /whatsapp/broadcasts` — create a draft broadcast.
+    pub async fn broadcast_create(
+        &self,
+        id: &str,
+        name: &str,
+        template_id: &str,
+    ) -> Result<crate::cloud::BroadcastView> {
+        let (plat, pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.create_broadcast(&pnid, name, template_id).await
+    }
+
+    /// `GET /whatsapp/broadcasts` — list this session's broadcasts.
+    pub async fn broadcast_list(
+        &self,
+        id: &str,
+        status: Option<&str>,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<crate::cloud::BroadcastList> {
+        let (plat, pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.list_broadcasts(&pnid, status, page, per_page).await
+    }
+
+    /// `GET /whatsapp/broadcasts/{bid}`.
+    pub async fn broadcast_get(
+        &self,
+        id: &str,
+        bid: &str,
+    ) -> Result<crate::cloud::BroadcastView> {
+        let (plat, _pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.get_broadcast(bid).await
+    }
+
+    /// `POST /whatsapp/broadcasts/{bid}/recipients` — `recipients` is a
+    /// caller-validated JSON array of Meta-component recipient objects.
+    pub async fn broadcast_add_recipients(
+        &self,
+        id: &str,
+        bid: &str,
+        recipients: serde_json::Value,
+    ) -> Result<crate::cloud::AddRecipientsResult> {
+        let (plat, _pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.add_broadcast_recipients(bid, recipients).await
+    }
+
+    /// `DELETE /whatsapp/broadcasts/{bid}/recipients`.
+    pub async fn broadcast_clear_recipients(
+        &self,
+        id: &str,
+        bid: &str,
+    ) -> Result<crate::cloud::BroadcastView> {
+        let (plat, _pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.clear_broadcast_recipients(bid).await
+    }
+
+    /// `GET /whatsapp/broadcasts/{bid}/recipients` — per-recipient status.
+    pub async fn broadcast_list_recipients(
+        &self,
+        id: &str,
+        bid: &str,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<crate::cloud::BroadcastRecipientList> {
+        let (plat, _pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.list_broadcast_recipients(bid, page, per_page).await
+    }
+
+    /// `POST /whatsapp/broadcasts/{bid}/send`.
+    pub async fn broadcast_send(
+        &self,
+        id: &str,
+        bid: &str,
+    ) -> Result<crate::cloud::BroadcastView> {
+        let (plat, _pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.send_broadcast(bid).await
+    }
+
+    /// `POST /whatsapp/broadcasts/{bid}/schedule`.
+    pub async fn broadcast_schedule(
+        &self,
+        id: &str,
+        bid: &str,
+        scheduled_at: &str,
+    ) -> Result<crate::cloud::BroadcastView> {
+        let (plat, _pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.schedule_broadcast(bid, scheduled_at).await
+    }
+
+    /// `POST /whatsapp/broadcasts/{bid}/cancel`.
+    pub async fn broadcast_cancel(
+        &self,
+        id: &str,
+        bid: &str,
+    ) -> Result<crate::cloud::BroadcastView> {
+        let (plat, _pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.cancel_broadcast(bid).await
+    }
+
+    /// `PATCH /whatsapp/broadcasts/{bid}` `{status:"stopped"}`.
+    pub async fn broadcast_stop(
+        &self,
+        id: &str,
+        bid: &str,
+    ) -> Result<crate::cloud::BroadcastView> {
+        let (plat, _pnid) = self.kapso_broadcast_ctx(id).await?;
+        plat.stop_broadcast(bid).await
+    }
+
     /// Read the persisted DeviceKeys for a session.
     pub fn load_device_keys(&self, id: &str) -> Result<DeviceKeys> {
         let row = self
@@ -2797,6 +3848,16 @@ impl SessionManager {
     /// in-flight validation so at most one runs.
     fn connect_cloud(self: &Arc<Self>, id: &str, session: Arc<Session>) -> Result<()> {
         let creds = self.cloud_creds(id)?;
+        // A kapso session that hasn't finished the hosted setup link has no
+        // phone_number_id to validate — refuse rather than dial a broken URL.
+        if creds.provider == crate::cloud::CloudProvider::Kapso {
+            let pending = session.meta.read().status == SessionStatus::PendingOnboarding;
+            if pending || creds.phone_number_id.trim().is_empty() {
+                return Err(Error::Conflict(
+                    "kapso session is still onboarding — finish the setup link first".into(),
+                ));
+            }
+        }
         let proxy = session.meta.read().proxy_url.clone();
         session.ensure_egress_worker(self.store.clone(), id);
         session.set_status(SessionStatus::Connecting);
@@ -2820,6 +3881,11 @@ impl SessionManager {
         creds: crate::cloud::CloudCreds,
         proxy: Option<String>,
     ) {
+        // Kapso sessions onboarded before the WABA id was captured have an empty
+        // `cloud_waba_id`, which breaks `/templates`. Note it before `creds` is
+        // moved into the client so we can backfill after a good validate.
+        let kapso_needs_waba = creds.provider == crate::cloud::CloudProvider::Kapso
+            && creds.waba_id.as_deref().unwrap_or_default().is_empty();
         let outcome = match crate::cloud::CloudClient::new(creds, proxy.as_deref()) {
             Ok(client) => client.validate().await,
             Err(e) => Err(e),
@@ -2827,6 +3893,10 @@ impl SessionManager {
         let now = chrono::Utc::now().timestamp();
         match outcome {
             Ok(info) => {
+                // Fill the WABA id from the Platform API. Best-effort.
+                if kapso_needs_waba {
+                    self.kapso_backfill_waba(&id).await;
+                }
                 // jid = "<display number digits>@s.whatsapp.net" so outbound rows
                 // carry a real sender and chats canonicalize like web. Keep any
                 // previously learned jid if Graph omitted the display number.
@@ -2902,6 +3972,11 @@ impl SessionManager {
     ///
     /// Live sessions are signalled to bounce in place (the driver re-logs-in
     /// instantly via `restart_required`); an offline session is simply started.
+    /// A session whose status looks live but has no socket loop running — a
+    /// driver waiting out its backoff, or one wedged inside a connect attempt —
+    /// is rescued by aborting the driver and starting a fresh one, so an
+    /// operator can unstick a `connecting` session without restarting the
+    /// process.
     pub fn reconnect(self: &Arc<Self>, id: &str) -> Result<()> {
         let session = self.get(id)?;
         // Cloud: no socket to bounce — a reconnect is a fresh credential
@@ -2912,18 +3987,27 @@ impl SessionManager {
         }
         session.clear_message_retries();
         let status = session.meta.read().status;
-        if matches!(
-            status,
-            SessionStatus::Connected | SessionStatus::Connecting | SessionStatus::Syncing
-        ) {
+        if reconnect_can_bounce(status, session.socket_live()) {
             session.request_reconnect();
-            Ok(())
-        } else {
-            // Not live (Disconnected / Blocked / LoggedOut / ProxyError) — there's
-            // no socket to bounce, so just (re)start the driver. `connect` clears
-            // the WA-block/expect-disconnect flags for a deliberate retry.
-            self.connect(id)
+            return Ok(());
         }
+        if status_is_live(status) {
+            // Status says live but no select loop is running, so
+            // `request_reconnect`'s notify would reach nobody and the call would
+            // 202 while doing nothing. Abort the driver (it may be parked in an
+            // await no signal can interrupt) and fall through to a clean start.
+            tracing::info!(
+                session = %id,
+                status = status.as_str(),
+                "reconnect: no live socket to bounce — restarting the connection driver"
+            );
+            session.abort_task();
+            session.set_status(SessionStatus::Disconnected);
+        }
+        // Offline (Disconnected / Blocked / LoggedOut / ProxyError) or just
+        // rescued — (re)start the driver. `connect` clears the WA-block and
+        // expect-disconnect flags for a deliberate retry.
+        self.connect(id)
     }
 
     /// Set (or clear, with `None`) the session's egress proxy. Validates the URL
@@ -3165,9 +4249,16 @@ impl SessionManager {
             tracing::warn!(session = %sid, error = %err, "cloud: webhook carried an error entry");
         }
 
+        let window_expires_at = batch.window_expires_at;
         for m in batch.messages {
-            if let Err(e) = self.cloud_ingest_message(&sid, &session, m) {
+            if let Err(e) = self.cloud_ingest_message(&sid, &session, m, window_expires_at) {
                 tracing::warn!(session = %sid, error = %e, "cloud: inbound message ingest failed");
+            }
+        }
+
+        for e in batch.outbound {
+            if let Err(err) = self.cloud_ingest_outbound_echo(&sid, &session, e) {
+                tracing::warn!(session = %sid, error = %err, "cloud: outbound echo ingest failed");
             }
         }
 
@@ -3217,8 +4308,8 @@ impl SessionManager {
         sid: &str,
         session: &Arc<Session>,
         m: crate::cloud::InboundMessage,
+        window_expires_at: Option<i64>,
     ) -> Result<()> {
-        use crate::cloud::InboundKind;
         use serde_json::{json, Map, Value};
 
         // `from` is normally the sender's phone digits; when Meta hides the
@@ -3244,121 +4335,8 @@ impl SessionManager {
         // fields (typed content) — mirroring the web path's `payload_json` and
         // event `body` conventions.
         let raw = m.raw;
-        let mut extra: Map<String, Value> = Map::new();
-        let (msg_type, body_text, mut payload): (&str, Option<String>, Value) = match m.kind {
-            InboundKind::Text { body } => {
-                let p = json!({"type": "text", "text": body});
-                ("text", Some(body), p)
-            }
-            InboundKind::Media {
-                msg_type,
-                media_id,
-                mime,
-                sha256,
-                caption,
-                filename,
-                url,
-                voice,
-            } => {
-                let mut p = json!({
-                    "type": msg_type,
-                    "media_id": media_id,
-                    "mimetype": mime,
-                    "sha256": sha256,
-                    "caption": caption,
-                    "voice": voice,
-                });
-                if let Some(obj) = p.as_object_mut() {
-                    if let Some(f) = filename {
-                        obj.insert("filename".into(), json!(f));
-                    }
-                    if let Some(u) = url {
-                        obj.insert("url".into(), json!(u));
-                    }
-                }
-                (msg_type, caption, p)
-            }
-            InboundKind::Location {
-                latitude,
-                longitude,
-                name,
-                address,
-            } => {
-                let label = name
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| address.clone().filter(|s| !s.is_empty()))
-                    .unwrap_or_else(|| format!("{latitude:.5},{longitude:.5}"));
-                let loc = json!({
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "name": name,
-                    "address": address,
-                });
-                extra.insert("location".into(), loc.clone());
-                let mut p = json!({"type": "location", "text": label});
-                if let Some(obj) = p.as_object_mut() {
-                    obj.insert("location".into(), loc);
-                }
-                ("location", Some(label), p)
-            }
-            InboundKind::Contacts(cards) => {
-                let contacts: Vec<Value> = cards
-                    .iter()
-                    .map(|c| json!({"name": c.name, "phones": c.phones}))
-                    .collect();
-                let text = cards
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .find(|n| !n.is_empty());
-                extra.insert("contacts".into(), Value::Array(contacts.clone()));
-                (
-                    "contact",
-                    text.clone(),
-                    json!({"type": "contact", "text": text, "contacts": contacts}),
-                )
-            }
-            InboundKind::Reaction { message_id, emoji } => {
-                let r = json!({"message_id": message_id, "emoji": emoji});
-                extra.insert("reaction".into(), r.clone());
-                (
-                    "reaction",
-                    emoji.clone(),
-                    json!({"type": "reaction", "text": emoji, "reaction": r}),
-                )
-            }
-            InboundKind::Button { payload, text } => {
-                let b = json!({"payload": payload, "text": text});
-                extra.insert("button".into(), b.clone());
-                (
-                    "button",
-                    text.clone(),
-                    json!({"type": "button", "text": text, "button": b}),
-                )
-            }
-            InboundKind::Interactive {
-                kind,
-                id,
-                title,
-                description,
-            } => {
-                let i = json!({"kind": kind, "id": id, "title": title, "description": description});
-                extra.insert("interactive".into(), i.clone());
-                (
-                    "interactive",
-                    title.clone(),
-                    json!({"type": "interactive", "text": title, "interactive": i}),
-                )
-            }
-            InboundKind::Unknown { type_name } => {
-                extra.insert("raw".into(), raw.clone());
-                (
-                    "unknown",
-                    None,
-                    json!({"type": "unknown", "raw_type": type_name, "raw": raw}),
-                )
-            }
-        };
+        let CloudKindPayload { msg_type, body_text, mut payload, extra } =
+            cloud_kind_payload(m.kind, &raw);
 
         // Common envelope fields, persisted alongside the content (queryable
         // without a schema change) and surfaced on the event body.
@@ -3397,6 +4375,10 @@ impl SessionManager {
             let _ = self.store.contact_upsert(sid, &sender, None, Some(name));
         }
         let _ = self.store.chat_set_name(sid, &chat, None, false, Some(m.timestamp));
+        // The customer's inbound (re)opens the 24 h customer-service window.
+        let window_close =
+            window_expires_at.unwrap_or(m.timestamp + crate::cloud::CS_WINDOW_SECS);
+        let _ = self.store.chat_set_cloud_window(sid, &chat, window_close);
         metrics::incr(&metrics::MSGS_IN);
 
         // Event body — same shape the web path emits (`type`, `text`, optional
@@ -3422,11 +4404,93 @@ impl SessionManager {
         }
         body.insert("push_name".into(), json!(m.push_name));
         body.insert("from_me".into(), json!(false));
+        body.insert("timestamp".into(), json!(m.timestamp));
+        // When the 24 h customer-service window for this chat closes (unix secs).
+        body.insert("window_expires_at".into(), json!(window_close));
         let _ = session.events.send(SessionEvent::Message {
             id: m.wamid.clone(),
             chat: chat.clone(),
             from: sender,
             body: Value::Object(body),
+        });
+        Ok(())
+    }
+
+    /// Persist + emit ONE business-originated message that ruwa did not send
+    /// itself, learned from a Kapso outbound echo webhook. The row is keyed by
+    /// wamid so the current batch's statuses (and later status webhooks) can
+    /// advance it. Only inbound messages reopen the customer-service window.
+    fn cloud_ingest_outbound_echo(
+        &self,
+        sid: &str,
+        session: &Arc<Session>,
+        e: crate::cloud::OutboundEcho,
+    ) -> Result<()> {
+        use serde_json::{json, Map, Value};
+
+        let to = e.to.trim();
+        if to.is_empty() {
+            tracing::debug!(session = %sid, id = %e.wamid, "cloud: outbound echo without recipient — skipped");
+            return Ok(());
+        }
+        let chat = crate::cloud::to_jid(to);
+        // Ruwa's own API sends have already inserted this row. Webhook retries
+        // have too, so leave the row for the status loop but do not re-emit it.
+        if self.store.message_exists(sid, &chat, &e.wamid)? {
+            tracing::debug!(session = %sid, id = %e.wamid, "cloud: outbound echo for a known message — status only");
+            return Ok(());
+        }
+
+        let raw = e.raw;
+        let CloudKindPayload { msg_type, body_text, mut payload, extra } =
+            cloud_kind_payload(e.kind, &raw);
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("from_me".into(), json!(true));
+        }
+        let payload_json = payload.to_string();
+        let sender = session.meta.read().jid.clone().unwrap_or_else(|| "self".into());
+        self.store.message_insert(
+            &crate::store::NewMessage {
+                session_id: sid,
+                chat_jid: &chat,
+                message_id: &e.wamid,
+                sender_jid: &sender,
+                from_me: true,
+                timestamp: e.timestamp,
+                msg_type,
+                body_text: body_text.as_deref(),
+                payload_json: &payload_json,
+                status: Some("sent"),
+            },
+            false,
+        )?;
+        let _ = self.store.chat_set_name(sid, &chat, None, false, Some(e.timestamp));
+        metrics::incr(&metrics::MSGS_OUT);
+
+        let mut body = Map::new();
+        body.insert("type".into(), json!(msg_type));
+        body.insert("text".into(), json!(body_text));
+        if let Some(md) = media_webhook_descriptor(msg_type, &payload, sid, &chat, &e.wamid) {
+            body.insert("media".into(), md);
+        }
+        for (k, v) in extra {
+            body.insert(k, v);
+        }
+        body.insert("from_me".into(), json!(true));
+        body.insert("timestamp".into(), json!(e.timestamp));
+        let id = e.wamid;
+        let _ = session.events.send(SessionEvent::Message {
+            id: id.clone(),
+            chat,
+            from: sender,
+            body: Value::Object(body),
+        });
+        // The persisted row starts at `sent`, so a same-batch sent receipt is
+        // correctly a no-op in the monotonic status loop. Emit that initial
+        // lifecycle event here; later delivered/read receipts use the loop.
+        let _ = session.events.send(SessionEvent::MessageSent {
+            id,
+            chat: crate::cloud::to_jid(to),
         });
         Ok(())
     }
@@ -3508,6 +4572,104 @@ impl SessionManager {
     }
 }
 
+struct CloudKindPayload {
+    msg_type: &'static str,
+    body_text: Option<String>,
+    payload: serde_json::Value,
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Convert normalized cloud content into the common persisted and webhook body
+/// shapes used by both inbound messages and Kapso outbound echoes.
+fn cloud_kind_payload(kind: crate::cloud::InboundKind, raw: &serde_json::Value) -> CloudKindPayload {
+    use crate::cloud::InboundKind;
+    use serde_json::{json, Map, Value};
+
+    let mut extra: Map<String, Value> = Map::new();
+    let (msg_type, body_text, payload) = match kind {
+        InboundKind::Text { body } => {
+            let p = json!({"type": "text", "text": body});
+            ("text", Some(body), p)
+        }
+        InboundKind::Media {
+            msg_type,
+            media_id,
+            mime,
+            sha256,
+            caption,
+            filename,
+            url,
+            voice,
+        } => {
+            let mut p = json!({
+                "type": msg_type,
+                "media_id": media_id,
+                "mimetype": mime,
+                "sha256": sha256,
+                "caption": caption,
+                "voice": voice,
+            });
+            if let Some(obj) = p.as_object_mut() {
+                if let Some(f) = filename {
+                    obj.insert("filename".into(), json!(f));
+                }
+                if let Some(u) = url {
+                    obj.insert("url".into(), json!(u));
+                }
+            }
+            (msg_type, caption, p)
+        }
+        InboundKind::Location { latitude, longitude, name, address } => {
+            let label = name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .or_else(|| address.clone().filter(|s| !s.is_empty()))
+                .unwrap_or_else(|| format!("{latitude:.5},{longitude:.5}"));
+            let loc = json!({
+                "latitude": latitude,
+                "longitude": longitude,
+                "name": name,
+                "address": address,
+            });
+            extra.insert("location".into(), loc.clone());
+            let mut p = json!({"type": "location", "text": label});
+            if let Some(obj) = p.as_object_mut() {
+                obj.insert("location".into(), loc);
+            }
+            ("location", Some(label), p)
+        }
+        InboundKind::Contacts(cards) => {
+            let contacts: Vec<Value> = cards
+                .iter()
+                .map(|c| json!({"name": c.name, "phones": c.phones}))
+                .collect();
+            let text = cards.iter().map(|c| c.name.clone()).find(|n| !n.is_empty());
+            extra.insert("contacts".into(), Value::Array(contacts.clone()));
+            ("contact", text.clone(), json!({"type": "contact", "text": text, "contacts": contacts}))
+        }
+        InboundKind::Reaction { message_id, emoji } => {
+            let r = json!({"message_id": message_id, "emoji": emoji});
+            extra.insert("reaction".into(), r.clone());
+            ("reaction", emoji.clone(), json!({"type": "reaction", "text": emoji, "reaction": r}))
+        }
+        InboundKind::Button { payload, text } => {
+            let b = json!({"payload": payload, "text": text});
+            extra.insert("button".into(), b.clone());
+            ("button", text.clone(), json!({"type": "button", "text": text, "button": b}))
+        }
+        InboundKind::Interactive { kind, id, title, description } => {
+            let i = json!({"kind": kind, "id": id, "title": title, "description": description});
+            extra.insert("interactive".into(), i.clone());
+            ("interactive", title.clone(), json!({"type": "interactive", "text": title, "interactive": i}))
+        }
+        InboundKind::Unknown { type_name } => {
+            extra.insert("raw".into(), raw.clone());
+            ("unknown", None, json!({"type": "unknown", "raw_type": type_name, "raw": raw}))
+        }
+    };
+    CloudKindPayload { msg_type, body_text, payload, extra }
+}
+
 /// Normalize a user-supplied Graph API version: blank → the default, a bare
 /// `25.0` gets its `v` prefix. Anything that isn't `v<major>.<minor>` after
 /// that is refused (it is interpolated into every Graph URL).
@@ -3540,12 +4702,82 @@ fn check_graph_id(what: &str, v: &str) -> Result<()> {
     }
 }
 
+/// Request body for [`SessionManager::create_kapso`] — the hosted-signup knobs
+/// forwarded to Kapso's `POST /setup-links` (see `crate::cloud::SetupLinkOpts`).
+pub struct KapsoCreateReq {
+    pub connection_type: Option<String>,
+    pub country_isos: Vec<String>,
+    pub language: Option<String>,
+    pub provision_phone_number: bool,
+    pub success_redirect_url: Option<String>,
+    pub failure_redirect_url: Option<String>,
+    pub graph_version: Option<String>,
+}
+
+/// Server-wide Kapso configuration, read from the environment (mirrors how
+/// `SessionManager::new` reads its own env). Every field is trimmed; a blank
+/// value counts as unset.
+pub(crate) struct KapsoConfig {
+    /// `RUWA_KAPSO_API_KEY` — the platform key for every Kapso call.
+    pub api_key: String,
+    /// Derived from `RUWA_KAPSO_BASE_URL` (`{base}/platform/v1`); `None` → the
+    /// `KapsoPlatform` default.
+    pub platform_base: Option<String>,
+    /// Derived from `RUWA_KAPSO_BASE_URL` (`{base}/meta/whatsapp`); `None` → the
+    /// `CloudClient` Kapso default. Persisted per kapso session as `base_url`.
+    pub wa_base: Option<String>,
+    /// `RUWA_PUBLIC_BASE_URL` — this ruwa's public origin, no trailing slash;
+    /// the webhook URLs handed to Kapso are built from it.
+    pub public_base_url: String,
+    /// `RUWA_KAPSO_PROJECT_WEBHOOK_SECRET` — verifies the project webhook.
+    pub project_webhook_secret: Option<String>,
+}
+
+/// Read [`KapsoConfig`] from the environment. `BadRequest` when a required var
+/// (`RUWA_KAPSO_API_KEY`, `RUWA_PUBLIC_BASE_URL`) is missing or blank.
+pub(crate) fn kapso_config() -> Result<KapsoConfig> {
+    fn env_trim(k: &str) -> Option<String> {
+        std::env::var(k)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+    let (Some(api_key), Some(public_base_url)) = (
+        env_trim("RUWA_KAPSO_API_KEY"),
+        env_trim("RUWA_PUBLIC_BASE_URL").map(|s| s.trim_end_matches('/').to_string()),
+    ) else {
+        return Err(Error::BadRequest(
+            "kapso not configured: set RUWA_KAPSO_API_KEY and RUWA_PUBLIC_BASE_URL".into(),
+        ));
+    };
+    let base = env_trim("RUWA_KAPSO_BASE_URL").map(|s| s.trim_end_matches('/').to_string());
+    let (platform_base, wa_base) = match base {
+        Some(b) => (
+            Some(format!("{b}/platform/v1")),
+            Some(format!("{b}/meta/whatsapp")),
+        ),
+        None => (None, None),
+    };
+    Ok(KapsoConfig {
+        api_key,
+        platform_base,
+        wa_base,
+        public_base_url,
+        project_webhook_secret: env_trim("RUWA_KAPSO_PROJECT_WEBHOOK_SECRET"),
+    })
+}
+
 /// Store row → transport creds (unsealed; for the Graph client only).
 fn cloud_creds_from_row(r: crate::store::CloudCredsRow) -> crate::cloud::CloudCreds {
     crate::cloud::CloudCreds {
+        provider: crate::cloud::CloudProvider::parse(&r.provider),
         phone_number_id: r.phone_number_id,
         waba_id: r.waba_id,
         access_token: r.access_token,
+        // `api_key` is server-wide (`RUWA_KAPSO_API_KEY`) and injected by the
+        // caller right before building the client, never persisted per-session.
+        api_key: None,
+        base_url: r.base_url,
         app_secret: r.app_secret,
         verify_token: r.verify_token,
         graph_version: r.graph_version,
@@ -3588,6 +4820,42 @@ pub(crate) fn download_proxy(session_proxy: Option<&str>) -> Option<&str> {
     }
 }
 
+/// How many QR-window timeouts an unpaired session may burn per connect before
+/// the reconnect loop parks it `Disconnected`. Each timeout is ~20–40s of QR
+/// validity, so the default 8 ≈ 4–5 minutes of scannable window. Override with
+/// `RUWA_QR_MAX_REFRESHES` (min 1).
+fn qr_refresh_limit() -> u32 {
+    std::env::var("RUWA_QR_MAX_REFRESHES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(8)
+}
+
+/// Process-wide gate for HEAVY ingests (history-sync blobs, app-state
+/// snapshots): each one inflates + decodes hundreds of MB, so two big accounts
+/// pairing at once — or a whole fleet resyncing after a proxy outage — used to
+/// stack into multi-GB peaks and get the container OOM-killed. Permits default
+/// to 1 (strictly serialized); `RUWA_HEAVY_INGEST_CONCURRENCY` raises it.
+/// Callers hold the permit only across download → decode → persist, never
+/// across socket reads, so waiting sessions keep draining their sockets.
+async fn heavy_ingest_permit() -> tokio::sync::SemaphorePermit<'static> {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    let gate = GATE.get_or_init(|| {
+        let n = std::env::var("RUWA_HEAVY_INGEST_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or(1);
+        tokio::sync::Semaphore::new(n)
+    });
+    if gate.available_permits() == 0 {
+        tracing::info!("heavy ingest queued behind another session's history/app-state sync");
+    }
+    gate.acquire().await.expect("heavy-ingest semaphore never closes")
+}
+
 /// The heavy phone-pushed history-sync types: INITIAL_BOOTSTRAP(0), FULL(2),
 /// RECENT(3). These carry the bulk history blobs (the dominant share of egress
 /// bandwidth) and are redundant when re-pushed on a reconnect — we already
@@ -3625,6 +4893,27 @@ fn should_skip_history_sync(
 /// once this goes false — i.e. the session connected, logged out, or was deleted.
 fn lease_wait_still_wanted(status: SessionStatus, has_jid: bool) -> bool {
     has_jid && matches!(status, SessionStatus::Disconnected)
+}
+
+/// Whether a session whose status is `status` looks live enough that a
+/// `reconnect` should target its connection rather than start a new one.
+fn status_is_live(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Connected
+            | SessionStatus::Connecting
+            | SessionStatus::Syncing
+            | SessionStatus::AwaitingQr
+    )
+}
+
+/// Whether `SessionManager::reconnect` can bounce the session in place. True
+/// only when a select loop is actually listening on `reconnect_notify`: a status
+/// that merely *looks* live — a driver waiting out its backoff, or one wedged
+/// inside a connect attempt — would swallow the notify and leave the caller with
+/// a 202 that did nothing, so those have to be restarted instead.
+fn reconnect_can_bounce(status: SessionStatus, socket_live: bool) -> bool {
+    socket_live && status_is_live(status)
 }
 
 /// The lease parameters a connection task needs to renew/heartbeat its claim.
@@ -3720,6 +5009,10 @@ async fn run_with_reconnect(
         }
     }
 
+    // Fresh pairing window: a new connect gets a full QR-refresh budget.
+    session
+        .qr_timeouts
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     let mut backoff_ms = INITIAL_BACKOFF_MS;
     loop {
         // Reset before each attempt so we can tell whether THIS connection
@@ -3763,7 +5056,7 @@ async fn run_with_reconnect(
                 session.set_status(SessionStatus::Disconnected);
                 tracing::info!(
                     session = %session.meta.read().id,
-                    "halting reconnect after stream-replaced; session parked Disconnected"
+                    "halting reconnect (terminal but non-auth disconnect: stream replaced, or QR window expired unscanned); session parked Disconnected — POST /connect to retry"
                 );
             }
             return;
@@ -3993,6 +5286,10 @@ async fn run_connection(
 
         let logout_notify = session.logout_notify.clone();
         let reconnect_notify = session.reconnect_notify.clone();
+        // From here on `reconnect_notify` has a listener, so a `request_reconnect`
+        // bounces this socket instead of being dropped on the floor. Cleared in
+        // the cleanup below, on every exit path.
+        session.set_socket_live(true);
         loop {
             tokio::select! {
                 _ = reconnect_notify.notified() => {
@@ -4100,6 +5397,11 @@ async fn run_connection(
                         from = %node.attrs.get("from").map(String::as_str).unwrap_or(""),
                         "inbound frame",
                     );
+                    // Paged offline-queue drain: every `offline`-tagged
+                    // stanza counts toward the current page.
+                    if node.attrs.contains_key("offline") {
+                        session.note_offline_stanza(&dispatcher);
+                    }
                     if node.tag == "iq" {
                         let id = node.attrs.get("id").cloned().unwrap_or_default();
                         let ty = node.attrs.get("type").cloned().unwrap_or_default();
@@ -4132,6 +5434,12 @@ async fn run_connection(
                             );
                         }
                         if let Some(id) = node.attrs.get("id") {
+                            // Full-node waiter (outbound call offer-ack → <relay>)
+                            // wins over the class-only waiter.
+                            if let Some(tx) = dispatcher.take_pending_ack_node(id) {
+                                let _ = tx.send(node.clone());
+                                continue;
+                            }
                             if let Some(tx) = dispatcher.take_pending_ack(id) {
                                 let class = node
                                     .attrs
@@ -4160,6 +5468,9 @@ async fn run_connection(
     }
     .await;
 
+    // No select loop is listening any more — a `request_reconnect` from here on
+    // has to restart the driver rather than signal it.
+    session.set_socket_live(false);
     // Reset the send queue so a future reconnect gets a fresh receiver.
     // (Old `mpsc::UnboundedSender` clones held by HTTP handlers stop
     // accepting after the swap; their next `enqueue_send` errors.)
@@ -4203,6 +5514,10 @@ pub(crate) struct ConnDispatcher {
     /// Distinct from `pending` (IQ replies) because acks aren't IQs:
     /// they arrive as `<ack id=msg_id type=...>` top-level nodes.
     pending_acks: Arc<PlMutex<HashMap<String, oneshot::Sender<String>>>>,
+    /// Like `pending_acks` but delivers the WHOLE ack node — the outbound
+    /// `<call><offer>` path needs the `<relay>` the offer-ack carries.
+    pending_ack_nodes:
+        Arc<PlMutex<HashMap<String, oneshot::Sender<crate::protocol::binary::Node>>>>,
 }
 
 impl ConnDispatcher {
@@ -4211,6 +5526,7 @@ impl ConnDispatcher {
             out_tx,
             pending: Arc::new(PlMutex::new(HashMap::new())),
             pending_acks: Arc::new(PlMutex::new(HashMap::new())),
+            pending_ack_nodes: Arc::new(PlMutex::new(HashMap::new())),
         }
     }
 
@@ -4237,12 +5553,44 @@ impl ConnDispatcher {
         self.pending_acks.lock().remove(msg_id)
     }
 
+    /// Register for the FULL `<ack>` node on `msg_id` (not just its class).
+    /// The outbound call path needs this: the server's `<ack type=offer>` for
+    /// our `<call><offer>` carries the `<relay>` block that drives the media
+    /// transport. Register BEFORE shipping the offer. Node-capture takes
+    /// precedence over the class-only waiter in the recv loop.
+    pub(crate) fn register_ack_node(
+        &self,
+        msg_id: &str,
+    ) -> oneshot::Receiver<crate::protocol::binary::Node> {
+        let (tx, rx) = oneshot::channel();
+        self.pending_ack_nodes.lock().insert(msg_id.to_string(), tx);
+        rx
+    }
+
+    fn take_pending_ack_node(
+        &self,
+        msg_id: &str,
+    ) -> Option<oneshot::Sender<crate::protocol::binary::Node>> {
+        self.pending_ack_nodes.lock().remove(msg_id)
+    }
+
     /// Send an `<iq>` and await the matching reply. Times out after 30s.
     /// Caller is responsible for the `id` attribute on `iq` — every IQ on
     /// the wire must carry one for routing.
     pub(crate) async fn iq_request(
         &self,
         iq: crate::protocol::binary::Node,
+    ) -> std::result::Result<crate::protocol::binary::Node, &'static str> {
+        self.iq_request_timeout(iq, IQ_REPLY_TIMEOUT).await
+    }
+
+    /// [`Self::iq_request`] with a caller-chosen deadline. Interactive routes
+    /// (profile picture, …) use a short one so a request the server silently
+    /// drops surfaces as a quick, honest error instead of a 30 s stall.
+    pub(crate) async fn iq_request_timeout(
+        &self,
+        iq: crate::protocol::binary::Node,
+        timeout: std::time::Duration,
     ) -> std::result::Result<crate::protocol::binary::Node, &'static str> {
         let id = iq
             .attrs
@@ -4263,13 +5611,16 @@ impl ConnDispatcher {
             return Err("connection task is gone");
         }
         tracing::debug!(%id, %kind, %xmlns, "iq_request enqueued");
-        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(_)) => Err("dispatcher dropped before reply"),
             Err(_) => {
                 self.pending.lock().remove(&id);
-                tracing::warn!(%id, %kind, %xmlns, "iq_request TIMED OUT after 30s");
-                Err("iq reply timeout")
+                tracing::warn!(
+                    %id, %kind, %xmlns, timeout_secs = timeout.as_secs_f32(),
+                    "iq_request TIMED OUT"
+                );
+                Err(IQ_TIMEOUT_ERR)
             }
         }
     }
@@ -4284,6 +5635,13 @@ impl ConnDispatcher {
         self.pending.lock().remove(id)
     }
 }
+
+/// Default deadline for an IQ reply (whatsmeow's request timeout is 75 s; most
+/// server replies land well under 1 s, so 30 s is generous).
+const IQ_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The `iq_request` error string for a missed deadline; matched by the
+/// `Session` wrapper to map it onto a 504.
+const IQ_TIMEOUT_ERR: &str = "iq reply timeout";
 
 /// Drive `SendOp`s off the queue until the channel closes. Each op is
 /// best-effort — failures log and continue so a single stuck recipient
@@ -4661,7 +6019,7 @@ fn lid_user_part(jid: &str) -> &str {
 /// into the message-secret HKDF when sealing an edit, so it must match
 /// byte-for-byte. `"64000000000001.1:50@lid"` → `"64000000000001@lid"`;
 /// `"5511…:3@s.whatsapp.net"` → `"5511…@s.whatsapp.net"`.
-fn to_non_ad_jid(jid: &str) -> String {
+pub(crate) fn to_non_ad_jid(jid: &str) -> String {
     let user = lid_user_part(jid);
     match jid.rfind('@') {
         Some(at) => format!("{user}@{}", &jid[at + 1..]),
@@ -4775,28 +6133,209 @@ fn attach_tctoken_if_available(
     if peer_lid_user.is_empty() {
         return;
     }
+    match fresh_tctoken(store, session_id, peer_lid_user) {
+        Some(token) => {
+            if let Content::Nodes(ref mut children) = node.content {
+                children.push(Node {
+                    tag: "tctoken".into(),
+                    attrs: Attrs::new(),
+                    content: Content::Bytes(token),
+                });
+            }
+            tracing::info!(peer_lid = %peer_lid_user, "attached <tctoken> to 1:1 send");
+        }
+        None => tracing::warn!(
+            peer_lid = %peer_lid_user,
+            "no fresh <tctoken> stored for peer — send may be dropped with error 463"
+        ),
+    }
+}
+
+/// The peer's stored privacy token when we hold a fresh, non-empty one
+/// (< ~28-day window, whatsmeow `ensureTCToken`). `None` otherwise. Keyed by
+/// the peer's LID user; callers holding a PN resolve it via
+/// [`Store::pn_to_lid`] first (see [`peer_tctoken_for_jid`]).
+fn fresh_tctoken(store: &Store, session_id: &str, peer_lid_user: &str) -> Option<Vec<u8>> {
     match store.privacy_token_get(session_id, peer_lid_user) {
         Ok(Some((token, ts))) => {
             let now = chrono::Utc::now().timestamp();
             let fresh = ts == 0 || now - ts < 28 * 86_400;
             if fresh && !token.is_empty() {
-                if let Content::Nodes(ref mut children) = node.content {
-                    children.push(Node {
-                        tag: "tctoken".into(),
-                        attrs: Attrs::new(),
-                        content: Content::Bytes(token),
-                    });
-                }
-                tracing::info!(peer_lid = %peer_lid_user, "attached <tctoken> to 1:1 send");
+                Some(token)
             } else {
-                tracing::warn!(peer_lid = %peer_lid_user, ts, "stored tctoken is stale — not attaching");
+                tracing::debug!(peer_lid = %peer_lid_user, ts, "stored tctoken is stale/empty");
+                None
             }
         }
-        _ => tracing::warn!(
-            peer_lid = %peer_lid_user,
-            "no <tctoken> stored for peer — send may be dropped with error 463"
-        ),
+        _ => None,
     }
+}
+
+/// Fresh privacy token for a bare peer JID (`user@s.whatsapp.net` or
+/// `user@lid`): PNs are resolved to their LID through the session's LID↔PN map
+/// (tokens are stored under the LID, whatsmeow `resolveTCTokenStorageLID`).
+/// `None` for groups / unmapped peers / no stored token.
+pub(crate) fn peer_tctoken_for_jid(store: &Store, session_id: &str, jid: &str) -> Option<Vec<u8>> {
+    let (user, server) = jid.rsplit_once('@')?;
+    let lid_user = match server {
+        "lid" => lid_user_part(user).to_string(),
+        "s.whatsapp.net" => store.pn_to_lid(session_id, jid_user(user)).ok().flatten()?,
+        _ => return None,
+    };
+    fresh_tctoken(store, session_id, &lid_user)
+}
+
+/// Everything the dial audio-bridge needs after `place_call` has shipped the
+/// offer and the server returned the relay. The bridge then connects the media
+/// transport, waits on `accept_rx` to learn which device answered, derives the
+/// recv SRTP keys, and starts the media loop.
+pub(crate) struct OutgoingCallSetup {
+    pub call_id: String,
+    /// Our own device LID in participant form (`<lidUser>:<dev>@lid`).
+    pub own_lid: String,
+    /// The peer we dialed (bare LID or PN jid) — the `<terminate>` target.
+    pub peer_addr: String,
+    /// The peer's bare LID/PN used as `call-creator`.
+    pub call_creator: String,
+    pub call_key: [u8; 32],
+    pub relay: crate::call::RelayData,
+    /// Resolves with the answering device's JID on the peer's `<accept>`.
+    pub accept_rx: oneshot::Receiver<String>,
+}
+
+/// Place an outbound 1:1 audio call: generate a callKey, Signal-encrypt it to
+/// each of the peer's devices, ship a `<call><offer>`, and capture the `<relay>`
+/// the server returns in the offer-ack. Ported from whatsapp-rust
+/// `voip/facade.rs::place_call` (1:1-audio subset). Does NOT start media — the
+/// caller (dial audio-bridge) does that after the peer accepts.
+///
+/// LIVE-UNVERIFIED: the offer wire shape + offer-ack relay framing are ported
+/// from the reference and unit-tested for structure, but a full outbound call
+/// has not been validated against a live WhatsApp peer.
+pub(crate) async fn place_call(
+    session: &Arc<Session>,
+    store: &Arc<Store>,
+    keys: &DeviceKeys,
+    dispatcher: &ConnDispatcher,
+    peer: &str,
+) -> Result<OutgoingCallSetup> {
+    let session_id = session.meta.read().id.clone();
+
+    // Our own device LID (participant id selects our send SRTP keys).
+    let own_lid = {
+        let meta = session.meta.read();
+        meta.jid
+            .as_ref()
+            .and_then(|jid| {
+                let user = jid_user(jid);
+                let device = jid.split(':').nth(1).and_then(|s| s.split('@').next()).unwrap_or("0");
+                store
+                    .pn_to_lid(&session_id, user)
+                    .ok()
+                    .flatten()
+                    .map(|lu| format!("{lu}:{device}@lid"))
+            })
+    }
+    .ok_or_else(|| Error::BadRequest("session has no LID (not paired?)".into()))?;
+
+    // Resolve the peer to a bare LID when we have the mapping (calls are
+    // LID-addressed); fall back to the PN jid otherwise.
+    let peer_digits = crate::cloud::to_digits(peer);
+    if peer_digits.is_empty() {
+        return Err(Error::BadRequest("invalid call recipient".into()));
+    }
+    let peer_lid_user = store.pn_to_lid(&session_id, &peer_digits).ok().flatten();
+    let (peer_addr, peer_bare) = match &peer_lid_user {
+        Some(lu) => (format!("{lu}@lid"), format!("{lu}@lid")),
+        None => (
+            format!("{peer_digits}@s.whatsapp.net"),
+            format!("{peer_digits}@s.whatsapp.net"),
+        ),
+    };
+
+    // Resolve the peer's devices; multi_device is computed on the FULL set
+    // (before encrypt filtering) so the addressed stanza shape stays stable.
+    let device_jids = resolve_device_jids(session, dispatcher, &peer_addr).await;
+    let multi_device = device_jids.len() > 1;
+
+    // callKey → waE2E.Message.call.callKey → message padding → per-device
+    // Signal encrypt (peer devices only; no own-device fan-out).
+    let call_key = crate::call::generate_call_key();
+    let padded = pad_message(&crate::call::encode_call_key_message(&call_key));
+    let recipients =
+        encrypt_per_device(store, keys, dispatcher, &session_id, &device_jids, &padded, &padded, None)
+            .await?;
+    let any_pkmsg = recipients
+        .iter()
+        .any(|r| matches!(r.message_type, crate::crypto::signal::MessageType::PreKey));
+    let device_keys: Vec<crate::call::OfferDeviceKey> = recipients
+        .into_iter()
+        .map(|r| crate::call::OfferDeviceKey {
+            device_jid: r.jid,
+            enc_type: match r.message_type {
+                crate::crypto::signal::MessageType::PreKey => "pkmsg".to_string(),
+                _ => "msg".to_string(),
+            },
+            ciphertext: r.ciphertext,
+        })
+        .collect();
+
+    let device_identity: Option<Vec<u8>> = if any_pkmsg {
+        store.session_account_pb(&session_id).ok().flatten()
+    } else {
+        None
+    };
+    let privacy_token: Option<Vec<u8>> = peer_lid_user
+        .as_ref()
+        .and_then(|lu| store.privacy_token_get(&session_id, lu).ok().flatten())
+        .map(|(tok, _)| tok);
+
+    let call_id = crate::call::generate_call_id();
+    let wrapper_id = crate::api::generate_message_id();
+    let offer = crate::call::build_offer(
+        &call_id,
+        &peer_bare,
+        &own_lid,
+        &wrapper_id,
+        "16000",
+        privacy_token.as_deref(),
+        &device_keys,
+        multi_device,
+        device_identity.as_deref(),
+    );
+
+    // Register the accept-waiter + offer-ack node-waiter BEFORE shipping the
+    // offer, so a fast server can't answer before we're listening.
+    let accept_rx = session.outbound_accept_register(&call_id);
+    let ack_rx = dispatcher.register_ack_node(&wrapper_id);
+    dispatcher.send_node(offer);
+    tracing::info!(call_id = %call_id, peer = %peer_bare, "shipped outbound <call><offer>");
+
+    // The offer-ack carries the <relay> the media transport dials.
+    let ack = match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
+        Ok(Ok(node)) => node,
+        _ => {
+            session.outbound_accept_cancel(&call_id);
+            return Err(Error::Internal(anyhow::anyhow!(
+                "no offer-ack within 10s — call not routed"
+            )));
+        }
+    };
+    let relay_node = crate::call::find_relay(&ack).ok_or_else(|| {
+        session.outbound_accept_cancel(&call_id);
+        Error::Internal(anyhow::anyhow!("offer-ack carried no <relay>"))
+    })?;
+    let relay = crate::call::parse_relay_data(relay_node);
+
+    Ok(OutgoingCallSetup {
+        call_id,
+        own_lid,
+        peer_addr,
+        call_creator: peer_bare,
+        call_key,
+        relay,
+        accept_rx,
+    })
 }
 
 /// whatsmeow `generateCsToken`: HMAC-SHA256(nct_salt, "<recipient_lid_user>@lid").
@@ -5426,6 +6965,11 @@ async fn encrypt_inner_proto_and_ship(
             }
         }
     }
+    if let Some(meta) = poll_meta_node(inner_proto_bytes) {
+        if let crate::protocol::binary::Content::Nodes(ref mut children) = node.content {
+            children.push(meta);
+        }
+    }
     // Attach the peer's `<tctoken>` (privacy / "trusted contact" token) when we
     // have one. Modern WhatsApp rejects a 1:1 send to a peer that expects a token
     // with error 463 (MissingTcToken) and silently drops it. This runs on BOTH the
@@ -5881,6 +7425,7 @@ fn build_group_message_node(
             content: Content::Bytes(pb),
         });
     }
+    children.extend(poll_meta_node(inner_proto_bytes));
 
     let mut msg_attrs = Attrs::new();
     msg_attrs.insert("id".into(), msg_id.into());
@@ -5975,6 +7520,27 @@ async fn send_media_op(
         mimetype,
         caption: caption.map(str::to_string),
     };
+    // Persist the upload descriptor on the outbound row. The spool file under
+    // `data/uploads` is ephemeral (a redeploy wipes it) and, without this,
+    // `GET …/media` for our own sent media 500'd with "read: No such file"
+    // forever. With url + media_key on the payload the GET can re-download
+    // from WhatsApp's CDN exactly like inbound media.
+    {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        let sid = session.meta.read().id.clone();
+        let _ = store.message_merge_payload(
+            &sid,
+            chat_jid,
+            msg_id,
+            &serde_json::json!({
+                "url": uploaded.url,
+                "direct_path": uploaded.direct_path,
+                "media_key_b64": B64.encode(media_key),
+                "mimetype": uploaded.mimetype,
+                "file_length": plaintext.len(),
+            }),
+        );
+    }
 
     // 4. Build the per-type waE2E.Message proto. History/AppState are
     // internal types and never reach this user-facing send path.
@@ -6235,17 +7801,66 @@ pub fn build_contact_message(display_name: &str, vcard: &str) -> Vec<u8> {
 /// Encode a waE2E.Message carrying a `PollCreationMessage`. `message_secret` is
 /// the 32-byte key (placed in `messageContextInfo`) WhatsApp uses to encrypt the
 /// poll-vote payloads; callers generate a fresh random one per poll.
+#[cfg(test)]
 pub fn build_poll_message(
     name: &str,
     options: &[String],
     selectable_count: u32,
     message_secret: &[u8; 32],
 ) -> Vec<u8> {
+    build_poll_message_ext(name, options, selectable_count, message_secret, &PollExtras::default())
+}
+
+/// Which `waE2E.Message` field carries the `PollCreationMessage`. WhatsApp
+/// has added a new field for newer poll features (quiz, end time, …); older
+/// clients only render the ones they know.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PollWireVersion {
+    #[default]
+    V1,
+    V3,
+    V5,
+    V6,
+}
+
+impl PollWireVersion {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "v1" => Some(Self::V1),
+            "v3" => Some(Self::V3),
+            "v5" => Some(Self::V5),
+            "v6" => Some(Self::V6),
+            _ => None,
+        }
+    }
+}
+
+/// Optional poll features beyond name/options/selectable count.
+#[derive(Debug, Clone, Default)]
+pub struct PollExtras {
+    /// `endTime` in unix **milliseconds** (a seconds value arrives as an
+    /// already-ended poll — verified live).
+    pub end_time: Option<i64>,
+    /// Makes the poll a quiz (`pollType=QUIZ`) with this option as the
+    /// correct answer. Must be one of the options.
+    pub quiz_answer: Option<String>,
+    pub wire_version: PollWireVersion,
+}
+
+/// [`build_poll_message`] with quiz / end time / wire field options.
+pub fn build_poll_message_ext(
+    name: &str,
+    options: &[String],
+    selectable_count: u32,
+    message_secret: &[u8; 32],
+    extras: &PollExtras,
+) -> Vec<u8> {
     use crate::proto::wa_web_protobufs_e2e::{
         poll_creation_message::Option as PollOption, Message, MessageContextInfo,
-        PollCreationMessage,
+        PollCreationMessage, PollType,
     };
     use prost::Message as _;
+    use sha2::{Digest, Sha256};
 
     let opts = options
         .iter()
@@ -6258,16 +7873,28 @@ pub fn build_poll_message(
         name: Some(name.to_string()),
         options: opts,
         selectable_options_count: Some(selectable_count),
+        end_time: extras.end_time,
+        poll_type: extras.quiz_answer.as_ref().map(|_| PollType::Quiz as i32),
+        correct_answer: extras.quiz_answer.as_ref().map(|a| PollOption {
+            option_name: Some(a.clone()),
+            option_hash: Some(hex::encode(Sha256::digest(a.as_bytes()))),
+        }),
         ..Default::default()
     };
-    let m = Message {
-        poll_creation_message: Some(Box::new(poll)),
+    let poll = Some(Box::new(poll));
+    let mut m = Message {
         message_context_info: Some(MessageContextInfo {
             message_secret: Some(message_secret.to_vec()),
             ..Default::default()
         }),
         ..Default::default()
     };
+    match extras.wire_version {
+        PollWireVersion::V1 => m.poll_creation_message = poll,
+        PollWireVersion::V3 => m.poll_creation_message_v3 = poll,
+        PollWireVersion::V5 => m.poll_creation_message_v5 = poll,
+        PollWireVersion::V6 => m.poll_creation_message_v6 = poll,
+    }
     m.encode_to_vec()
 }
 
@@ -6469,6 +8096,104 @@ fn replenish_prekeys(store: &Arc<Store>, session_id: &str, keys: &DeviceKeys, d:
 /// to ship back as an acknowledgment. Synchronous so it's unit-testable
 /// without a live socket; takes `&Store` so it can persist pair-success
 /// fields atomically with status transitions.
+/// Collapse repeated `composing` from the same contact inside this window.
+const PRESENCE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Decode an inbound `<chatstate>` / `<presence>` into `(from, state)`:
+///
+/// * `<chatstate from=J><composing/></chatstate>` → composing / paused
+///   (the same pair `build_chat_state` sends for our own typing).
+/// * `<presence from=J type="unavailable"/>` → unavailable; no `type` (or
+///   `available`) → available. `last` (last-seen) is ignored.
+///
+/// `None` for anything else, including group chat states (`from=…@g.us`,
+/// which carry the typer in `participant`) — only 1:1 chats are surfaced.
+fn parse_inbound_presence(node: &crate::protocol::binary::Node) -> Option<(String, &'static str)> {
+    use crate::protocol::binary::Content;
+    let from = node.attrs.get("from")?.as_str();
+    let (_, server) = from.rsplit_once('@')?;
+    if !matches!(server, "s.whatsapp.net" | "lid" | "c.us") {
+        return None;
+    }
+    let state = match node.tag.as_str() {
+        "chatstate" => {
+            let Content::Nodes(children) = &node.content else { return None };
+            match children.first().map(|c| c.tag.as_str())? {
+                "composing" => "composing",
+                "paused" => "paused",
+                _ => return None,
+            }
+        }
+        "presence" => match node.attrs.get("type").map(String::as_str) {
+            None | Some("available") => "available",
+            Some("unavailable") => "unavailable",
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((from.to_string(), state))
+}
+
+/// The contact jid to surface for a presence sender: device/agent suffix
+/// stripped, `@lid` resolved to `<pn>@s.whatsapp.net` through the session's
+/// LID↔PN map (left as `<lid>@lid` when unmapped so the signal isn't lost).
+fn presence_contact_jid(store: &Store, session_id: &str, from: &str) -> String {
+    let (head, server) = from.rsplit_once('@').unwrap_or((from, "s.whatsapp.net"));
+    let user = lid_user_part(head);
+    match server {
+        "lid" => match store.lid_to_pn(session_id, user).ok().flatten() {
+            Some(pn) => format!("{pn}@s.whatsapp.net"),
+            None => format!("{user}@lid"),
+        },
+        _ => format!("{user}@s.whatsapp.net"),
+    }
+}
+
+/// Emit a `presence` event for an inbound chat state / presence node. Own
+/// devices (our other linked devices announcing themselves) and groups are
+/// ignored; repeated `composing` inside [`PRESENCE_DEBOUNCE`] is collapsed.
+/// Returns whether an event was emitted (for tests).
+fn handle_inbound_presence(
+    session: &Arc<Session>,
+    store: &Arc<Store>,
+    node: &crate::protocol::binary::Node,
+) -> bool {
+    let Some((from, state)) = parse_inbound_presence(node) else {
+        return false;
+    };
+    let (session_id, own_pn_user) = {
+        let m = session.meta.read();
+        (m.id.clone(), m.jid.as_deref().map(|j| jid_user(j).to_string()))
+    };
+    let jid = presence_contact_jid(store, &session_id, &from);
+    let own_lid_user = own_pn_user
+        .as_deref()
+        .and_then(|pn| store.pn_to_lid(&session_id, pn).ok().flatten());
+    if device_user_is_own(jid_user(&jid), own_pn_user.as_deref(), own_lid_user.as_deref()) {
+        return false;
+    }
+    {
+        let mut last = session.presence_last_composing.lock();
+        let now = std::time::Instant::now();
+        if state == "composing" {
+            if let Some(prev) = last.get(&jid) {
+                if now.duration_since(*prev) < PRESENCE_DEBOUNCE {
+                    return false;
+                }
+            }
+            last.insert(jid.clone(), now);
+            if last.len() > 4096 {
+                last.retain(|_, t| now.duration_since(*t) < PRESENCE_DEBOUNCE);
+            }
+        } else {
+            last.remove(&jid);
+        }
+    }
+    tracing::debug!(%jid, state, "inbound presence");
+    let _ = session.events.send(SessionEvent::Presence { jid, state: state.to_string() });
+    true
+}
+
 fn process_inbound_node(
     session: &Arc<Session>,
     store: &Arc<Store>,
@@ -6479,15 +8204,36 @@ fn process_inbound_node(
     use crate::protocol::binary::Content;
 
     if node.tag == "message" {
-        return process_inbound_message(session, store, keys, dispatcher, node);
+        let receipt = process_inbound_message(session, store, keys, dispatcher, node);
+        // Server-level `<ack class="message">` for EVERY inbound message,
+        // decrypted or not — whatsmeow `handleEncryptedMessage` always ends in
+        // `sendAck(node, 0)` (via `maybeDeferredAck`), separately from the
+        // `<receipt>` addressed to the sender. Without it the server never
+        // considers the stanza consumed by this device: live-observed on a
+        // coexistence (Cloud API) number, whose own hosted-device peer messages
+        // (`…@hosted`, undecryptable) were replayed on EVERY reconnect with a
+        // growing `offline` counter, and the device stopped receiving new
+        // messages altogether from the moment the last of them arrived.
+        if let Some(d) = dispatcher {
+            d.send_node(build_message_ack(node));
+        }
+        return receipt;
     }
     // `<ib>` (info-bind): the server pushes directives a real client must act
     // on. Ignoring them leaves the device in an unsynced state — the strongest
     // remaining candidate for "message sync paused". Mirrors Baileys'
     // CB:ib,,dirty / offline_preview / offline handlers.
     //   - `<dirty type=… timestamp=…/>` → reply `<iq xmlns="urn:xmpp:whatsapp:dirty"><clean…/></iq>`.
-    //   - `<offline_preview/>`          → reply `<ib><offline_batch count="100"/></ib>`.
-    //   - `<offline count=N/>`          → all queued offline notifs delivered.
+    //   - `<offline_preview count=… message=… notification=… receipt=… appdata=…/>`
+    //                                   → start the paged drain (`OfflineDrain`):
+    //                                     `<ib><offline_batch count="100"/></ib>`,
+    //                                     re-requested per page until the end marker.
+    //   - `<offline count=N/>`          → queue empty: stop paging.
+    //
+    // A single `offline_batch` (Baileys) or none at all (whatsmeow) both stall
+    // on a large queue: the server delivers one page per request, sends no
+    // end marker for a partial page, and holds live `<message>`s behind the
+    // undrained queue — see `OfflineDrain` for the prod incident.
     if node.tag == "ib" {
         use crate::protocol::binary::{Attrs, Node};
         if let Content::Nodes(children) = &node.content {
@@ -6520,24 +8266,23 @@ fn process_inbound_node(
                         }
                     }
                     "offline_preview" => {
-                        tracing::info!("inbound <ib><offline_preview> — sending <offline_batch>");
+                        let get = |k: &str| child.attrs.get(k).cloned().unwrap_or_default();
+                        tracing::info!(
+                            count = %get("count"),
+                            message = %get("message"),
+                            notification = %get("notification"),
+                            receipt = %get("receipt"),
+                            appdata = %get("appdata"),
+                            "inbound <ib><offline_preview> — starting paged drain"
+                        );
                         if let Some(d) = dispatcher {
-                            let mut batch_attrs = Attrs::new();
-                            batch_attrs.insert("count".into(), "100".into());
-                            d.send_node(Node {
-                                tag: "ib".into(),
-                                attrs: Attrs::new(),
-                                content: Content::Nodes(vec![Node {
-                                    tag: "offline_batch".into(),
-                                    attrs: batch_attrs,
-                                    content: Content::None,
-                                }]),
-                            });
+                            let announced = get("count").parse::<u64>().unwrap_or(0);
+                            session.begin_offline_drain(announced, d);
                         }
                     }
                     "offline" => {
                         let count = child.attrs.get("count").cloned().unwrap_or_default();
-                        tracing::info!(count = %count, "inbound <ib><offline> — all queued offline notifs delivered");
+                        session.finish_offline_drain(&count);
                     }
                     other => {
                         tracing::info!(child = %other, attrs = ?child.attrs, "inbound <ib> child (logged, unhandled)");
@@ -6601,6 +8346,32 @@ fn process_inbound_node(
             && matches!(&node.content, Content::Nodes(ns)
                 if ns.iter().any(|c| c.tag == "ping"));
         if is_idle_ping_timeout {
+            // …but not forever. An UNPAIRED session whose QR nobody scans would
+            // otherwise re-handshake through its proxy every ~20–40s until
+            // someone deletes it (seen in prod: 20h+ loops). whatsmeow's QR
+            // channel also ends — it emits `timeout` once the refs run out.
+            // Budget the refreshes; past the cap, park Disconnected (not
+            // Blocked: nothing is wrong with the account) so `POST /connect`
+            // reopens the window. Paired sessions (idle-ping) keep reconnecting.
+            let unpaired = session.meta.read().jid.is_none();
+            if unpaired {
+                let n = session
+                    .qr_timeouts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                let limit = qr_refresh_limit();
+                if n >= limit {
+                    session
+                        .expect_disconnect
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(
+                        timeouts = n,
+                        limit,
+                        "QR window expired (nobody scanned) — parking Disconnected; POST /connect to get a new QR"
+                    );
+                    return None;
+                }
+            }
             session
                 .restart_required
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -6909,6 +8680,13 @@ fn process_inbound_node(
         }
         return None;
     }
+    // A contact's typing indicator / availability. Ephemeral: emit a
+    // `presence` event and move on — nothing is stored, no ack is owed
+    // (whatsmeow doesn't ack chatstate/presence either).
+    if matches!(node.tag.as_str(), "chatstate" | "presence") {
+        handle_inbound_presence(session, store, node);
+        return None;
+    }
     // `notification`, `receipt`, and `call` nodes need an `<ack>` reply or
     // WA's server stops routing further events to us. Mirrors whatsmeow's
     // `sendAck`. Without these, inbound `<message>` nodes never arrive.
@@ -6946,6 +8724,91 @@ fn process_inbound_node(
         if node.tag == "call" {
             if let Some(ev) = parse_call_event(node) {
                 let _ = session.events.send(ev);
+            }
+            // Track the ringing set so a later `accept` can decrypt the callKey
+            // and answer. An `<offer>` stashes the (raw, undecrypted) parsed
+            // offer; a `<terminate>`/`<reject>` clears it. We do NOT decrypt the
+            // callKey here — that consumes a prekey, and an unanswered/spam call
+            // should never do that (the reference decrypts only at accept time).
+            if let Content::Nodes(children) = &node.content {
+                if let Some(offer) = children.iter().find(|c| c.tag == "offer") {
+                    // Our own device LID selects the right `<enc>` on a
+                    // multi-device offer; a single-device offer's bare `<enc>`
+                    // needs no match, so an empty own-LID still works there.
+                    let own_lid = {
+                        let meta = session.meta.read();
+                        meta.jid
+                            .as_ref()
+                            .and_then(|jid| {
+                                let user = jid_user(jid);
+                                let device = jid
+                                    .split(':')
+                                    .nth(1)
+                                    .and_then(|s| s.split('@').next())
+                                    .unwrap_or("0");
+                                store
+                                    .pn_to_lid(&meta.id, user)
+                                    .ok()
+                                    .flatten()
+                                    .map(|lid_user| format!("{lid_user}:{device}@lid"))
+                            })
+                            .unwrap_or_default()
+                    };
+                    if let Some(parsed) = crate::call::parse_offer(node, &own_lid) {
+                        tracing::info!(
+                            call_id = %parsed.call_id, from = %parsed.from,
+                            enc = %parsed.enc.enc_type,
+                            "incoming call offer — stashed as pending (not answered)"
+                        );
+                        // Ring-ack receipt: tell the server we received the offer
+                        // (mirrors whatsmeow's send_offer_ack_receipt). Our own AD
+                        // jid goes in `from` when we have one.
+                        let own_ad = session
+                            .meta
+                            .read()
+                            .jid
+                            .clone()
+                            .map(|j| to_non_ad_jid(&j));
+                        let receipt = crate::call::build_offer_ack_receipt(
+                            &parsed.from,
+                            node.attrs.get("id").map(String::as_str).unwrap_or(""),
+                            &parsed.call_id,
+                            &parsed.call_creator,
+                            own_ad.as_deref(),
+                        );
+                        let _ = session.enqueue_send(SendOp::RawNode(receipt));
+                        session.pending_call_insert(parsed);
+                    }
+                    let _ = offer;
+                } else if let Some(accept) = children.iter().find(|c| c.tag == "accept") {
+                    // The peer answered OUR outbound call. Deliver the answering
+                    // device's JID to the waiting dial bridge so it can derive
+                    // the recv SRTP keys for that device and start media. Harmless
+                    // for inbound calls (no waiter registered → no-op).
+                    if let Some(call_id) = accept.attrs.get("call-id") {
+                        let answering = node
+                            .attrs
+                            .get("from")
+                            .cloned()
+                            .unwrap_or_else(|| accept.attrs.get("call-creator").cloned().unwrap_or_default());
+                        if session.outbound_accept_fire(call_id, &answering) {
+                            tracing::info!(call_id = %call_id, from = %answering, "peer accepted our outbound call");
+                        }
+                    }
+                } else if let Some(end) = children
+                    .iter()
+                    .find(|c| c.tag == "terminate" || c.tag == "reject")
+                {
+                    if let Some(call_id) = end.attrs.get("call-id") {
+                        session.pending_call_remove(call_id);
+                        // Drop any dial bridge waiting on an accept (peer declined
+                        // or hung up before answering).
+                        session.outbound_accept_cancel(call_id);
+                        // If the call was already answered, tear down its live
+                        // media loop (the peer hung up / it was accepted elsewhere).
+                        session.active_call_end(call_id);
+                    }
+                }
             }
         }
         // `<notification type="devices">` means a peer (or we) added/removed a
@@ -7395,24 +9258,47 @@ fn apply_pair_success(
         .map_err(|e| Error::BadRequest(format!("bad inner ADVDeviceIdentity: {e}")))?;
     let key_index = device_id_details.key_index.unwrap_or(0);
 
-    // 5. Verify account signature: msg = [6,0]||signed.details||identity_pub.
-    let acct_prefix: &[u8] = if is_hosted {
-        &ADV_HOSTED_ACCOUNT_SIG_PREFIX
-    } else {
-        &ADV_ACCOUNT_SIG_PREFIX
-    };
-    let mut acct_msg = Vec::with_capacity(acct_prefix.len() + signed_details.len() + 32);
-    acct_msg.extend_from_slice(acct_prefix);
-    acct_msg.extend_from_slice(&signed_details);
-    acct_msg.extend_from_slice(&keys.identity.public);
+    // 5. Verify account signature: msg = prefix||signed.details||identity_pub.
+    //    The prefix is [6,0] (e2ee) or [6,5] (hosted). whatsmeow picks it from
+    //    the INNER `ADVDeviceIdentity.device_type` — NOT the outer container's
+    //    `account_type` (that one only selects the HMAC prefix above). The two
+    //    diverge for Cloud-API *coexistence* accounts (a WhatsApp Business app
+    //    number also onboarded to the Cloud API): the phone signs with the
+    //    hosted prefix while the container still says e2ee, so keying the
+    //    choice off the container rejected every pair-success from such an
+    //    account ("account signature verification failed" → the phone shows
+    //    "couldn't link device, try again"). Mirror upstream, and as belt and
+    //    braces accept the other prefix too — a signature can't be forged for
+    //    either, so trying both loses nothing.
+    let sig_hosted = device_id_details.device_type == Some(AdvEncryptionType::Hosted as i32);
     let mut acct_sig_arr = [0u8; 64];
     acct_sig_arr.copy_from_slice(&account_sig);
     let mut acct_key_arr = [0u8; 32];
     acct_key_arr.copy_from_slice(&account_sig_key);
-    if !crate::crypto::identity::xeddsa_verify(&acct_key_arr, &acct_msg, &acct_sig_arr) {
-        return Err(Error::BadRequest(
-            "pair-success account signature verification failed".into(),
-        ));
+    let verify_with = |prefix: &[u8]| {
+        let mut m = Vec::with_capacity(prefix.len() + signed_details.len() + 32);
+        m.extend_from_slice(prefix);
+        m.extend_from_slice(&signed_details);
+        m.extend_from_slice(&keys.identity.public);
+        crate::crypto::identity::xeddsa_verify(&acct_key_arr, &m, &acct_sig_arr)
+    };
+    let (first, second): (&[u8], &[u8]) = if sig_hosted {
+        (&ADV_HOSTED_ACCOUNT_SIG_PREFIX, &ADV_ACCOUNT_SIG_PREFIX)
+    } else {
+        (&ADV_ACCOUNT_SIG_PREFIX, &ADV_HOSTED_ACCOUNT_SIG_PREFIX)
+    };
+    if !verify_with(first) {
+        if verify_with(second) {
+            tracing::warn!(
+                container_hosted = is_hosted,
+                device_type_hosted = sig_hosted,
+                "pair-success account signature verified with the OTHER prefix — phone/container flags disagree"
+            );
+        } else {
+            return Err(Error::BadRequest(
+                "pair-success account signature verification failed".into(),
+            ));
+        }
     }
 
     // 6. Generate device signature: msg = [6,1]||signed.details||identity_pub
@@ -7577,6 +9463,27 @@ fn build_iq_ack(orig: &crate::protocol::binary::Node) -> crate::protocol::binary
         attrs,
         content: crate::protocol::binary::Content::None,
     }
+}
+
+/// Decrypt the callKey from an inbound call `<offer>` for the answer path: the
+/// `<enc>` is a normal Signal 1:1 message from the `call_creator`, and its
+/// plaintext is a `waE2E.Message` carrying `call.callKey` (32 bytes). This
+/// establishes/advances the Signal session (a `pkmsg` consumes a prekey), which
+/// is why it runs only when we actually answer, never on every ringing offer.
+pub(crate) fn decrypt_call_key(
+    store: &Arc<Store>,
+    session_id: &str,
+    keys: &DeviceKeys,
+    call_creator: &str,
+    enc_type: &str,
+    enc_version: u32,
+    ciphertext: &[u8],
+) -> Option<[u8; 32]> {
+    let addr = resolve_session_address(store, session_id, call_creator);
+    let plain = decrypt_signal_envelope(
+        store, session_id, keys, &addr, call_creator, enc_type, enc_version, ciphertext,
+    )?;
+    crate::call::call_key_from_e2e(&plain)
 }
 
 /// Decrypt a single 1:1 Signal envelope (`<enc type="msg"|"pkmsg">`) under
@@ -7794,6 +9701,17 @@ fn decrypt_group_message(
 
     // 1. Install any SenderKeyDistributionMessage carried in a 1:1 envelope,
     //    so the skmsg below has receiver state to decrypt against.
+    //
+    // The 1:1 plaintext is ALSO kept: a group stanza is not guaranteed to carry
+    // an `skmsg`. WhatsApp phones deliver some group messages (reactions, and
+    // plain text from senders whose sender key we don't hold yet) as a lone
+    // `pkmsg`/`msg` whose waE2E.Message carries the SKDM *and* the content.
+    // whatsmeow treats every `<enc>` child as a message in its own right
+    // (`decryptMessages` → `handleDecryptedMessage` per envelope); we used to
+    // install the SKDM and then return None because no `skmsg` followed, which
+    // flagged the message undecryptable → 5 retry receipts → "PERMANENTLY
+    // failed", losing ~100 real group messages/day fleet-wide.
+    let mut dm_plain: Option<Vec<u8>> = None;
     for enc in &encs {
         let (ty, v, ct) = enc_attrs(enc);
         if ty != "pkmsg" && ty != "msg" {
@@ -7810,6 +9728,7 @@ fn decrypt_group_message(
         let Ok(decoded) = Message::decode(plain.as_slice()) else {
             continue;
         };
+        dm_plain = Some(plain);
         let Some(skdm) = decoded.sender_key_distribution_message else {
             continue;
         };
@@ -7872,7 +9791,13 @@ fn decrypt_group_message(
             }
         }
     }
-    None
+    // 3. No `skmsg` in the stanza: the 1:1 envelope IS the message. Its
+    //    plaintext may be SKDM-only (classified `protocol` → acked, not
+    //    stored/emitted) or carry real content alongside the SKDM.
+    if dm_plain.is_some() {
+        tracing::info!(group = %group, sender = %sender, "decrypt: group stanza without skmsg — using 1:1 envelope content");
+    }
+    dm_plain
 }
 
 /// How long a failed-decrypt inbound gets to heal (retry receipt → sender
@@ -8050,6 +9975,20 @@ fn process_inbound_message(
         )
     };
 
+    // Our own phone answering a `PlaceholderMessageResendRequest`: it hands back
+    // the original message(s) as `WebMessageInfo` bytes inside a peer
+    // protocolMessage. Restore each one under ITS OWN id/chat (upsert over the
+    // `[undecryptable]` row + emit) — the wrapper itself stays protocol-only.
+    if let Some(p) = plain.as_ref() {
+        let (req_id, restored) = placeholder_resend_responses(p);
+        if !restored.is_empty() {
+            tracing::info!(session = %session_id, req_id = ?req_id, items = restored.len(), "phone resend response received");
+            for w in restored {
+                restore_resent_message(session, store, &session_id, own_pn_user.as_deref(), w);
+            }
+        }
+    }
+
     // A `deviceSentMessage` is our OWN outbound, fanned out from another of our
     // devices (the phone). The real conversation is its `destinationJid` and it
     // is from us — NOT a message addressed to our own number. Peek the proto for
@@ -8082,11 +10021,19 @@ fn process_inbound_message(
     // classification yields nothing.
     let secret_enc = plain.as_ref().and_then(|p| secret_encrypted_from_e2e(p));
 
+    // Same for a poll vote: its choice is sealed under the poll's stored secret.
+    let poll_update = plain.as_ref().and_then(|p| poll_update_from_e2e(p));
+
     // Peek the proto for a reply quote (`contextInfo`) before `classify_e2e_message`
     // discards it, so the stored message carries what it was replying to. Same
     // cheap re-decode pattern as `device_sent_dest` above.
     let quoted_ctx: Option<QuotedContext> =
         plain.as_ref().and_then(|p| quoted_context_from_e2e(p));
+
+    // Same cheap re-decode, for the ad a Click-to-WhatsApp conversation came from
+    // (`contextInfo.externalAdReply`). Present ONLY on the first message after the
+    // tap and nowhere else, so it is captured here or lost.
+    let ad_ctx: Option<AdContext> = plain.as_ref().and_then(|p| ad_context_from_e2e(p));
 
     // Decode content; when it's an unrecognized type that is really a modern
     // `SecretEncryptedMessage` edit, unseal it with the original message's stored
@@ -8095,6 +10042,15 @@ fn process_inbound_message(
         InboundContent::Other => match secret_enc.as_ref() {
             Some(se) => decrypt_secret_encrypted(store, &session_id, se, &participant),
             None => InboundContent::Other,
+        },
+        InboundContent::Typed { kind, text } if kind == "poll_vote" => match poll_update.as_ref() {
+            Some(pu) => {
+                let chat_raw = device_sent_dest.as_deref().unwrap_or(from.as_str());
+                let chats =
+                    [canonical_user_jid(store, &session_id, chat_raw), to_non_ad_jid(chat_raw)];
+                decrypt_poll_vote(store, &session_id, pu, &participant, &chats)
+            }
+            None => InboundContent::Typed { kind, text },
         },
         other => other,
     });
@@ -8130,6 +10086,22 @@ fn process_inbound_message(
                     "text".to_string(),
                     body,
                     serde_json::json!({"type": "text", "text": t, "enc_type": enc_type}),
+                )
+            }
+            // A button / template / list reply is chat text for the consumer
+            // (`type` stays "text", `msg_type` stays "text" so history readers
+            // are unaffected); only the extra `reply` object marks its origin.
+            InboundContent::Reply { text: t, kind, id } => {
+                let body = Some(t.clone());
+                (
+                    "text".to_string(),
+                    body,
+                    serde_json::json!({
+                        "type": "text",
+                        "text": t,
+                        "reply": reply_origin_json(kind, id.as_deref()),
+                        "enc_type": enc_type,
+                    }),
                 )
             }
             InboundContent::Media {
@@ -8297,6 +10269,29 @@ fn process_inbound_message(
                 text.clone(),
                 serde_json::json!({"type": kind, "text": text, "enc_type": enc_type}),
             ),
+            InboundContent::Poll { name, options, selectable_count } => (
+                "poll".to_string(),
+                name.clone(),
+                serde_json::json!({
+                    "type": "poll",
+                    "text": name,
+                    "poll": {"name": name, "options": options, "selectable_count": selectable_count},
+                    "enc_type": enc_type,
+                }),
+            ),
+            InboundContent::PollVote { poll_id, selected } => {
+                let text = selected.as_ref().map(|s| s.join(", ")).filter(|t| !t.is_empty());
+                (
+                    "poll_vote".to_string(),
+                    text.clone(),
+                    serde_json::json!({
+                        "type": "poll_vote",
+                        "text": text,
+                        "poll_vote": {"poll_id": poll_id, "selected_options": selected},
+                        "enc_type": enc_type,
+                    }),
+                )
+            }
             InboundContent::Contacts { display_name, cards } => (
                 "contact".to_string(),
                 display_name.clone(),
@@ -8307,6 +10302,25 @@ fn process_inbound_message(
                     "enc_type": enc_type,
                 }),
             ),
+            InboundContent::Location { latitude, longitude, name, address, live } => {
+                let label = location_label(latitude, longitude, name.as_deref(), address.as_deref());
+                (
+                    "location".to_string(),
+                    Some(label.clone()),
+                    serde_json::json!({
+                        "type": "location",
+                        "text": label,
+                        "location": {
+                            "latitude": latitude,
+                            "longitude": longitude,
+                            "name": name,
+                            "address": address,
+                            "live": live,
+                        },
+                        "enc_type": enc_type,
+                    }),
+                )
+            }
             InboundContent::Template { text, buttons } => (
                 "template".to_string(),
                 text.clone(),
@@ -8407,6 +10421,14 @@ fn process_inbound_message(
         }
     }
 
+    // Same for the CTWA ad referral, so the attribution survives in the stored
+    // message even for a consumer that only reads history.
+    if let Some(a) = &ad_ctx {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("ad".to_string(), ad_context_json(a));
+        }
+    }
+
     // A message EDIT applies onto the ORIGINAL message in place: update its
     // body + set `edited`, and DON'T insert a separate row. This shows the edit
     // where the original sits (WhatsApp's behaviour) and drops the old duplicate
@@ -8423,6 +10445,7 @@ fn process_inbound_message(
                 body_obj.insert("edits".into(), serde_json::json!(target));
                 body_obj.insert("from_me".into(), serde_json::json!(store_from_me));
                 body_obj.insert("push_name".into(), serde_json::json!(push_name));
+                body_obj.insert("timestamp".into(), serde_json::json!(timestamp));
                 let _ = session.events.send(SessionEvent::Message {
                     id: msg_id.clone(),
                     chat: chat_canon.clone(),
@@ -8449,6 +10472,7 @@ fn process_inbound_message(
                 body_obj.insert("revokes".into(), serde_json::json!(target));
                 body_obj.insert("from_me".into(), serde_json::json!(store_from_me));
                 body_obj.insert("push_name".into(), serde_json::json!(push_name));
+                body_obj.insert("timestamp".into(), serde_json::json!(timestamp));
                 let _ = session.events.send(SessionEvent::Message {
                     id: msg_id.clone(),
                     chat: chat_canon.clone(),
@@ -8490,6 +10514,18 @@ fn process_inbound_message(
             true,
         );
 
+        // A readable vote also updates the poll's tally in place, so listing the
+        // poll shows current results. WhatsApp sends the voter's whole selection
+        // every time, so it replaces their previous vote.
+        if let Some(pv) = payload.get("poll_vote") {
+            if let (Some(pid), Some(sel)) = (
+                pv.get("poll_id").and_then(|v| v.as_str()),
+                pv.get("selected_options").and_then(|v| v.as_array()),
+            ) {
+                apply_poll_vote(store, &session_id, &chat_canon, pid, &sender_canon, sel);
+            }
+        }
+
         // Learn the SENDER's display name from the message's `notify` push name
         // and mirror it into `contacts`, so the dashboard (and `chats_list`) can
         // show a real name instead of a bare JID — no app-state/contacts sync
@@ -8524,6 +10560,17 @@ fn process_inbound_message(
         if let Some(contacts) = payload.get("contacts") {
             body_obj.insert("contacts".into(), contacts.clone());
         }
+        // A poll's question + options, and a vote's poll id + chosen option names.
+        for key in ["poll", "poll_vote"] {
+            if let Some(v) = payload.get(key) {
+                body_obj.insert(key.into(), v.clone());
+            }
+        }
+        // Same for a location's coordinates: the body is an allowlist of payload
+        // keys, so without this the pin went out as `type:"location"` + label only.
+        if let Some(loc) = payload.get("location") {
+            body_obj.insert("location".into(), loc.clone());
+        }
         // Surface a template message's tappable button labels (when any) so an
         // agent can see the available replies. Sourced from the payload built
         // above for `type:"template"`; omitted when there are no buttons.
@@ -8532,8 +10579,18 @@ fn process_inbound_message(
         {
             body_obj.insert("buttons".into(), buttons.clone());
         }
+        // The ad this conversation came from, when the message is the first one
+        // after a Click-to-WhatsApp tap. Absent on every other message.
+        if let Some(a) = &ad_ctx {
+            body_obj.insert("ad".into(), ad_context_json(a));
+        }
         body_obj.insert("push_name".into(), serde_json::json!(push_name));
         body_obj.insert("from_me".into(), serde_json::json!(store_from_me));
+        // Original send time of the message (unix secs, from the stanza `t` attr) —
+        // NOT the delivery time. Offline drains and history replays deliver hours-old
+        // messages in a burst; without this a consumer cannot tell a fresh message
+        // from a replayed one (and answers a chat the human already closed).
+        body_obj.insert("timestamp".into(), serde_json::json!(timestamp));
         let event = SessionEvent::Message {
             id: msg_id.clone(),
             chat: chat_canon.clone(),
@@ -8884,7 +10941,10 @@ fn decrypt_secret_encrypted(
             // the new text and left the original showing unchanged.
             let text = match decode_e2e_message(&pt) {
                 InboundContent::Text(t) => Some(t),
+                InboundContent::Reply { text, .. } => Some(text),
                 InboundContent::Typed { text, .. } => text,
+                InboundContent::Poll { name, .. } => name,
+                InboundContent::Location { name, address, .. } => name.or(address),
                 InboundContent::Media { caption, .. } => caption,
                 InboundContent::Edited { text, .. } => text,
                 _ => None,
@@ -8899,6 +10959,186 @@ fn decrypt_secret_encrypted(
         "secret-encrypted edit failed to authenticate with any sender candidate"
     );
     make(None)
+}
+
+/// Peek a decrypted message for a `PollUpdateMessage` (a vote), at the top level
+/// or inside our own `deviceSentMessage` / an `ephemeralMessage` wrapper.
+fn poll_update_from_e2e(
+    plaintext: &[u8],
+) -> Option<crate::proto::wa_web_protobufs_e2e::PollUpdateMessage> {
+    use crate::proto::wa_web_protobufs_e2e::Message;
+    use ::prost::Message as _;
+    let m = Message::decode(plaintext).ok()?;
+    m.poll_update_message
+        .clone()
+        .or_else(|| {
+            m.device_sent_message
+                .as_ref()
+                .and_then(|d| d.message.as_ref())
+                .and_then(|im| im.poll_update_message.clone())
+        })
+        .or_else(|| {
+            m.ephemeral_message
+                .as_ref()
+                .and_then(|f| f.message.as_ref())
+                .and_then(|im| im.poll_update_message.clone())
+        })
+}
+
+/// The JID forms a peer may have sealed with for `jid`: its `ToNonAD` form plus
+/// the LID↔PN counterpart when this session knows it.
+fn jid_seal_forms(store: &Arc<Store>, session_id: &str, jid: &str) -> Vec<String> {
+    let user = lid_user_part(jid);
+    let alt = if jid.ends_with("@lid") {
+        store.lid_to_pn(session_id, user).ok().flatten().map(|pn| format!("{pn}@s.whatsapp.net"))
+    } else if jid.ends_with("@s.whatsapp.net") {
+        store.pn_to_lid(session_id, user).ok().flatten().map(|lid| format!("{lid}@lid"))
+    } else {
+        None
+    };
+    std::iter::once(to_non_ad_jid(jid)).chain(alt).collect()
+}
+
+/// The option names of poll `poll_id`, read from its stored row: `poll.options`,
+/// or the top-level `options` that outbound polls stored before `poll` existed.
+/// `chats` are tried in order (the poll row may sit under the PN or LID chat).
+fn poll_options_for(
+    store: &Arc<Store>,
+    session_id: &str,
+    chats: &[String],
+    poll_id: &str,
+) -> Vec<String> {
+    for chat in chats {
+        let Ok(Some((_, _, payload))) = store.message_media_lookup(session_id, chat, poll_id) else {
+            continue;
+        };
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+        let opts = v.get("poll").and_then(|p| p.get("options")).or_else(|| v.get("options"));
+        if let Some(arr) = opts.and_then(|o| o.as_array()) {
+            return arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Map each voted option hash (`SHA-256(option name)`) back to its name. A hash
+/// matching no known option (poll row missing) surfaces as hex rather than
+/// silently dropping the choice.
+fn poll_selected_names(options: &[String], hashes: &[Vec<u8>]) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    hashes
+        .iter()
+        .map(|h| {
+            options
+                .iter()
+                .find(|o| Sha256::digest(o.as_bytes()).as_slice() == h.as_slice())
+                .cloned()
+                .unwrap_or_else(|| hex::encode(h))
+        })
+        .collect()
+}
+
+/// Unseal a poll vote with the stored secret of the poll it targets and resolve
+/// the chosen options to names. `voter_jid` is the raw sender of the vote stanza;
+/// `chats` the chat JIDs the poll row may be stored under. Like edits, the JIDs
+/// the voter sealed with may be PN or LID, so every combination is tried and GCM
+/// authentication picks the right one. = whatsmeow `DecryptPollVote`.
+fn decrypt_poll_vote(
+    store: &Arc<Store>,
+    session_id: &str,
+    pu: &crate::proto::wa_web_protobufs_e2e::PollUpdateMessage,
+    voter_jid: &str,
+    chats: &[String],
+) -> InboundContent {
+    use crate::crypto::msg_secret;
+    use ::prost::Message as _;
+
+    let Some(target) = pu.poll_creation_message_key.as_ref() else {
+        return InboundContent::Typed { kind: "poll_vote".into(), text: None };
+    };
+    let Some(poll_id) = target.id.as_deref().filter(|s| !s.is_empty()) else {
+        return InboundContent::Typed { kind: "poll_vote".into(), text: None };
+    };
+    let unread = || InboundContent::PollVote { poll_id: poll_id.to_string(), selected: None };
+    let Some((payload, iv)) = pu
+        .vote
+        .as_ref()
+        .and_then(|v| Some((v.enc_payload.as_deref()?, v.enc_iv.as_deref()?)))
+    else {
+        return unread();
+    };
+    let Ok(Some((stored_sender, secret))) = store.message_secret_get(session_id, poll_id) else {
+        tracing::info!(poll = %poll_id, "vote targets a poll with no stored secret");
+        return unread();
+    };
+
+    let voters = jid_seal_forms(store, session_id, voter_jid);
+    let mut creators: Vec<String> = Vec::new();
+    if target.from_me == Some(true) {
+        creators.extend(voters.iter().cloned()); // own poll, voted from our phone
+    }
+    for j in [target.remote_jid.as_deref(), target.participant.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+    {
+        creators.extend(jid_seal_forms(store, session_id, j));
+    }
+    creators.extend(jid_seal_forms(store, session_id, &stored_sender));
+    let mut seen = std::collections::HashSet::new();
+    creators.retain(|c| seen.insert(c.clone()));
+
+    for voter in &voters {
+        let aad = msg_secret::poll_vote_aad(poll_id, voter);
+        for creator in &creators {
+            let key =
+                msg_secret::derive_key(&secret, poll_id, creator, voter, msg_secret::USE_CASE_POLL_VOTE);
+            if let Some(pt) = msg_secret::decrypt_with_aad(&key, iv, payload, &aad) {
+                let hashes = crate::proto::wa_web_protobufs_e2e::PollVoteMessage::decode(pt.as_slice())
+                    .map(|v| v.selected_options)
+                    .unwrap_or_default();
+                let options = poll_options_for(store, session_id, chats, poll_id);
+                return InboundContent::PollVote {
+                    poll_id: poll_id.to_string(),
+                    selected: Some(poll_selected_names(&options, &hashes)),
+                };
+            }
+        }
+    }
+    tracing::warn!(
+        poll = %poll_id, tried = voters.len() * creators.len(),
+        "poll vote failed to authenticate with any sender candidate"
+    );
+    unread()
+}
+
+/// Record `voter`'s current choice on the poll row's `poll_votes` map (voter JID →
+/// option names). An empty selection withdraws the vote. No-op when the poll row
+/// isn't stored under `chat`.
+fn apply_poll_vote(
+    store: &Arc<Store>,
+    session_id: &str,
+    chat: &str,
+    poll_id: &str,
+    voter: &str,
+    selected: &[serde_json::Value],
+) {
+    let Ok(Some((_, _, payload))) = store.message_media_lookup(session_id, chat, poll_id) else {
+        return;
+    };
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+    let mut votes = v.get("poll_votes").and_then(|x| x.as_object()).cloned().unwrap_or_default();
+    if selected.is_empty() {
+        votes.remove(voter);
+    } else {
+        votes.insert(voter.to_string(), serde_json::Value::Array(selected.to_vec()));
+    }
+    let _ = store.message_merge_payload(
+        session_id,
+        chat,
+        poll_id,
+        &serde_json::json!({ "poll_votes": votes }),
+    );
 }
 
 /// A captured reply reference from an INBOUND message's `contextInfo`. WhatsApp
@@ -8917,15 +11157,14 @@ struct QuotedContext {
     text: Option<String>,
 }
 
-/// Extract a reply quote from a decrypted `waE2E.Message`, if it is a reply.
-/// Returns `None` for a non-reply (no `contextInfo`, or a `contextInfo` that
-/// only carries mentions/forwards with no quoted stanza).
-fn quoted_context_from_e2e(plaintext: &[u8]) -> Option<QuotedContext> {
-    use crate::proto::wa_web_protobufs_e2e::{ContextInfo, Message};
-    use ::prost::Message as _;
-    let msg = Message::decode(plaintext).ok()?;
-    let ctx: &ContextInfo = msg
-        .extended_text_message
+/// The `contextInfo` carried by whichever content sub-message a `Message` holds.
+/// WhatsApp hangs it off the content message (extendedText for text, image/video/
+/// document for media), never off the envelope — so every consumer of it walks the
+/// same chain. Shared by the reply-quote and the ad-referral extractors below.
+fn context_info_of(
+    msg: &crate::proto::wa_web_protobufs_e2e::Message,
+) -> Option<&crate::proto::wa_web_protobufs_e2e::ContextInfo> {
+    msg.extended_text_message
         .as_ref()
         .and_then(|m| m.context_info.as_deref())
         .or_else(|| msg.image_message.as_ref().and_then(|m| m.context_info.as_deref()))
@@ -8934,7 +11173,17 @@ fn quoted_context_from_e2e(plaintext: &[u8]) -> Option<QuotedContext> {
             msg.document_message
                 .as_ref()
                 .and_then(|m| m.context_info.as_deref())
-        })?;
+        })
+}
+
+/// Extract a reply quote from a decrypted `waE2E.Message`, if it is a reply.
+/// Returns `None` for a non-reply (no `contextInfo`, or a `contextInfo` that
+/// only carries mentions/forwards with no quoted stanza).
+fn quoted_context_from_e2e(plaintext: &[u8]) -> Option<QuotedContext> {
+    use crate::proto::wa_web_protobufs_e2e::Message;
+    use ::prost::Message as _;
+    let msg = Message::decode(plaintext).ok()?;
+    let ctx = context_info_of(&msg)?;
     // A real reply has a quoted stanza id. `contextInfo` is also present for plain
     // mentions/forwards — those carry no quote, so skip them.
     if ctx.stanza_id.is_none() && ctx.quoted_message.is_none() {
@@ -8969,6 +11218,121 @@ fn quoted_preview_text(m: &crate::proto::wa_web_protobufs_e2e::Message) -> Optio
         return Some("[audio]".to_string());
     }
     None
+}
+
+/// The ad a Click-to-WhatsApp (CTWA) conversation came from. WhatsApp attaches it
+/// to the FIRST inbound message after the tap, as `contextInfo.externalAdReply` —
+/// the same `contextInfo` that carries reply quotes. It is the only attribution
+/// signal in the protocol: two ads whose prefilled text is identical are told
+/// apart by `source_id` (the ad id), and `title`/`body` are the creative's own
+/// headline and description. Absent on every other message (organic chats, later
+/// turns of the same conversation), which is why it must be captured on arrival —
+/// nothing downstream can re-derive it.
+struct AdContext {
+    /// Ad id — the stable key to map a creative onto a funnel. Matches
+    /// `ad_id` in Meta Ads Manager reporting.
+    source_id: Option<String>,
+    /// Landing/ad URL, with the click params still attached.
+    source_url: Option<String>,
+    /// `"ad"` (paid) vs `"post"` (organic click-to-chat on a post).
+    source_type: Option<String>,
+    /// Which surface the tap came from (`"facebook"`, `"instagram"`, ...).
+    source_app: Option<String>,
+    /// Click id — joins this conversation to the click in Meta's reporting.
+    ctwa_clid: Option<String>,
+    /// Free-form payload the advertiser sets on the ad itself.
+    ad_ref: Option<String>,
+    /// Creative headline.
+    title: Option<String>,
+    /// Creative description.
+    body: Option<String>,
+    /// `contextInfo.entryPointConversionSource` — the entry point WhatsApp
+    /// itself recorded, independent of the ad block.
+    entry_point: Option<String>,
+}
+
+impl AdContext {
+    /// Every field the ad block can carry is optional, and a `contextInfo` with an
+    /// empty `externalAdReply` is not attribution. Only an ad we can actually name
+    /// (an id, a click id, a url, or at least a headline) is worth surfacing.
+    fn is_meaningful(&self) -> bool {
+        self.source_id.is_some()
+            || self.ctwa_clid.is_some()
+            || self.source_url.is_some()
+            || self.title.is_some()
+    }
+}
+
+/// Extract the CTWA ad referral from a decrypted `waE2E.Message`, if the message
+/// came from an ad tap. Unwraps the wrapper layers first (a disappearing-messages
+/// chat wraps EVERY message in `ephemeralMessage`, and the ad tap is no exception),
+/// mirroring `classify_e2e_message` / `secret_encrypted_from_e2e`.
+fn ad_context_from_e2e(plaintext: &[u8]) -> Option<AdContext> {
+    use crate::proto::wa_web_protobufs_e2e::Message;
+    use ::prost::Message as _;
+    let mut m = Message::decode(plaintext).ok()?;
+    for _ in 0..4 {
+        if let Some(ctx) = context_info_of(&m) {
+            let ad = ctx.external_ad_reply.as_ref();
+            let out = AdContext {
+                source_id: ad.and_then(|a| a.source_id.clone()),
+                source_url: ad.and_then(|a| a.source_url.clone()),
+                source_type: ad.and_then(|a| a.source_type.clone()),
+                source_app: ad.and_then(|a| a.source_app.clone()),
+                ctwa_clid: ad.and_then(|a| a.ctwa_clid.clone()),
+                ad_ref: ad.and_then(|a| a.r#ref.clone()),
+                title: ad.and_then(|a| a.title.clone()),
+                body: ad.and_then(|a| a.body.clone()),
+                entry_point: ctx.entry_point_conversion_source.clone(),
+            };
+            return out.is_meaningful().then_some(out);
+        }
+        // No contextInfo at this layer: unwrap one wrapper and look again (taken
+        // one at a time to satisfy the borrow checker).
+        let inner = if let Some(f) = m.ephemeral_message.take() {
+            f.message
+        } else if let Some(f) = m.view_once_message.take() {
+            f.message
+        } else if let Some(f) = m.view_once_message_v2.take() {
+            f.message
+        } else if let Some(f) = m.view_once_message_v2_extension.take() {
+            f.message
+        } else if let Some(f) = m.document_with_caption_message.take() {
+            f.message
+        } else if let Some(f) = m.edited_message.take() {
+            f.message
+        } else {
+            let d = m.device_sent_message.take()?;
+            d.message
+        };
+        m = *inner?;
+    }
+    None
+}
+
+/// JSON shape of an [`AdContext`], shared by the stored payload and the emitted
+/// event so a consumer reading either sees the same keys. Null fields are kept
+/// (rather than omitted) so the shape is stable to destructure.
+fn ad_context_json(a: &AdContext) -> serde_json::Value {
+    serde_json::json!({
+        "source_id": a.source_id,
+        "source_url": a.source_url,
+        "source_type": a.source_type,
+        "source_app": a.source_app,
+        "ctwa_clid": a.ctwa_clid,
+        "ref": a.ad_ref,
+        "title": a.title,
+        "body": a.body,
+        "entry_point": a.entry_point,
+    })
+}
+
+/// Human label for a location: name, else address, else "lat,lng" (5 decimals).
+fn location_label(latitude: f64, longitude: f64, name: Option<&str>, address: Option<&str>) -> String {
+    name.filter(|s| !s.is_empty())
+        .or(address.filter(|s| !s.is_empty()))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{latitude:.5},{longitude:.5}"))
 }
 
 fn decode_e2e_message(plaintext: &[u8]) -> InboundContent {
@@ -9123,7 +11487,10 @@ fn classify_e2e_message(
         if let Some(edited) = pm.edited_message {
             let text = match classify_e2e_message(*edited, depth + 1) {
                 InboundContent::Text(t) => Some(t),
+                InboundContent::Reply { text, .. } => Some(text),
                 InboundContent::Typed { text, .. } => text,
+                InboundContent::Poll { name, .. } => name,
+                InboundContent::Location { name, address, .. } => name.or(address),
                 InboundContent::Media { caption, .. } => caption,
                 InboundContent::Edited { text, .. } => text,
                 _ => None,
@@ -9158,16 +11525,28 @@ fn classify_e2e_message(
     // a normal text bubble (these ARE the chat content the user sees). Fields
     // are `.clone()`d because several of these message types are `Box`-wrapped
     // by prost and a field move-out through the Box won't compile. ──
-    if let Some(b) = msg.buttons_response_message.as_ref().and_then(|m| m.response.as_ref()).map(
-        |crate::proto::wa_web_protobufs_e2e::buttons_response_message::Response::SelectedDisplayText(t)| t.clone(),
-    ) {
-        return InboundContent::Text(b);
+    //
+    // The three RESPONSE types (the other side tapped a button / list row we or
+    // a business sent) keep their origin as `Reply` so consumers can tell a tap
+    // from typed text and see which option was chosen. They still serialize as
+    // `type: "text"` (with an extra `reply` object) — see `reply_origin_json`.
+    if let Some(br) = msg.buttons_response_message.as_ref() {
+        if let Some(b) = br.response.as_ref().map(
+            |crate::proto::wa_web_protobufs_e2e::buttons_response_message::Response::SelectedDisplayText(t)| t.clone(),
+        ) {
+            return InboundContent::Reply { text: b, kind: ReplyKind::Button, id: br.selected_button_id.clone() };
+        }
     }
-    if let Some(b) = msg.template_button_reply_message.as_ref().and_then(|m| m.selected_display_text.clone()) {
-        return InboundContent::Text(b);
+    if let Some(tr) = msg.template_button_reply_message.as_ref() {
+        if let Some(b) = tr.selected_display_text.clone() {
+            return InboundContent::Reply { text: b, kind: ReplyKind::Template, id: tr.selected_id.clone() };
+        }
     }
-    if let Some(b) = msg.list_response_message.as_ref().and_then(|m| m.title.clone()) {
-        return InboundContent::Text(b);
+    if let Some(lr) = msg.list_response_message.as_ref() {
+        if let Some(b) = lr.title.clone() {
+            let id = lr.single_select_reply.as_ref().and_then(|r| r.selected_row_id.clone());
+            return InboundContent::Reply { text: b, kind: ReplyKind::List, id };
+        }
     }
     if let Some(b) = msg.buttons_message.as_ref().and_then(|m| m.content_text.clone()) {
         return InboundContent::Text(b);
@@ -9185,13 +11564,20 @@ fn classify_e2e_message(
     if let Some(r) = msg.reaction_message.as_ref() {
         return InboundContent::Typed { kind: "reaction".into(), text: r.text.clone() };
     }
+    // Field by field (not `poll_creation_of`): `msg` is partially moved above.
     if let Some(p) = msg
         .poll_creation_message
-        .as_ref()
-        .or(msg.poll_creation_message_v2.as_ref())
-        .or(msg.poll_creation_message_v3.as_ref())
+        .as_deref()
+        .or(msg.poll_creation_message_v2.as_deref())
+        .or(msg.poll_creation_message_v3.as_deref())
+        .or(msg.poll_creation_message_v5.as_deref())
+        .or(msg.poll_creation_message_v6.as_deref())
     {
-        return InboundContent::Typed { kind: "poll".into(), text: p.name.clone() };
+        return InboundContent::Poll {
+            name: p.name.clone(),
+            options: p.options.iter().filter_map(|o| o.option_name.clone()).collect(),
+            selectable_count: p.selectable_options_count.unwrap_or(0),
+        };
     }
     if let Some(c) = msg.contact_message.as_ref() {
         let card = parse_vcard(c.vcard.as_deref().unwrap_or(""), c.display_name.as_deref());
@@ -9212,10 +11598,25 @@ fn classify_e2e_message(
         };
     }
     if let Some(loc) = msg.location_message.as_ref() {
-        let label = loc.name.clone().filter(|s| !s.is_empty()).or_else(|| loc.address.clone()).or_else(|| {
-            Some(format!("{:.5},{:.5}", loc.degrees_latitude.unwrap_or(0.0), loc.degrees_longitude.unwrap_or(0.0)))
-        });
-        return InboundContent::Typed { kind: "location".into(), text: label };
+        return InboundContent::Location {
+            latitude: loc.degrees_latitude.unwrap_or(0.0),
+            longitude: loc.degrees_longitude.unwrap_or(0.0),
+            name: loc.name.clone().filter(|s| !s.is_empty()),
+            address: loc.address.clone().filter(|s| !s.is_empty()),
+            live: loc.is_live.unwrap_or(false),
+        };
+    }
+    // Live location: WhatsApp sends the first frame as its own message type
+    // (field 18); later position updates ride in app-state, not here. The
+    // caption is the only human text — surface it as `name`.
+    if let Some(ll) = msg.live_location_message.as_ref() {
+        return InboundContent::Location {
+            latitude: ll.degrees_latitude.unwrap_or(0.0),
+            longitude: ll.degrees_longitude.unwrap_or(0.0),
+            name: ll.caption.clone().filter(|s| !s.is_empty()),
+            address: None,
+            live: true,
+        };
     }
     if let Some(gi) = msg.group_invite_message.as_ref() {
         return InboundContent::Typed { kind: "group_invite".into(), text: gi.group_name.clone() };
@@ -9264,14 +11665,20 @@ fn classify_e2e_message(
         return InboundContent::Typed { kind: "keep".into(), text: None };
     }
 
+    // A message whose only payload is a `senderKeyDistributionMessage` is the
+    // group-key handshake itself (already installed by `decrypt_group_message`),
+    // not chat content: protocol-only, like control protocolMessages above.
+    // Anything with real content next to the SKDM matched an arm earlier.
+    if msg.sender_key_distribution_message.is_some() {
+        return InboundContent::Typed { kind: "protocol".into(), text: None };
+    }
+
     // Still nothing recognized: log WHICH field was actually set so the
     // remaining "unknown" rows are diagnosable from prod logs (field NAME only,
     // never content — no PII). Inlined rather than a `&msg` helper because by
     // here `msg` is partially moved, so only per-field borrows are allowed.
-    // `protocol_*` is handled above, so it won't appear here.
-    let hint: &str = if msg.sender_key_distribution_message.is_some() {
-        "sender_key_distribution_message"
-    } else if msg.secret_encrypted_message.is_some() {
+    // `protocol_*` and SKDM-only are handled above, so they won't appear here.
+    let hint: &str = if msg.secret_encrypted_message.is_some() {
         "secret_encrypted_message"
     } else if msg.message_context_info.is_some() {
         "message_context_info"
@@ -9313,10 +11720,44 @@ fn classify_e2e_message(
     InboundContent::Other
 }
 
+/// Which interactive control an [`InboundContent::Reply`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyKind {
+    /// `buttonsResponseMessage` — a tap on a legacy quick-reply button.
+    Button,
+    /// `templateButtonReplyMessage` — a tap on a business template (HSM) button.
+    Template,
+    /// `listResponseMessage` — a row picked from an interactive list.
+    List,
+}
+
+impl ReplyKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReplyKind::Button => "button",
+            ReplyKind::Template => "template",
+            ReplyKind::List => "list",
+        }
+    }
+}
+
+/// The `reply` object attached to a `type: "text"` payload when the text came
+/// from an interactive control (see [`InboundContent::Reply`]). Plain typed
+/// text never carries it.
+fn reply_origin_json(kind: ReplyKind, id: Option<&str>) -> serde_json::Value {
+    serde_json::json!({"kind": kind.as_str(), "id": id})
+}
+
 /// Decoded view of an inbound waE2E.Message — the receive path branches
 /// on this to decide what `msg_type` and metadata to persist.
 enum InboundContent {
     Text(String),
+    /// The other side tapped a button / template button / list row. `text` is
+    /// the label they saw (surfaced exactly like typed text: `msg_type`
+    /// "text", `body_text` = label) and `kind`/`id` say which control produced
+    /// it, so a consumer can render "via button" and branch on the option id
+    /// instead of the label. `id` is `None` when the sender didn't set one.
+    Reply { text: String, kind: ReplyKind, id: Option<String> },
     Media {
         kind: crate::media::MediaType,
         url: Option<String>,
@@ -9342,12 +11783,27 @@ enum InboundContent {
     /// group_invite, template) — `kind` becomes `messages.msg_type` and `text`
     /// (if any) the human-readable body. Keeps these out of the "unknown" bucket.
     Typed { kind: String, text: Option<String> },
+    /// A poll (`pollCreationMessage` v1–v3): the question, the option names in
+    /// order, and how many a voter may pick (0 = any number).
+    Poll { name: Option<String>, options: Vec<String>, selectable_count: u32 },
+    /// A vote on a poll. Votes arrive sealed under the poll's message secret, so
+    /// only the live receive path (which has the store) produces this; plain
+    /// decoding yields `Typed{poll_vote}`. `selected` is the chosen option names
+    /// (empty = vote withdrawn), `None` when the vote couldn't be unsealed.
+    PollVote { poll_id: String, selected: Option<Vec<String>> },
     /// A shared contact card (`contactMessage`) or multiple cards
     /// (`contactsArrayMessage`). `display_name` is the chat-list label (kept as
     /// `text` for back-compat); `cards` carries each contact's name + phone
     /// numbers parsed from its vCard so webhook consumers get the number(s)
     /// without parsing the raw card.
     Contacts { display_name: Option<String>, cards: Vec<ContactCard> },
+    /// A dropped pin (`locationMessage`) or the first frame of a live-location
+    /// share (`liveLocationMessage`, `live: true`). Coordinates ride in the
+    /// webhook as `location: {latitude, longitude, name, address, live}` next
+    /// to the human label in `text` — before this the pin went out as a bare
+    /// `type: "location"` with only the label, and a live share fell through to
+    /// "unknown" (field 18), so consumers could not render a map.
+    Location { latitude: f64, longitude: f64, name: Option<String>, address: Option<String>, live: bool },
     /// A business `TemplateMessage` (HSM): a structured title/body/footer with
     /// tappable buttons, sent by business/notification accounts (order updates,
     /// OTPs, reminders, …). `text` is the visible content (title + body + footer,
@@ -9568,6 +12024,28 @@ fn media_kind_str(kind: crate::media::MediaType) -> &'static str {
 /// a typed one — `type="sender"`, escalating to `type="peer_msg"` when the
 /// stanza itself is `type="peer_msg"`. Acking own messages as plain deliveries
 /// (what we did before) leaves the phone's history-sync drive unsatisfied.
+/// `<ack class="message" id to [participant] [recipient]>` for an inbound
+/// `<message>` — whatsmeow receipt.go `sendAck` (no `type` attr on message
+/// acks; `type` is copied only for notification/receipt/call).
+fn build_message_ack(node: &crate::protocol::binary::Node) -> crate::protocol::binary::Node {
+    use crate::protocol::binary::{Attrs, Content, Node};
+    let mut attrs = Attrs::new();
+    attrs.insert("class".into(), "message".into());
+    for key in ["id", "participant", "recipient"] {
+        if let Some(v) = node.attrs.get(key) {
+            attrs.insert(key.into(), v.clone());
+        }
+    }
+    if let Some(from) = node.attrs.get("from") {
+        attrs.insert("to".into(), from.clone());
+    }
+    Node {
+        tag: "ack".into(),
+        attrs,
+        content: Content::None,
+    }
+}
+
 fn build_receipt(
     msg_id: &str,
     from: &str,
@@ -11089,44 +13567,68 @@ pub fn iq_is_error(iq: &crate::protocol::binary::Node) -> bool {
 
 /// Build a profile-picture query IQ for `target_jid`. `preview=true` asks for
 /// the small thumbnail; otherwise the full-resolution image URL. Mirrors
-/// whatsmeow's `GetProfilePictureInfo` (`xmlns="w:profile:picture"`).
+/// whatsmeow's `GetProfilePictureInfo` (`xmlns="w:profile:picture"`):
+///
+/// * `to` is the SERVER (`s.whatsapp.net`) and the contact goes in `target` —
+///   addressing the `<iq>` `to=<contact>` directly is the pre-2022 shape; the
+///   server no longer answers it at all (no error, no result — the request
+///   just vanishes and the caller sits on the timeout).
+/// * `tctoken` (the peer's privacy token, when we hold a fresh one) rides
+///   inside `<picture>`; without it, peers with "who can see my profile
+///   photo = my contacts" style privacy answer 401/404 for a non-contact.
 pub fn build_picture_iq(
     iq_id: &str,
     target_jid: &str,
     preview: bool,
+    tctoken: Option<&[u8]>,
 ) -> crate::protocol::binary::Node {
     use crate::protocol::binary::{Attrs, Content, Node};
     let mut pic_attrs = Attrs::new();
     pic_attrs.insert("query".into(), "url".into());
     pic_attrs.insert("type".into(), if preview { "preview" } else { "image" }.into());
+    let pic_content = match tctoken {
+        Some(t) if !t.is_empty() => Content::Nodes(vec![Node {
+            tag: "tctoken".into(),
+            attrs: Attrs::new(),
+            content: Content::Bytes(t.to_vec()),
+        }]),
+        _ => Content::None,
+    };
 
     let mut iq_attrs = Attrs::new();
     iq_attrs.insert("id".into(), iq_id.into());
     iq_attrs.insert("type".into(), "get".into());
     iq_attrs.insert("xmlns".into(), "w:profile:picture".into());
-    iq_attrs.insert("to".into(), target_jid.into());
+    iq_attrs.insert("to".into(), "@s.whatsapp.net".into());
+    iq_attrs.insert("target".into(), target_jid.into());
     Node {
         tag: "iq".into(),
         attrs: iq_attrs,
         content: Content::Nodes(vec![Node {
             tag: "picture".into(),
             attrs: pic_attrs,
-            content: Content::None,
+            content: pic_content,
         }]),
     }
 }
 
 /// Extract the profile-picture URL from a `w:profile:picture` reply, or `None`
-/// when the contact has no picture / it's hidden (server replies with an error
-/// or omits the `<picture>` node).
+/// when the contact has no picture / it's hidden: the server answers
+/// `<iq type="error">` (401 not-authorized / 404 item-not-found), or a
+/// `<picture status="204|304">` without a `url`, or omits `<picture>` entirely.
+/// All of those are "no picture for you", not failures.
 pub fn parse_picture_response(iq: &crate::protocol::binary::Node) -> Option<String> {
     use crate::protocol::binary::Content;
+    if iq_is_error(iq) {
+        return None;
+    }
     let Content::Nodes(ns) = &iq.content else {
         return None;
     };
     ns.iter()
         .find(|n| n.tag == "picture")
         .and_then(|p| p.attrs.get("url").cloned())
+        .filter(|u| !u.is_empty())
 }
 
 /// One row of an onWhatsApp lookup: the queried number, its resolved JID (when
@@ -12058,6 +14560,39 @@ pub struct EncryptedRecipient {
 /// renders it — the exact "shows sent, never arrives" symptom. Only a
 /// `reaction`/`poll`/plain-text payload should ever get those attributes;
 /// everything else that carries media content must be `"media"`.
+/// The `<meta polltype="creation|vote"/>` child WhatsApp requires on every
+/// `type="poll"` message (whatsmeow `getMessageContent`). Without it the server
+/// acks the stanza but recipients never see the poll.
+fn poll_meta_node(inner_proto: &[u8]) -> Option<crate::protocol::binary::Node> {
+    use crate::proto::wa_web_protobufs_e2e::Message;
+    use crate::protocol::binary::{Attrs, Content, Node};
+    use prost::Message as _;
+
+    let msg = Message::decode(inner_proto).ok()?;
+    let poll_type = if msg.poll_update_message.is_some() {
+        "vote"
+    } else if poll_creation_of(&msg).is_some() {
+        "creation"
+    } else {
+        return None;
+    };
+    let mut attrs = Attrs::new();
+    attrs.insert("polltype".into(), poll_type.into());
+    Some(Node { tag: "meta".into(), attrs, content: Content::None })
+}
+
+/// The `PollCreationMessage` of a message, whichever field version carries it.
+fn poll_creation_of(
+    msg: &crate::proto::wa_web_protobufs_e2e::Message,
+) -> Option<&crate::proto::wa_web_protobufs_e2e::PollCreationMessage> {
+    msg.poll_creation_message
+        .as_deref()
+        .or(msg.poll_creation_message_v2.as_deref())
+        .or(msg.poll_creation_message_v3.as_deref())
+        .or(msg.poll_creation_message_v5.as_deref())
+        .or(msg.poll_creation_message_v6.as_deref())
+}
+
 fn msg_type_attr_for_inner(inner_proto: &[u8]) -> &'static str {
     use crate::proto::wa_web_protobufs_e2e::Message;
     use prost::Message as _;
@@ -12069,7 +14604,7 @@ fn msg_type_attr_for_inner(inner_proto: &[u8]) -> &'static str {
     if msg.reaction_message.is_some() || msg.enc_reaction_message.is_some() {
         return "reaction";
     }
-    if msg.poll_creation_message.is_some() || msg.poll_update_message.is_some() {
+    if poll_creation_of(&msg).is_some() || msg.poll_update_message.is_some() {
         return "poll";
     }
     let has_media = msg.image_message.is_some()
@@ -12604,13 +15139,7 @@ async fn run_lid_pn_sweep(store: Arc<Store>, session_id: String, dispatcher: Con
     // Fold any contact's `@lid` 1:1 chat into their phone-number chat using the
     // LID<->PN mappings we already hold (a group-only contact shows up twice —
     // once per addressing — until merged). Idempotent; runs every connect.
-    match store.consolidate_lid_chats(&session_id) {
-        Ok(n) if n > 0 => {
-            tracing::info!(session = %session_id, rekeyed = n, "consolidated @lid chats into PN")
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(session = %session_id, error = %e, "lid chat consolidation failed"),
-    }
+    consolidate_lid_chats_blocking(&store, &session_id, "connect").await;
 
     const MAX_TOTAL: u32 = 400;
     const BATCH: usize = 50;
@@ -12622,10 +15151,15 @@ async fn run_lid_pn_sweep(store: Arc<Store>, session_id: String, dispatcher: Con
     // The server is authoritative for the pairing; usync asks it directly.
     // Bounded by MAX_TOTAL per connect, so a large book converges over a few
     // reconnects (resolved pairs drop out of the query next time).
-    let targets = match store.pns_without_lid_mapping(&session_id, MAX_TOTAL) {
-        Ok(t) => t,
-        Err(e) => {
+    let (s, sid) = (Arc::clone(&store), session_id.clone());
+    let targets = match tokio::task::spawn_blocking(move || s.pns_without_lid_mapping(&sid, MAX_TOTAL)).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "lid-pn sweep: target query failed");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "lid-pn sweep: target query task failed");
             return;
         }
     };
@@ -12654,15 +15188,26 @@ async fn run_lid_pn_sweep(store: Arc<Store>, session_id: String, dispatcher: Con
     // waiting for the next connect. (Contacts collapse at READ time, so they need
     // no write-side step — the new mappings take effect on the next list fetch.)
     if learned > 0 {
-        match store.consolidate_lid_chats(&session_id) {
-            Ok(n) if n > 0 => {
-                tracing::info!(session = %session_id, rekeyed = n, "consolidated @lid chats into PN (post-sweep)")
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(session = %session_id, error = %e, "post-sweep lid chat consolidation failed"),
-        }
+        consolidate_lid_chats_blocking(&store, &session_id, "post-sweep").await;
     }
     tracing::info!(learned, "lid-pn sweep: complete (LID×PN duplicates now collapse on next list fetch)");
+}
+
+/// Run `consolidate_lid_chats` on the blocking pool, never on a runtime worker.
+/// A Postgres store call parks its calling thread until the query returns
+/// (`pg_offload` joins), so a slow consolidation run from a few concurrent
+/// reconnect sweeps pinned every worker and froze the whole server — HTTP,
+/// egress, logging — until the queries were cancelled.
+async fn consolidate_lid_chats_blocking(store: &Arc<Store>, session_id: &str, phase: &'static str) {
+    let (s, sid) = (Arc::clone(store), session_id.to_string());
+    match tokio::task::spawn_blocking(move || s.consolidate_lid_chats(&sid)).await {
+        Ok(Ok(n)) if n > 0 => {
+            tracing::info!(session = %session_id, rekeyed = n, phase, "consolidated @lid chats into PN")
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(session = %session_id, error = %e, phase, "lid chat consolidation failed"),
+        Err(e) => tracing::warn!(session = %session_id, error = %e, phase, "lid chat consolidation task failed"),
+    }
 }
 
 pub fn build_app_state_fetch_iq(
@@ -13455,6 +16000,10 @@ async fn handle_app_state_sync_iq(
                     let mut media_key = [0u8; 32];
                     media_key.copy_from_slice(&mk);
                     let url = format!("https://{host}{direct_path}");
+                    // Same gate as history-sync: a contacts snapshot of a big
+                    // account is tens of MB inflated, and a fleet-wide resync
+                    // (proxy outage → every session reconnects) stacked them.
+                    let _permit = heavy_ingest_permit().await;
                     let blob =
                         match crate::media::download_encrypted(&url, download_proxy(proxy.as_deref())).await {
                             Ok(b) => b,
@@ -14067,9 +16616,12 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
         .map_err(|e| Error::Internal(anyhow::anyhow!("zlib decompress: {e}")))?;
     let hs = HistorySyncSubset::decode(out.as_slice())
         .map_err(|e| Error::Internal(anyhow::anyhow!("decode HistorySync: {e}")))?;
+    // prost decodes into owned data; the inflated buffer is dead weight now.
+    let decompressed_len = out.len();
+    drop(out);
     let nct_salt = hs.nct_salt.clone().filter(|s| !s.is_empty());
     tracing::info!(
-        decompressed_len = out.len(),
+        decompressed_len,
         conversations = hs.conversations.len(),
         pushnames = hs.pushnames.len(),
         nct_salt_len = nct_salt.as_ref().map(|s| s.len()).unwrap_or(0),
@@ -14131,88 +16683,8 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
                 });
             let timestamp = wmi.message_timestamp.unwrap_or(0) as i64;
             // Decode the inner waE2E.Message to extract a body / type.
-            let (msg_type, body_text, payload_json) = match wmi.message {
-                Some(m) => {
-                    use prost::Message as _;
-                    let bytes = m.encode_to_vec();
-                    match decode_e2e_message(&bytes) {
-                        InboundContent::Text(t) => (
-                            "text".to_string(),
-                            Some(t.clone()),
-                            serde_json::json!({"type":"text","text":t,"source":"history_sync"}),
-                        ),
-                        InboundContent::Media {
-                            kind,
-                            url,
-                            direct_path,
-                            mimetype,
-                            media_key,
-                            caption,
-                            file_length,
-                        } => {
-                            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-                            let media_key_b64 = media_key.as_ref().map(|k| B64.encode(k));
-                            (
-                                media_kind_str(kind).to_string(),
-                                caption.clone(),
-                                serde_json::json!({
-                                    "type": media_kind_str(kind),
-                                    "url": url,
-                                    "direct_path": direct_path,
-                                    "mimetype": mimetype,
-                                    "media_key_b64": media_key_b64,
-                                    "caption": caption,
-                                    "file_length": file_length,
-                                    "source": "history_sync",
-                                }),
-                            )
-                        }
-                        InboundContent::Typed { kind, text } => (
-                            kind.clone(),
-                            text.clone(),
-                            serde_json::json!({"type":kind,"text":text,"source":"history_sync"}),
-                        ),
-                        InboundContent::Template { text, buttons } => (
-                            "template".to_string(),
-                            text.clone(),
-                            serde_json::json!({"type":"template","text":text,"buttons":buttons,"source":"history_sync"}),
-                        ),
-                        InboundContent::Contacts { display_name, cards } => (
-                            "contact".to_string(),
-                            display_name.clone(),
-                            serde_json::json!({"type":"contact","text":display_name,"contacts":cards,"source":"history_sync"}),
-                        ),
-                        // History-sync edits are rare and the original may not be
-                        // ingested yet, so just record the new text as an `edited`
-                        // row rather than applying in place.
-                        InboundContent::Edited { target_id, text } => (
-                            "edited".to_string(),
-                            text.clone(),
-                            serde_json::json!({"type":"edited","text":text,"edits":target_id,"source":"history_sync"}),
-                        ),
-                        // Same for a history-sync revoke: the target may not be
-                        // ingested yet, so record the marker rather than trying
-                        // to tombstone a row that might not exist.
-                        InboundContent::Revoked { target_id } => (
-                            "revoked".to_string(),
-                            None,
-                            serde_json::json!({"type":"revoked","revokes":target_id,"source":"history_sync"}),
-                        ),
-                        InboundContent::HistorySyncNotification(_)
-                        | InboundContent::AppStateSyncKeyShare(_)
-                        | InboundContent::Other => (
-                            "unknown".to_string(),
-                            None,
-                            serde_json::json!({"type":"unknown","source":"history_sync"}),
-                        ),
-                    }
-                }
-                None => (
-                    "unknown".to_string(),
-                    None,
-                    serde_json::json!({"type":"unknown","source":"history_sync"}),
-                ),
-            };
+            let (msg_type, body_text, payload_json) =
+                e2e_content_columns(wmi.message.as_ref(), "history_sync");
             rows.push(HistoryMessageRow {
                 chat_jid: chat_jid.clone(),
                 message_id: msg_id,
@@ -14234,6 +16706,249 @@ pub fn parse_history_sync_payload(zlib: &[u8]) -> Result<ParsedHistorySync> {
         nct_salt,
         privacy_tokens,
     })
+}
+
+/// Map a decoded `waE2E.Message` (as carried by a `WebMessageInfo`) onto the
+/// `messages` columns: `(msg_type, body_text, payload_json)`. Shared by the
+/// history-sync ingest and the phone's placeholder-resend response, which both
+/// hand us an already-decrypted message rather than an `<enc>` envelope.
+/// `source` is stamped into the payload for provenance.
+fn e2e_content_columns(
+    msg: Option<&crate::proto::wa_web_protobufs_e2e::Message>,
+    source: &str,
+) -> (String, Option<String>, serde_json::Value) {
+    match msg {
+        Some(m) => {
+            use prost::Message as _;
+            let bytes = m.encode_to_vec();
+            match decode_e2e_message(&bytes) {
+                InboundContent::Text(t) => (
+                    "text".to_string(),
+                    Some(t.clone()),
+                    serde_json::json!({"type":"text","text":t,"source":source}),
+                ),
+                InboundContent::Reply { text: t, kind, id } => (
+                    "text".to_string(),
+                    Some(t.clone()),
+                    serde_json::json!({
+                        "type":"text",
+                        "text":t,
+                        "reply": reply_origin_json(kind, id.as_deref()),
+                        "source":source,
+                    }),
+                ),
+                InboundContent::Media {
+                    kind,
+                    url,
+                    direct_path,
+                    mimetype,
+                    media_key,
+                    caption,
+                    file_length,
+                } => {
+                    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                    let media_key_b64 = media_key.as_ref().map(|k| B64.encode(k));
+                    (
+                        media_kind_str(kind).to_string(),
+                        caption.clone(),
+                        serde_json::json!({
+                            "type": media_kind_str(kind),
+                            "url": url,
+                            "direct_path": direct_path,
+                            "mimetype": mimetype,
+                            "media_key_b64": media_key_b64,
+                            "caption": caption,
+                            "file_length": file_length,
+                            "source": "history_sync",
+                        }),
+                    )
+                }
+                InboundContent::Typed { kind, text } => (
+                    kind.clone(),
+                    text.clone(),
+                    serde_json::json!({"type":kind,"text":text,"source":source}),
+                ),
+                InboundContent::Poll { name, options, selectable_count } => (
+                    "poll".to_string(),
+                    name.clone(),
+                    serde_json::json!({"type":"poll","text":name,"poll":{"name":name,"options":options,"selectable_count":selectable_count},"source":source}),
+                ),
+                // Never produced by plain decoding (votes need the store to
+                // unseal); kept as a marker row if it ever is.
+                InboundContent::PollVote { poll_id, .. } => (
+                    "poll_vote".to_string(),
+                    None,
+                    serde_json::json!({"type":"poll_vote","poll_vote":{"poll_id":poll_id,"selected_options":null},"source":source}),
+                ),
+                InboundContent::Template { text, buttons } => (
+                    "template".to_string(),
+                    text.clone(),
+                    serde_json::json!({"type":"template","text":text,"buttons":buttons,"source":source}),
+                ),
+                InboundContent::Contacts { display_name, cards } => (
+                    "contact".to_string(),
+                    display_name.clone(),
+                    serde_json::json!({"type":"contact","text":display_name,"contacts":cards,"source":source}),
+                ),
+                InboundContent::Location { latitude, longitude, name, address, live } => {
+                    let label = location_label(latitude, longitude, name.as_deref(), address.as_deref());
+                    (
+                        "location".to_string(),
+                        Some(label.clone()),
+                        serde_json::json!({"type":"location","text":label,"location":{"latitude":latitude,"longitude":longitude,"name":name,"address":address,"live":live},"source":source}),
+                    )
+                }
+                // History-sync edits are rare and the original may not be
+                // ingested yet, so just record the new text as an `edited`
+                // row rather than applying in place.
+                InboundContent::Edited { target_id, text } => (
+                    "edited".to_string(),
+                    text.clone(),
+                    serde_json::json!({"type":"edited","text":text,"edits":target_id,"source":source}),
+                ),
+                // Same for a history-sync revoke: the target may not be
+                // ingested yet, so record the marker rather than trying
+                // to tombstone a row that might not exist.
+                InboundContent::Revoked { target_id } => (
+                    "revoked".to_string(),
+                    None,
+                    serde_json::json!({"type":"revoked","revokes":target_id,"source":source}),
+                ),
+                InboundContent::HistorySyncNotification(_)
+                | InboundContent::AppStateSyncKeyShare(_)
+                | InboundContent::Other => (
+                    "unknown".to_string(),
+                    None,
+                    serde_json::json!({"type":"unknown","source":source}),
+                ),
+            }
+        }
+        None => (
+            "unknown".to_string(),
+            None,
+            serde_json::json!({"type":"unknown","source":source}),
+        ),
+    }
+}
+
+/// Pull the `WebMessageInfo`s out of a phone's answer to our
+/// `PlaceholderMessageResendRequest` (a peer `protocolMessage` of type
+/// `PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE`). Empty for anything else.
+/// = whatsmeow `handlePlaceholderResendResponse` (decode side).
+fn placeholder_resend_responses(plaintext: &[u8]) -> (Option<String>, Vec<WebMessageInfoSubset>) {
+    use prost::Message as _;
+    let Ok(msg) = crate::proto::wa_web_protobufs_e2e::Message::decode(plaintext) else {
+        return (None, Vec::new());
+    };
+    let Some(resp) = msg
+        .protocol_message
+        .and_then(|pm| pm.peer_data_operation_request_response_message)
+    else {
+        return (None, Vec::new());
+    };
+    let items = resp
+        .peer_data_operation_result
+        .into_iter()
+        .filter_map(|r| r.placeholder_message_resend_response)
+        .filter_map(|p| p.web_message_info_bytes)
+        .filter_map(|b| WebMessageInfoSubset::decode(b.as_slice()).ok())
+        .collect();
+    (resp.stanza_id, items)
+}
+
+/// Persist + surface a message our own phone re-sent us in answer to a
+/// `PlaceholderMessageResendRequest` (issued on the first decrypt failure /
+/// `<unavailable>` stanza). The row upserts over the `[undecryptable]`
+/// placeholder (same `session, chat, id`) and the event goes out immediately,
+/// exactly like a retry-receipt recovery — so a message the PEER never
+/// resends still reaches webhook/SSE consumers instead of being lost. Before
+/// this the response was classified `protocol` and silently dropped.
+fn restore_resent_message(
+    session: &Arc<Session>,
+    store: &Arc<Store>,
+    session_id: &str,
+    own_pn_user: Option<&str>,
+    wmi: WebMessageInfoSubset,
+) {
+    let push_name = wmi.push_name.clone().filter(|s| !s.is_empty());
+    let key = wmi.key.clone().unwrap_or_default();
+    let Some(msg_id) = key.id.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(chat_raw) = key.remote_jid.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let from_me = key.from_me.unwrap_or(false);
+    let sender_raw = if from_me {
+        own_pn_user
+            .map(|o| format!("{o}@s.whatsapp.net"))
+            .unwrap_or_else(|| chat_raw.clone())
+    } else {
+        wmi.participant
+            .clone()
+            .or(key.participant)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| chat_raw.clone())
+    };
+    let timestamp = wmi.message_timestamp.unwrap_or(0) as i64;
+    let (msg_type, body_text, payload) = e2e_content_columns(wmi.message.as_ref(), "phone_resend");
+    if matches!(msg_type.as_str(), "protocol" | "unknown") {
+        tracing::info!(id = %msg_id, msg_type = %msg_type, "phone resend response carried no chat content — ignored");
+        return;
+    }
+    let chat_canon = canonical_user_jid(store, session_id, &chat_raw);
+    let sender_canon = canonical_user_jid(store, session_id, &sender_raw);
+    let payload_json = payload.to_string();
+    let _ = store.message_insert(
+        &crate::store::NewMessage {
+            session_id,
+            chat_jid: &chat_canon,
+            message_id: &msg_id,
+            sender_jid: &sender_canon,
+            from_me,
+            timestamp,
+            msg_type: &msg_type,
+            body_text: body_text.as_deref(),
+            payload_json: &payload_json,
+            status: None,
+        },
+        true,
+    );
+    if let Some(name) = &push_name {
+        if !from_me {
+            let _ = store.contact_upsert(session_id, &sender_canon, None, Some(name));
+        }
+    }
+    let prior = session.take_message_retry(&msg_id);
+    tracing::info!(
+        session = %session_id,
+        id = %msg_id,
+        chat = %chat_canon,
+        msg_type = %msg_type,
+        prior_retries = ?prior,
+        "restored message from phone resend response (PlaceholderMessageResendResponse)"
+    );
+    let mut body_obj = serde_json::Map::new();
+    body_obj.insert("type".into(), serde_json::json!(msg_type));
+    body_obj.insert("text".into(), serde_json::json!(body_text));
+    if let Some(m) = media_webhook_descriptor(&msg_type, &payload, session_id, &chat_canon, &msg_id) {
+        body_obj.insert("media".into(), m);
+    }
+    if let Some(contacts) = payload.get("contacts") {
+        body_obj.insert("contacts".into(), contacts.clone());
+    }
+    if let Some(loc) = payload.get("location") {
+        body_obj.insert("location".into(), loc.clone());
+    }
+    body_obj.insert("push_name".into(), serde_json::json!(push_name));
+    body_obj.insert("from_me".into(), serde_json::json!(from_me));
+    body_obj.insert("timestamp".into(), serde_json::json!(timestamp));
+    let _ = session.events.send(SessionEvent::Message {
+        id: msg_id,
+        chat: chat_canon,
+        from: sender_canon,
+        body: serde_json::Value::Object(body_obj),
+    });
 }
 
 /// One row decoded out of a HistorySync blob, shaped for direct INSERT
@@ -14397,8 +17112,9 @@ pub async fn ingest_history_sync_notification(
     // bytes are the same zlib-compressed format as a decrypted blob. We used to
     // hard-require `direct_path` and error out on these, silently dropping the
     // entire inline chunk (the live "missing direct_path" warning seen on pair).
-    if let Some(inline) = notif.initial_hist_bootstrap_inline_payload.clone() {
-        let parsed = parse_history_sync_payload(&inline)?;
+    if let Some(inline) = notif.initial_hist_bootstrap_inline_payload.as_deref() {
+        let _permit = heavy_ingest_permit().await;
+        let parsed = parse_history_sync_payload(inline)?;
         let n = persist_history_sync_rows(store, session_id, &parsed)?;
         mark_history_synced(store, session_id, notif.sync_type);
         return Ok(n);
@@ -14439,13 +17155,22 @@ pub async fn ingest_history_sync_notification(
     // History-sync blobs are the bulk of the proxy's metered traffic; route
     // them direct when RUWA_PROXY_DOWNLOADS=0 (CDN fetch, works from any IP).
     let proxy: Option<String> = store.session_proxy(session_id).ok().flatten();
+    // Gate BEFORE the download so the encrypted blob of a queued chunk isn't
+    // sitting in RAM while another session's ingest runs.
+    let _permit = heavy_ingest_permit().await;
     let blob = crate::media::download_encrypted(&url, download_proxy(proxy.as_deref()))
         .await
         .map_err(|e| Error::Internal(anyhow::anyhow!("download history blob: {e:?}")))?;
+    let downloaded_len = blob.len();
     let zlib = crate::media::decrypt(&blob, &media_key, crate::media::MediaType::History)
         .map_err(|e| Error::Internal(anyhow::anyhow!("decrypt history blob: {e:?}")))?;
-    tracing::debug!(downloaded_len = blob.len(), decrypted_len = zlib.len(), "downloaded history-sync blob");
+    // Each stage is a full copy (ciphertext → plaintext → inflated → decoded →
+    // rows). Free every stage as soon as the next one exists so the peak is
+    // ~two stages, not all of them at once.
+    drop(blob);
+    tracing::debug!(downloaded_len, decrypted_len = zlib.len(), "downloaded history-sync blob");
     let parsed = parse_history_sync_payload(&zlib)?;
+    drop(zlib);
     let n = persist_history_sync_rows(store, session_id, &parsed)?;
     mark_history_synced(store, session_id, notif.sync_type);
     Ok(n)
@@ -14506,6 +17231,7 @@ impl SessionStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             SessionStatus::Pending => "pending",
+            SessionStatus::PendingOnboarding => "pending_onboarding",
             SessionStatus::Connecting => "connecting",
             SessionStatus::AwaitingQr => "awaiting_qr",
             SessionStatus::Syncing => "syncing",
@@ -14524,6 +17250,7 @@ trait ParseStatus {
 impl ParseStatus for String {
     fn parse_session_status(&self) -> SessionStatus {
         match self.as_str() {
+            "pending_onboarding" => SessionStatus::PendingOnboarding,
             "connecting" => SessionStatus::Connecting,
             "awaiting_qr" => SessionStatus::AwaitingQr,
             "syncing" => SessionStatus::Syncing,
@@ -14930,22 +17657,45 @@ mod tests {
     fn picture_iq_shape_and_response_parse() {
         use crate::protocol::binary::{Attrs, Content, Node};
 
-        let iq = build_picture_iq("ID2", "5511999999999@s.whatsapp.net", false);
+        // whatsmeow `GetProfilePictureInfo`: `to` is the SERVER, the contact
+        // rides in `target`. (`to=<contact>` is silently dropped by the server
+        // — staging 2026-09-06: every picture IQ timed out, no error frame.)
+        let iq = build_picture_iq("ID2", "5511999999999@s.whatsapp.net", false, None);
         assert_eq!(iq.attrs.get("xmlns").map(String::as_str), Some("w:profile:picture"));
-        assert_eq!(iq.attrs.get("to").map(String::as_str), Some("5511999999999@s.whatsapp.net"));
+        assert_eq!(iq.attrs.get("type").map(String::as_str), Some("get"));
+        assert_eq!(iq.attrs.get("to").map(String::as_str), Some("@s.whatsapp.net"));
+        assert_eq!(iq.attrs.get("target").map(String::as_str), Some("5511999999999@s.whatsapp.net"));
         let pic = match &iq.content {
             Content::Nodes(ns) => ns.iter().find(|n| n.tag == "picture").unwrap(),
             _ => panic!("no picture node"),
         };
         assert_eq!(pic.attrs.get("type").map(String::as_str), Some("image"));
         assert_eq!(pic.attrs.get("query").map(String::as_str), Some("url"));
-        // preview=true switches the type.
-        let prev = build_picture_iq("ID3", "g@g.us", true);
+        // No token → empty <picture/>.
+        assert!(matches!(pic.content, Content::None));
+        // preview=true switches the type; a fresh tctoken rides INSIDE <picture>.
+        let prev = build_picture_iq("ID3", "120363001@g.us", true, Some(&[1, 2, 3]));
+        assert_eq!(prev.attrs.get("target").map(String::as_str), Some("120363001@g.us"));
         let pic2 = match &prev.content {
             Content::Nodes(ns) => ns.iter().find(|n| n.tag == "picture").unwrap(),
             _ => panic!(),
         };
         assert_eq!(pic2.attrs.get("type").map(String::as_str), Some("preview"));
+        match &pic2.content {
+            Content::Nodes(ns) => {
+                assert_eq!(ns.len(), 1);
+                assert_eq!(ns[0].tag, "tctoken");
+                assert!(matches!(&ns[0].content, Content::Bytes(b) if b == &[1, 2, 3]));
+            }
+            _ => panic!("tctoken must be a child of <picture>"),
+        }
+        // An empty token is not attached.
+        let none = build_picture_iq("ID4", "5511999999999@s.whatsapp.net", true, Some(&[]));
+        let pic3 = match &none.content {
+            Content::Nodes(ns) => ns.iter().find(|n| n.tag == "picture").unwrap(),
+            _ => panic!(),
+        };
+        assert!(matches!(pic3.content, Content::None));
 
         // Parse a reply with a url.
         let mut pa = Attrs::new();
@@ -14975,6 +17725,68 @@ mod tests {
             }]),
         };
         assert_eq!(parse_picture_response(&err), None);
+
+        // `<iq type="error">` (401 not-authorized / 404 not-found = hidden or
+        // no picture) → None, even if some <picture> were present.
+        let mut ea = Attrs::new();
+        ea.insert("type".into(), "error".into());
+        let mut ec = Attrs::new();
+        ec.insert("code".into(), "404".into());
+        ec.insert("text".into(), "item-not-found".into());
+        let typed_err = Node {
+            tag: "iq".into(),
+            attrs: ea,
+            content: Content::Nodes(vec![Node { tag: "error".into(), attrs: ec, content: Content::None }]),
+        };
+        assert_eq!(parse_picture_response(&typed_err), None);
+
+        // `<picture status="204"/>` (no picture set) → None.
+        let mut sa = Attrs::new();
+        sa.insert("status".into(), "204".into());
+        let no_pic = Node {
+            tag: "iq".into(),
+            attrs: Attrs::new(),
+            content: Content::Nodes(vec![Node { tag: "picture".into(), attrs: sa, content: Content::None }]),
+        };
+        assert_eq!(parse_picture_response(&no_pic), None);
+    }
+
+    /// `iq_request_timeout`: an unanswered IQ fails with the timeout error at
+    /// the caller's deadline (not the 30 s default) and the pending slot is
+    /// released; an `<iq type="error">` carrying the SAME id IS matched and
+    /// delivered (so a hidden/no-picture error becomes `url: null`, never a
+    /// timeout).
+    #[tokio::test]
+    async fn iq_request_timeout_honours_deadline_and_matches_error_reply() {
+        use crate::protocol::binary::{Attrs, Content, Node};
+        use std::time::Duration;
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let dispatcher = ConnDispatcher::new(out_tx);
+
+        // 1. Silent server → timeout at the short deadline.
+        let iq = build_picture_iq("PIC-1", "5511999999999@s.whatsapp.net", true, None);
+        let started = std::time::Instant::now();
+        let res = dispatcher.iq_request_timeout(iq, Duration::from_millis(80)).await;
+        assert_eq!(res, Err(IQ_TIMEOUT_ERR));
+        assert!(started.elapsed() < Duration::from_secs(5), "must not wait the 30 s default");
+        assert!(dispatcher.take_pending("PIC-1").is_none(), "pending slot released on timeout");
+        // The IQ was actually written to the socket queue.
+        let written = out_rx.recv().await.unwrap();
+        assert_eq!(written.attrs.get("id").map(String::as_str), Some("PIC-1"));
+
+        // 2. Error reply with the same id is matched and returned.
+        let iq = build_picture_iq("PIC-2", "5511999999999@s.whatsapp.net", true, None);
+        let d2 = dispatcher.clone();
+        let waiter = tokio::spawn(async move { d2.iq_request_timeout(iq, Duration::from_secs(5)).await });
+        let _ = out_rx.recv().await.unwrap();
+        let mut ea = Attrs::new();
+        ea.insert("id".into(), "PIC-2".into());
+        ea.insert("type".into(), "error".into());
+        let err_reply = Node { tag: "iq".into(), attrs: ea, content: Content::None };
+        dispatcher.take_pending("PIC-2").expect("pending registered").send(err_reply).unwrap();
+        let reply = waiter.await.unwrap().expect("error reply delivered, not timed out");
+        assert!(iq_is_error(&reply));
+        assert_eq!(parse_picture_response(&reply), None);
     }
 
     #[test]
@@ -15141,6 +17953,59 @@ mod tests {
     /// A `contactsArrayMessage` (multiple cards in one message) surfaces every
     /// card with its parsed phones.
     #[test]
+    fn location_and_live_location_decode_with_coords() {
+        use crate::proto::wa_web_protobufs_e2e::{LiveLocationMessage, LocationMessage, Message};
+        use prost::Message as _;
+
+        let pin = Message {
+            location_message: Some(Box::new(LocationMessage {
+                degrees_latitude: Some(-23.55052),
+                degrees_longitude: Some(-46.633308),
+                name: Some("Praça da Sé".into()),
+                address: Some("Sé, São Paulo".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        match decode_e2e_message(&pin.encode_to_vec()) {
+            InboundContent::Location { latitude, longitude, name, address, live } => {
+                assert!((latitude - -23.55052).abs() < 1e-9);
+                assert!((longitude - -46.633308).abs() < 1e-9);
+                assert_eq!(name.as_deref(), Some("Praça da Sé"));
+                assert_eq!(address.as_deref(), Some("Sé, São Paulo"));
+                assert!(!live);
+            }
+            _ => panic!("expected Location"),
+        }
+
+        // Live share (field 18) used to fall through to "unknown".
+        let live = Message {
+            live_location_message: Some(Box::new(LiveLocationMessage {
+                degrees_latitude: Some(-22.9),
+                degrees_longitude: Some(-43.2),
+                caption: Some("a caminho".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        match decode_e2e_message(&live.encode_to_vec()) {
+            InboundContent::Location { latitude, longitude, name, address, live } => {
+                assert!((latitude - -22.9).abs() < 1e-9);
+                assert!((longitude - -43.2).abs() < 1e-9);
+                assert_eq!(name.as_deref(), Some("a caminho"));
+                assert!(address.is_none());
+                assert!(live);
+            }
+            _ => panic!("expected live Location"),
+        }
+
+        // Label: name → address → "lat,lng".
+        assert_eq!(location_label(1.0, 2.0, Some("X"), Some("Y")), "X");
+        assert_eq!(location_label(1.0, 2.0, Some(""), Some("Y")), "Y");
+        assert_eq!(location_label(-23.55052, -46.633308, None, None), "-23.55052,-46.63331");
+    }
+
+    #[test]
     fn contacts_array_message_decodes_each_card() {
         use crate::proto::wa_web_protobufs_e2e::{ContactMessage, ContactsArrayMessage, Message};
         use prost::Message as _;
@@ -15278,6 +18143,120 @@ mod tests {
         assert_eq!(h.reconnect_count, 2);
     }
 
+    /// Inbound `<chatstate>` / `<presence>` → a `presence` event with the
+    /// exact webhook contract `{"event":"presence","data":{"jid","state"}}`.
+    /// LID senders resolve to PN through the session map; groups and own
+    /// devices are ignored; repeated `composing` inside 3 s is collapsed.
+    #[test]
+    fn inbound_chatstate_and_presence_emit_presence_event() {
+        use crate::protocol::binary::{Attrs, Content, Node};
+        let mgr = manager();
+        let sid = mgr.create(None).unwrap().meta.read().id.clone();
+        let session = mgr.get(&sid).unwrap();
+        let keys = mgr.load_device_keys(&sid).unwrap();
+        let mut rx = session.events.subscribe();
+
+        let chatstate = |from: &str, child: &str| {
+            let mut a = Attrs::new();
+            a.insert("from".into(), from.into());
+            Node {
+                tag: "chatstate".into(),
+                attrs: a,
+                content: Content::Nodes(vec![Node { tag: child.into(), attrs: Attrs::new(), content: Content::None }]),
+            }
+        };
+        let presence = |from: &str, ty: Option<&str>| {
+            let mut a = Attrs::new();
+            a.insert("from".into(), from.into());
+            if let Some(t) = ty {
+                a.insert("type".into(), t.into());
+            }
+            Node { tag: "presence".into(), attrs: a, content: Content::None }
+        };
+        let next = |rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>| -> serde_json::Value {
+            let ev = rx.try_recv().expect("an event should have been emitted");
+            crate::egress::event_to_payload(&sid, &ev, 1_700_000_000)
+        };
+
+        // composing → exact contract; no ack owed.
+        let ack = process_inbound_node(&session, &mgr.store, &keys, None,
+            &chatstate("5511999998888:3@s.whatsapp.net", "composing"));
+        assert!(ack.is_none(), "chatstate must not be acked");
+        let p = next(&mut rx);
+        assert_eq!(p["event"], "presence");
+        assert_eq!(p["session"], sid.as_str());
+        assert_eq!(p["ts"], 1_700_000_000);
+        assert_eq!(p["data"], serde_json::json!({"jid": "5511999998888@s.whatsapp.net", "state": "composing"}));
+
+        // A second composing right away is debounced; paused always goes through.
+        process_inbound_node(&session, &mgr.store, &keys, None,
+            &chatstate("5511999998888@s.whatsapp.net", "composing"));
+        assert!(rx.try_recv().is_err(), "composing within 3 s must be collapsed");
+        process_inbound_node(&session, &mgr.store, &keys, None,
+            &chatstate("5511999998888@s.whatsapp.net", "paused"));
+        let p = next(&mut rx);
+        assert_eq!(p["data"]["state"], "paused");
+        assert_eq!(p["data"]["jid"], "5511999998888@s.whatsapp.net");
+        // …and paused resets the debounce, so the next composing is emitted.
+        process_inbound_node(&session, &mgr.store, &keys, None,
+            &chatstate("5511999998888@s.whatsapp.net", "composing"));
+        assert_eq!(next(&mut rx)["data"]["state"], "composing");
+
+        // LID sender resolves to the PN via the session's LID↔PN map.
+        mgr.store.lid_pn_put(&sid, "64000000000001", "5511900000002", 1).unwrap();
+        process_inbound_node(&session, &mgr.store, &keys, None,
+            &chatstate("64000000000001.1@lid", "composing"));
+        assert_eq!(next(&mut rx)["data"]["jid"], "5511900000002@s.whatsapp.net");
+        // Unmapped LID is surfaced as-is rather than dropped.
+        process_inbound_node(&session, &mgr.store, &keys, None,
+            &chatstate("77000000000009@lid", "paused"));
+        assert_eq!(next(&mut rx)["data"]["jid"], "77000000000009@lid");
+
+        // presence available / unavailable (no type = available).
+        process_inbound_node(&session, &mgr.store, &keys, None,
+            &presence("5511999998888@s.whatsapp.net", Some("unavailable")));
+        assert_eq!(next(&mut rx)["data"]["state"], "unavailable");
+        process_inbound_node(&session, &mgr.store, &keys, None,
+            &presence("5511999998888@s.whatsapp.net", None));
+        assert_eq!(next(&mut rx)["data"]["state"], "available");
+
+        // Group chat state → ignored (1:1 only).
+        let mut g = chatstate("120363001234567890@g.us", "composing");
+        g.attrs.insert("participant".into(), "5511999998888@s.whatsapp.net".into());
+        process_inbound_node(&session, &mgr.store, &keys, None, &g);
+        assert!(rx.try_recv().is_err(), "group chat state must not emit");
+
+        // Unknown child / type → ignored.
+        process_inbound_node(&session, &mgr.store, &keys, None,
+            &chatstate("5511999998888@s.whatsapp.net", "recording"));
+        process_inbound_node(&session, &mgr.store, &keys, None,
+            &presence("5511999998888@s.whatsapp.net", Some("subscribe")));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Our own other devices announcing presence are not "a contact typing".
+    #[test]
+    fn inbound_presence_from_own_device_is_ignored() {
+        use crate::protocol::binary::{Attrs, Content, Node};
+        let mgr = manager();
+        let sid = mgr.create(None).unwrap().meta.read().id.clone();
+        let session = mgr.get(&sid).unwrap();
+        let keys = mgr.load_device_keys(&sid).unwrap();
+        session.meta.write().jid = Some("5511900000001:7@s.whatsapp.net".into());
+        mgr.store.lid_pn_put(&sid, "64000000000777", "5511900000001", 1).unwrap();
+        let mut rx = session.events.subscribe();
+        for from in ["5511900000001:2@s.whatsapp.net", "64000000000777.1@lid"] {
+            let mut a = Attrs::new();
+            a.insert("from".into(), from.into());
+            process_inbound_node(&session, &mgr.store, &keys, None, &Node {
+                tag: "chatstate".into(),
+                attrs: a,
+                content: Content::Nodes(vec![Node { tag: "composing".into(), attrs: Attrs::new(), content: Content::None }]),
+            });
+        }
+        assert!(rx.try_recv().is_err(), "own-device chat state must not emit");
+    }
+
     #[test]
     fn stream_error_515_flags_restart_required() {
         use crate::protocol::binary::{Attrs, Content, Node};
@@ -15366,6 +18345,209 @@ mod tests {
     }
 
     #[test]
+    fn qr_window_timeouts_are_capped_for_unpaired_sessions() {
+        // An unpaired session gets `qr_refresh_limit()` refreshes; the Nth
+        // timeout flags a (non-blocked) terminal disconnect instead of another
+        // proxy-metered re-handshake. A paired session is never capped.
+        use crate::protocol::binary::{Attrs, Content, Node};
+        let mgr = manager();
+        let sid = mgr.create(None).unwrap().meta.read().id.clone();
+        let session = mgr.get(&sid).unwrap();
+        let keys = mgr.load_device_keys(&sid).unwrap();
+        let ord = std::sync::atomic::Ordering::Relaxed;
+        let ping_err = || Node {
+            tag: "stream:error".into(),
+            attrs: Attrs::new(),
+            content: Content::Nodes(vec![Node {
+                tag: "ping".into(),
+                attrs: Attrs::new(),
+                content: Content::None,
+            }]),
+        };
+        let limit = qr_refresh_limit();
+        for i in 1..limit {
+            session.restart_required.store(false, ord);
+            process_inbound_node(&session, &mgr.store, &keys, None, &ping_err());
+            assert!(session.restart_required.load(ord), "refresh #{i} should reconnect");
+            assert!(!session.expect_disconnect.load(ord), "refresh #{i} must not park");
+        }
+        session.restart_required.store(false, ord);
+        process_inbound_node(&session, &mgr.store, &keys, None, &ping_err());
+        assert!(!session.restart_required.load(ord), "cap reached: no more refresh");
+        assert!(session.expect_disconnect.load(ord), "cap reached: park Disconnected");
+        assert!(!session.wa_blocked.load(ord), "cap must NOT block the account");
+
+        // Paired session: same node, never capped.
+        session.expect_disconnect.store(false, ord);
+        session.qr_timeouts.store(0, ord);
+        session.meta.write().jid = Some("5511999999999:1@s.whatsapp.net".into());
+        for _ in 0..(limit + 2) {
+            session.restart_required.store(false, ord);
+            process_inbound_node(&session, &mgr.store, &keys, None, &ping_err());
+            assert!(session.restart_required.load(ord));
+            assert!(!session.expect_disconnect.load(ord));
+        }
+    }
+
+    #[test]
+    fn message_ack_mirrors_whatsmeow_send_ack() {
+        use crate::protocol::binary::{Attrs, Content, Node};
+        let mut a = Attrs::new();
+        a.insert("id".into(), "MSG1".into());
+        a.insert("from".into(), "550000000003.128:99@hosted".into());
+        a.insert("type".into(), "text".into());
+        a.insert("category".into(), "peer".into());
+        a.insert("recipient".into(), "5511900000000@s.whatsapp.net".into());
+        let node = Node { tag: "message".into(), attrs: a, content: Content::None };
+        let ack = build_message_ack(&node);
+        assert_eq!(ack.tag, "ack");
+        assert_eq!(ack.attrs.get("class").map(String::as_str), Some("message"));
+        assert_eq!(ack.attrs.get("id").map(String::as_str), Some("MSG1"));
+        assert_eq!(ack.attrs.get("to").map(String::as_str), Some("550000000003.128:99@hosted"));
+        assert_eq!(ack.attrs.get("recipient").map(String::as_str), Some("5511900000000@s.whatsapp.net"));
+        assert!(!ack.attrs.contains_key("type"), "message acks carry no type attr");
+        assert!(!ack.attrs.contains_key("participant"));
+    }
+
+    #[test]
+    fn message_merge_payload_overlays_keys_and_keeps_others() {
+        let mgr = manager();
+        let sid = mgr.create(None).unwrap().meta.read().id.clone();
+        let store = Arc::clone(&mgr.store);
+        let chat = "5511900000001@s.whatsapp.net";
+        store
+            .message_insert(
+                &crate::store::NewMessage {
+                    session_id: &sid,
+                    chat_jid: chat,
+                    message_id: "M1",
+                    sender_jid: "self",
+                    from_me: true,
+                    timestamp: 1,
+                    msg_type: "image",
+                    body_text: None,
+                    payload_json: r#"{"type":"image","caption":"hi","file_path":"data/uploads/x"}"#,
+                    status: None,
+                },
+                true,
+            )
+            .unwrap();
+        store
+            .message_merge_payload(
+                &sid,
+                chat,
+                "M1",
+                &serde_json::json!({"url":"https://mmg/x","media_key_b64":"AAAA","caption":"new"}),
+            )
+            .unwrap();
+        let (_, _, payload) = store.message_media_lookup(&sid, chat, "M1").unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["url"], "https://mmg/x");
+        assert_eq!(v["media_key_b64"], "AAAA");
+        assert_eq!(v["caption"], "new");
+        assert_eq!(v["file_path"], "data/uploads/x");
+        // Unknown row: no-op, no error.
+        store.message_merge_payload(&sid, chat, "NOPE", &serde_json::json!({"a":1})).unwrap();
+    }
+
+    #[test]
+    fn phone_resend_response_restores_undecryptable_row_and_emits_event() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use e2e::peer_data_operation_request_response_message::{
+            peer_data_operation_result::PlaceholderMessageResendResponse, PeerDataOperationResult,
+        };
+        use prost::Message as _;
+
+        let mgr = manager();
+        let sid = mgr.create(None).unwrap().meta.read().id.clone();
+        let session = mgr.get(&sid).unwrap();
+        let store = Arc::clone(&mgr.store);
+        let mut rx = session.events.subscribe();
+
+        let chat = "5511900000001@s.whatsapp.net";
+        // The first (undecryptable / <unavailable>) delivery left a placeholder row.
+        store
+            .message_insert(
+                &crate::store::NewMessage {
+                    session_id: &sid,
+                    chat_jid: chat,
+                    message_id: "MSG1",
+                    sender_jid: chat,
+                    from_me: false,
+                    timestamp: 1,
+                    msg_type: "undecryptable",
+                    body_text: None,
+                    payload_json: "{}",
+                    status: None,
+                },
+                true,
+            )
+            .unwrap();
+        session.bump_message_retry("MSG1");
+
+        // The phone's answer: a peer protocolMessage wrapping the original as WebMessageInfo.
+        let wmi = WebMessageInfoSubset {
+            key: Some(crate::proto::wa_common::MessageKey {
+                remote_jid: Some(chat.into()),
+                from_me: Some(false),
+                id: Some("MSG1".into()),
+                participant: None,
+            }),
+            message: Some(e2e::Message { conversation: Some("oi de novo".into()), ..Default::default() }),
+            message_timestamp: Some(1700000000),
+            push_name: Some("Peer".into()),
+            participant: None,
+        };
+        let wrapper = e2e::Message {
+            protocol_message: Some(Box::new(e2e::ProtocolMessage {
+                r#type: Some(e2e::protocol_message::Type::PeerDataOperationRequestResponseMessage as i32),
+                peer_data_operation_request_response_message: Some(
+                    e2e::PeerDataOperationRequestResponseMessage {
+                        stanza_id: Some("REQ1".into()),
+                        peer_data_operation_result: vec![PeerDataOperationResult {
+                            placeholder_message_resend_response: Some(PlaceholderMessageResendResponse {
+                                web_message_info_bytes: Some(wmi.encode_to_vec()),
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let plain = wrapper.encode_to_vec();
+        // The wrapper itself is protocol-only (never stored/emitted as a bubble).
+        assert!(matches!(
+            decode_e2e_message(&plain),
+            InboundContent::Typed { kind, .. } if kind == "protocol"
+        ));
+        let (req, items) = placeholder_resend_responses(&plain);
+        assert_eq!(req.as_deref(), Some("REQ1"));
+        assert_eq!(items.len(), 1);
+        for w in items {
+            restore_resent_message(&session, &store, &sid, None, w);
+        }
+
+        assert_eq!(store.message_type_get(&sid, chat, "MSG1").unwrap().as_deref(), Some("text"));
+        assert!(session.take_message_retry("MSG1").is_none(), "retry counter cleared");
+        match rx.try_recv().unwrap() {
+            SessionEvent::Message { id, chat: c, body, .. } => {
+                assert_eq!(id, "MSG1");
+                assert_eq!(c, chat);
+                assert_eq!(body["type"], "text");
+                assert_eq!(body["text"], "oi de novo");
+                assert_eq!(body["from_me"], false);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+        // Unrelated plaintext yields nothing.
+        let plain_text = e2e::Message { conversation: Some("x".into()), ..Default::default() }.encode_to_vec();
+        assert!(placeholder_resend_responses(&plain_text).1.is_empty());
+    }
+
+    #[test]
     fn inbound_call_offer_emits_event_and_reject_folds_to_terminate() {
         use crate::protocol::binary::{Attrs, Content, Node};
         let mgr = manager();
@@ -15429,6 +18611,85 @@ mod tests {
     }
 
     #[test]
+    fn inbound_offer_stashes_pending_call_and_terminate_clears_it() {
+        use crate::protocol::binary::{Attrs, Content, Node};
+        let mgr = manager();
+        let sid = mgr.create(None).unwrap().meta.read().id.clone();
+        let session = mgr.get(&sid).unwrap();
+        let keys = mgr.load_device_keys(&sid).unwrap();
+
+        let action = |tag: &str, children: Vec<Node>| {
+            let mut ca = Attrs::new();
+            ca.insert("call-id".into(), "CALLZ".into());
+            ca.insert("call-creator".into(), "111@lid".into());
+            let mut a = Attrs::new();
+            a.insert("from".into(), "111@lid".into());
+            a.insert("id".into(), "S1".into());
+            Node {
+                tag: "call".into(),
+                attrs: a,
+                content: Content::Nodes(vec![Node {
+                    tag: tag.into(),
+                    attrs: ca,
+                    content: Content::Nodes(children),
+                }]),
+            }
+        };
+        let audio = |rate: &str| {
+            let mut a = Attrs::new();
+            a.insert("enc".into(), "opus".into());
+            a.insert("rate".into(), rate.into());
+            Node { tag: "audio".into(), attrs: a, content: Content::None }
+        };
+        let enc = Node {
+            tag: "enc".into(),
+            attrs: {
+                let mut a = Attrs::new();
+                a.insert("type".into(), "pkmsg".into());
+                a.insert("v".into(), "2".into());
+                a
+            },
+            content: Content::Bytes(vec![0xDE, 0xAD]),
+        };
+
+        // A full offer stashes a pending call (raw — no decrypt happened).
+        process_inbound_node(
+            &session, &mgr.store, &keys, None,
+            &action("offer", vec![audio("16000"), enc]),
+        );
+        let pending = session.pending_calls_snapshot();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].call_id, "CALLZ");
+        assert_eq!(pending[0].audio_rates, vec![16000]);
+        assert_eq!(pending[0].enc.ciphertext, vec![0xDE, 0xAD]);
+        assert!(session.pending_call_get("CALLZ").is_some());
+
+        // Terminate clears it.
+        process_inbound_node(&session, &mgr.store, &keys, None, &action("terminate", vec![]));
+        assert!(session.pending_calls_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_call_terminate_fires_shutdown_once() {
+        let mgr = manager();
+        let sid = mgr.create(None).unwrap().meta.read().id.clone();
+        let session = mgr.get(&sid).unwrap();
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        // A task waiting on the call's shutdown.
+        let waiter = { let s = shutdown.clone(); tokio::spawn(async move { s.notified().await; }) };
+        tokio::task::yield_now().await; // let the waiter register
+
+        session.active_call_register("CALLX", shutdown.clone());
+        // First end fires the shutdown and reports we found a live call.
+        assert!(session.active_call_end("CALLX"));
+        // The waiter wakes.
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap();
+        // A second end (or an end for an unknown call) reports nothing to do.
+        assert!(!session.active_call_end("CALLX"));
+        assert!(!session.active_call_end("nope"));
+    }
+
+    #[test]
     fn call_reject_node_mirrors_whatsmeow_shape() {
         let n = build_call_reject_node(
             "MSGID1",
@@ -15466,6 +18727,9 @@ mod tests {
         let ord = std::sync::atomic::Ordering::Relaxed;
 
         session.set_status(SessionStatus::Connected);
+        // A connection loop is running, so the notify has a listener and the
+        // bounce is served in place (no driver restart).
+        session.set_socket_live(true);
         session.bump_message_retry("M1");
         session.bump_message_retry("M2");
         assert_eq!(session.message_retries.lock().len(), 2);
@@ -15773,6 +19037,120 @@ mod tests {
         // Logged out / unpaired → nothing to revive.
         assert!(!lease_wait_still_wanted(SessionStatus::LoggedOut, true));
         assert!(!lease_wait_still_wanted(SessionStatus::Disconnected, false));
+    }
+
+    #[test]
+    fn reconnect_bounces_only_when_a_socket_loop_is_listening() {
+        // Live status + a running select loop → the notify has a listener, so
+        // bounce in place.
+        for st in [
+            SessionStatus::Connected,
+            SessionStatus::Connecting,
+            SessionStatus::Syncing,
+            SessionStatus::AwaitingQr,
+        ] {
+            assert!(reconnect_can_bounce(st, true), "{st:?} + live socket");
+            // Same status with no loop running: the notify would be lost, so the
+            // driver has to be restarted instead.
+            assert!(!reconnect_can_bounce(st, false), "{st:?} + no socket");
+            assert!(status_is_live(st), "{st:?} should count as live");
+        }
+        // Offline statuses never bounce, however stale the socket flag is.
+        for st in [
+            SessionStatus::Disconnected,
+            SessionStatus::Blocked,
+            SessionStatus::LoggedOut,
+            SessionStatus::ProxyError,
+            SessionStatus::Pending,
+        ] {
+            assert!(!status_is_live(st), "{st:?} should not count as live");
+            assert!(!reconnect_can_bounce(st, true), "{st:?} + stale flag");
+            assert!(!reconnect_can_bounce(st, false), "{st:?}");
+        }
+    }
+
+    #[test]
+    fn socket_live_defaults_off_and_tracks_the_loop() {
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let mgr = SessionManager::new(store);
+        let session = mgr.create(None).unwrap();
+        // A session that has never connected has no listener.
+        assert!(!session.socket_live());
+        session.set_socket_live(true);
+        assert!(session.socket_live());
+        session.set_socket_live(false);
+        assert!(!session.socket_live());
+    }
+
+    #[tokio::test]
+    async fn abort_task_clears_the_driver_handle() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct AbortFlag(Arc<AtomicBool>);
+        impl Drop for AbortFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let mgr = SessionManager::new(store);
+        let session = mgr.create(None).unwrap();
+        let aborted = Arc::new(AtomicBool::new(false));
+        let g = AbortFlag(aborted.clone());
+        // A driver parked in an await nothing will ever complete — the shape of
+        // a connection wedged inside a dead proxy's CONNECT.
+        session.set_task_handle(tokio::spawn(async move {
+            let _g = g;
+            std::future::pending::<()>().await;
+        }));
+        session.abort_task();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(aborted.load(Ordering::SeqCst), "abort_task must kill the driver");
+        assert!(
+            session.take_task_handle().is_none(),
+            "abort_task must clear the handle slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_rescues_a_session_wedged_in_connecting() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct AbortFlag(Arc<AtomicBool>);
+        impl Drop for AbortFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        // A session pinned at `connecting` by a driver parked in an await no
+        // signal reaches — the shape a dead proxy used to produce. `reconnect`
+        // must kill that driver and stand up a new one instead of 202-ing on a
+        // notify nobody is listening for.
+        let mgr = std::sync::Arc::new(manager());
+        let sid = mgr.create(None).unwrap().meta.read().id.clone();
+        let session = mgr.get(&sid).unwrap();
+        // Point the driver at a closed local port so the fresh attempt fails
+        // instantly instead of dialling WhatsApp from the test suite.
+        session.meta.write().proxy_url = Some("http://127.0.0.1:1".into());
+        session.set_status(SessionStatus::Connecting);
+        session.set_socket_live(false);
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        let g = AbortFlag(aborted.clone());
+        session.set_task_handle(tokio::spawn(async move {
+            let _g = g;
+            std::future::pending::<()>().await;
+        }));
+
+        mgr.reconnect(&sid).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            aborted.load(Ordering::SeqCst),
+            "the wedged driver must be aborted, not left running"
+        );
+        assert!(
+            session.take_task_handle().is_some(),
+            "a fresh driver must be registered after the rescue"
+        );
     }
 
     #[test]
@@ -16413,6 +19791,71 @@ mod tests {
     ///
     /// Without (3) the WA server keeps the linked device in passive
     /// observer mode and never forwards inbound `<message>` nodes.
+    /// Paged offline-queue drain: `<ib><offline_preview>` → first
+    /// `<ib><offline_batch count=100>`; a full page of `offline` stanzas →
+    /// next page request; `<ib><offline>` → stop (no further requests).
+    /// Without the re-request a backlog >100 stanzas drained one page per
+    /// connection and nothing ever arrived live (prod 2026-09-01).
+    #[test]
+    fn offline_preview_starts_paged_drain_until_end_marker() {
+        use crate::protocol::binary::{Attrs, Content, Node};
+        use tokio::sync::mpsc;
+
+        let mgr = manager();
+        let session = mgr.create(None).unwrap();
+        let keys = mgr.load_device_keys(&session.meta.read().id).unwrap();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Node>();
+        let dispatcher = ConnDispatcher::new(out_tx);
+
+        let ib = |child: &str, attrs: Attrs| Node {
+            tag: "ib".into(),
+            attrs: Attrs::new(),
+            content: Content::Nodes(vec![Node {
+                tag: child.into(),
+                attrs,
+                content: Content::None,
+            }]),
+        };
+        let batch_count = |n: &Node| -> Option<String> {
+            assert_eq!(n.tag, "ib");
+            match &n.content {
+                Content::Nodes(ns) if ns.len() == 1 && ns[0].tag == "offline_batch" => {
+                    ns[0].attrs.get("count").cloned()
+                }
+                _ => panic!("expected <ib><offline_batch>, got {n:?}"),
+            }
+        };
+
+        let mut pv = Attrs::new();
+        pv.insert("count".into(), "12940".into());
+        pv.insert("message".into(), "3445".into());
+        let reply = process_inbound_node(&session, &mgr.store, &keys, Some(&dispatcher), &ib("offline_preview", pv));
+        assert!(reply.is_none());
+        let first = out_rx.try_recv().expect("first page requested on preview");
+        assert_eq!(batch_count(&first).as_deref(), Some("100"));
+        assert!(session.offline_drain_active());
+
+        // 99 offline stanzas: still the same page.
+        for _ in 0..(OFFLINE_PAGE_SIZE - 1) {
+            session.note_offline_stanza(&dispatcher);
+        }
+        assert!(out_rx.try_recv().is_err(), "no request before the page is full");
+        // The 100th completes the page → next page requested immediately.
+        session.note_offline_stanza(&dispatcher);
+        let second = out_rx.try_recv().expect("second page requested on page-full");
+        assert_eq!(batch_count(&second).as_deref(), Some("100"));
+
+        // End marker: queue empty → drain stops, later stanzas don't page.
+        let mut end = Attrs::new();
+        end.insert("count".into(), "140".into());
+        process_inbound_node(&session, &mgr.store, &keys, Some(&dispatcher), &ib("offline", end));
+        assert!(!session.offline_drain_active());
+        for _ in 0..(OFFLINE_PAGE_SIZE * 2) {
+            session.note_offline_stanza(&dispatcher);
+        }
+        assert!(out_rx.try_recv().is_err(), "no page requests after <ib><offline>");
+    }
+
     #[test]
     fn success_handler_ships_passive_prekeys_then_presence_available() {
         use crate::protocol::binary::{Content, Node};
@@ -16691,6 +20134,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn outbound_accept_waiter_delivers_answering_device_and_cancels() {
+        // The dial path registers a per-call waiter before shipping the offer;
+        // the inbound `<accept>` fires it with the answering device's jid.
+        let mgr = manager();
+        let session = mgr.create(None).unwrap();
+
+        let rx = session.outbound_accept_register("CALL1");
+        assert!(
+            session.outbound_accept_fire("CALL1", "999:3@lid"),
+            "fire finds the registered waiter"
+        );
+        assert_eq!(rx.await.unwrap(), "999:3@lid");
+        // A second fire (no waiter) is a no-op — harmless for inbound calls.
+        assert!(!session.outbound_accept_fire("CALL1", "x"));
+
+        // Cancel drops the waiter (peer declined before answering): the receiver
+        // then resolves to an error rather than hanging.
+        let rx2 = session.outbound_accept_register("CALL2");
+        session.outbound_accept_cancel("CALL2");
+        assert!(rx2.await.is_err());
+    }
+
     #[test]
     fn devices_notification_clears_device_cache() {
         // `<notification type="devices">` must drop cached device lists so the
@@ -16841,8 +20307,21 @@ mod tests {
         adv_secret: &[u8; 32],
         device_identity_pub: &[u8; 32],
     ) -> Vec<u8> {
+        build_pair_success_bundle_ex(adv_secret, device_identity_pub, false)
+    }
+
+    /// `coexistence=true` builds what a Cloud-API coexistence phone ships: the
+    /// inner identity says `device_type=HOSTED` and the account signature uses
+    /// the hosted prefix [6,5], while the outer HMAC container stays e2ee
+    /// (`account_type` unset, no HMAC prefix).
+    fn build_pair_success_bundle_ex(
+        adv_secret: &[u8; 32],
+        device_identity_pub: &[u8; 32],
+        coexistence: bool,
+    ) -> Vec<u8> {
         use crate::proto::wa_adv::{
-            AdvDeviceIdentity, AdvSignedDeviceIdentity, AdvSignedDeviceIdentityHmac,
+            AdvDeviceIdentity, AdvEncryptionType, AdvSignedDeviceIdentity,
+            AdvSignedDeviceIdentityHmac,
         };
         use hmac::{Hmac, Mac};
         use prost::Message;
@@ -16854,16 +20333,20 @@ mod tests {
             timestamp: Some(1700000000),
             key_index: Some(1),
             account_type: None,
-            device_type: None,
+            device_type: coexistence.then_some(AdvEncryptionType::Hosted as i32),
         };
         let signed_details = inner.encode_to_vec();
 
         // Fresh "account" keypair to play the role of the WA-account signer.
         let account = crate::crypto::identity::KeyPair::generate();
 
-        // account_sig = xeddsa_sign(account_priv, [6,0]||signed_details||device_identity_pub)
+        // account_sig = xeddsa_sign(account_priv, prefix||signed_details||device_identity_pub)
         let mut acct_msg = Vec::with_capacity(2 + signed_details.len() + 32);
-        acct_msg.extend_from_slice(&ADV_ACCOUNT_SIG_PREFIX);
+        acct_msg.extend_from_slice(if coexistence {
+            &ADV_HOSTED_ACCOUNT_SIG_PREFIX
+        } else {
+            &ADV_ACCOUNT_SIG_PREFIX
+        });
         acct_msg.extend_from_slice(&signed_details);
         acct_msg.extend_from_slice(device_identity_pub);
         let account_sig = crate::crypto::identity::xeddsa_sign(&account.private, &acct_msg);
@@ -16924,6 +20407,37 @@ mod tests {
             content: Content::Nodes(vec![device_id_node, biz, device, platform_node]),
         }]);
         iq
+    }
+
+    /// Cloud-API coexistence account (WhatsApp Business app number also on
+    /// the Cloud API): the phone signs the account signature with the HOSTED
+    /// prefix and flags it only in the inner `device_type`; the outer HMAC
+    /// container is still e2ee. Keying the prefix off the container rejected
+    /// these ("account signature verification failed") and the phone showed
+    /// "couldn't link device". whatsmeow keys it off `device_type`.
+    #[test]
+    fn pair_success_accepts_coexistence_hosted_account_signature() {
+        let mgr = manager();
+        let session = mgr.create(None).unwrap();
+        let id = session.meta.read().id.clone();
+        let keys = mgr.load_device_keys(&id).unwrap();
+
+        let bundle = build_pair_success_bundle_ex(&keys.adv_secret, &keys.identity.public, true);
+        let iq = pair_success_iq(&bundle, "Coex Biz", "5511999999999:4@s.whatsapp.net", "smba", "ps-coex");
+        let ack = process_inbound_node(&session, &mgr.store, &keys, None, &iq)
+            .expect("coexistence pair-success must be accepted");
+        assert_eq!(ack.attrs.get("type").map(String::as_str), Some("result"));
+        assert_eq!(session.meta.read().jid.as_deref(), Some("5511999999999:4@s.whatsapp.net"));
+
+        // A signature made with the WRONG key must still be rejected on both prefixes.
+        let session2 = mgr.create(None).unwrap();
+        let keys2 = mgr.load_device_keys(&session2.meta.read().id).unwrap();
+        let other = crate::crypto::identity::KeyPair::generate();
+        let bad = build_pair_success_bundle_ex(&keys2.adv_secret, &other.public, true);
+        let iq = pair_success_iq(&bad, "x", "5511999999999:5@s.whatsapp.net", "smba", "ps-bad");
+        let reply = process_inbound_node(&session2, &mgr.store, &keys2, None, &iq);
+        assert!(session2.meta.read().jid.is_none(), "forged/mismatched signature must not pair");
+        let _ = reply;
     }
 
     #[test]
@@ -17798,6 +21312,56 @@ mod tests {
             assert_eq!(msg_type_attr_for_inner(payload), "media");
             assert!(media_type_attr_for_inner(payload).is_some());
         }
+    }
+
+    /// A poll stanza carries `<meta polltype=…>` (creation or vote); nothing else
+    /// does. Without it the server acks the poll but never delivers it.
+    #[test]
+    fn poll_meta_node_marks_creation_and_vote() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use prost::Message as _;
+
+        let poll = build_poll_message("Q?", &["a".into(), "b".into()], 1, &[0u8; 32]);
+        assert_eq!(msg_type_attr_for_inner(&poll), "poll");
+        let meta = poll_meta_node(&poll).expect("poll creation gets a meta node");
+        assert_eq!(meta.tag, "meta");
+        assert_eq!(meta.attrs.get("polltype").map(String::as_str), Some("creation"));
+
+        let vote = e2e::Message {
+            poll_update_message: Some(e2e::PollUpdateMessage::default()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let meta = poll_meta_node(&vote).expect("poll vote gets a meta node");
+        assert_eq!(meta.attrs.get("polltype").map(String::as_str), Some("vote"));
+
+        let text = e2e::Message { conversation: Some("oi".into()), ..Default::default() }.encode_to_vec();
+        assert!(poll_meta_node(&text).is_none());
+    }
+
+    /// Quiz / end time / wire version land in the chosen field, and a poll in
+    /// any field still gets `type="poll"` + `<meta polltype>` and decodes.
+    #[test]
+    fn poll_extras_build_quiz_in_chosen_field() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use prost::Message as _;
+
+        let extras = PollExtras {
+            end_time: Some(1_800_000_000),
+            quiz_answer: Some("b".into()),
+            wire_version: PollWireVersion::V5,
+        };
+        let bytes = build_poll_message_ext("Q?", &["a".into(), "b".into()], 1, &[0u8; 32], &extras);
+        let m = e2e::Message::decode(bytes.as_slice()).unwrap();
+        assert!(m.poll_creation_message.is_none());
+        let p = m.poll_creation_message_v5.as_ref().expect("v5 field set");
+        assert_eq!(p.end_time, Some(1_800_000_000));
+        assert_eq!(p.poll_type, Some(e2e::PollType::Quiz as i32));
+        assert_eq!(p.correct_answer.as_ref().and_then(|o| o.option_name.as_deref()), Some("b"));
+
+        assert_eq!(msg_type_attr_for_inner(&bytes), "poll");
+        assert!(poll_meta_node(&bytes).is_some());
+        assert!(matches!(decode_e2e_message(&bytes), InboundContent::Poll { .. }));
     }
 
     /// whatsmeow stamps `mediatype` on the per-device `<enc>` of a 1:1 media
@@ -18768,11 +22332,23 @@ mod tests {
         }
 
         let poll = e2e::Message {
-            poll_creation_message: Some(Box::new(e2e::PollCreationMessage { name: Some("Lunch?".into()), ..Default::default() })),
+            poll_creation_message: Some(Box::new(e2e::PollCreationMessage {
+                name: Some("Lunch?".into()),
+                options: ["Pizza", "Sushi"]
+                    .iter()
+                    .map(|o| e2e::poll_creation_message::Option { option_name: Some((*o).into()), option_hash: None })
+                    .collect(),
+                selectable_options_count: Some(1),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         match decode_e2e_message(&poll.encode_to_vec()) {
-            InboundContent::Typed { kind, text } => { assert_eq!(kind, "poll"); assert_eq!(text.as_deref(), Some("Lunch?")); }
+            InboundContent::Poll { name, options, selectable_count } => {
+                assert_eq!(name.as_deref(), Some("Lunch?"));
+                assert_eq!(options, vec!["Pizza".to_string(), "Sushi".to_string()]);
+                assert_eq!(selectable_count, 1);
+            }
             _ => panic!("poll"),
         }
 
@@ -18780,9 +22356,10 @@ mod tests {
             location_message: Some(Box::new(e2e::LocationMessage { name: Some("Office".into()), ..Default::default() })),
             ..Default::default()
         };
-        assert!(matches!(decode_e2e_message(&loc.encode_to_vec()), InboundContent::Typed { kind, .. } if kind == "location"));
+        assert!(matches!(decode_e2e_message(&loc.encode_to_vec()), InboundContent::Location { name: Some(n), live: false, .. } if n == "Office"));
 
-        // A tapped button reply surfaces its display text as a normal text bubble.
+        // A tapped button reply surfaces its display text as chat text, tagged
+        // with its origin (see `inbound_reply_origin_*` tests for the payload).
         let reply = e2e::Message {
             template_button_reply_message: Some(Box::new(e2e::TemplateButtonReplyMessage {
                 selected_display_text: Some("Yes".into()), ..Default::default()
@@ -18790,9 +22367,122 @@ mod tests {
             ..Default::default()
         };
         match decode_e2e_message(&reply.encode_to_vec()) {
-            InboundContent::Text(t) => assert_eq!(t, "Yes"),
+            InboundContent::Reply { text, kind, id } => {
+                assert_eq!(text, "Yes");
+                assert_eq!(kind, ReplyKind::Template);
+                assert_eq!(id, None);
+            }
             _ => panic!("button reply"),
         }
+    }
+
+    /// A legacy quick-reply button tap (`buttonsResponseMessage`) is surfaced as
+    /// `type: "text"` (so consumers treat it as the customer speaking) plus a
+    /// `reply` object naming the control and the tapped button's id.
+    #[test]
+    fn inbound_reply_origin_button() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        let msg = e2e::Message {
+            buttons_response_message: Some(Box::new(e2e::ButtonsResponseMessage {
+                selected_button_id: Some("confirm_yes".into()),
+                response: Some(e2e::buttons_response_message::Response::SelectedDisplayText(
+                    "Sim, confirmo".into(),
+                )),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let (msg_type, body, payload) = e2e_content_columns(Some(&msg), "test");
+        assert_eq!(msg_type, "text");
+        assert_eq!(body.as_deref(), Some("Sim, confirmo"));
+        assert_eq!(payload["type"], "text");
+        assert_eq!(payload["text"], "Sim, confirmo");
+        assert_eq!(payload["reply"]["kind"], "button");
+        assert_eq!(payload["reply"]["id"], "confirm_yes");
+    }
+
+    /// A business template (HSM) button tap carries `kind: "template"` and the
+    /// button's `selectedID`; a tap without an id yields `id: null` rather than
+    /// dropping the `reply` object.
+    #[test]
+    fn inbound_reply_origin_template() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        let with_id = e2e::Message {
+            template_button_reply_message: Some(Box::new(e2e::TemplateButtonReplyMessage {
+                selected_id: Some("track_order".into()),
+                selected_display_text: Some("Track order".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let (msg_type, body, payload) = e2e_content_columns(Some(&with_id), "test");
+        assert_eq!(msg_type, "text");
+        assert_eq!(body.as_deref(), Some("Track order"));
+        assert_eq!(payload["type"], "text");
+        assert_eq!(payload["text"], "Track order");
+        assert_eq!(payload["reply"]["kind"], "template");
+        assert_eq!(payload["reply"]["id"], "track_order");
+
+        let without_id = e2e::Message {
+            template_button_reply_message: Some(Box::new(e2e::TemplateButtonReplyMessage {
+                selected_display_text: Some("Cancel".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let (_, _, payload) = e2e_content_columns(Some(&without_id), "test");
+        assert_eq!(payload["type"], "text");
+        assert_eq!(payload["reply"]["kind"], "template");
+        assert!(payload["reply"]["id"].is_null(), "missing id must serialize as null: {payload}");
+    }
+
+    /// A list row pick (`listResponseMessage`) carries `kind: "list"` and the
+    /// row id from `singleSelectReply`; `text` is the row title the user saw.
+    #[test]
+    fn inbound_reply_origin_list() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        let msg = e2e::Message {
+            list_response_message: Some(Box::new(e2e::ListResponseMessage {
+                title: Some("Corte + barba".into()),
+                single_select_reply: Some(e2e::list_response_message::SingleSelectReply {
+                    selected_row_id: Some("svc_cut_beard".into()),
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let (msg_type, body, payload) = e2e_content_columns(Some(&msg), "test");
+        assert_eq!(msg_type, "text");
+        assert_eq!(body.as_deref(), Some("Corte + barba"));
+        assert_eq!(payload["type"], "text");
+        assert_eq!(payload["text"], "Corte + barba");
+        assert_eq!(payload["reply"]["kind"], "list");
+        assert_eq!(payload["reply"]["id"], "svc_cut_beard");
+    }
+
+    /// Regression: ordinary typed text (`conversation` / `extendedTextMessage`)
+    /// must NOT grow a `reply` object — only interactive replies carry it.
+    #[test]
+    fn inbound_typed_text_has_no_reply_origin() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        let plain = e2e::Message { conversation: Some("Sim, confirmo".into()), ..Default::default() };
+        let (msg_type, body, payload) = e2e_content_columns(Some(&plain), "test");
+        assert_eq!(msg_type, "text");
+        assert_eq!(body.as_deref(), Some("Sim, confirmo"));
+        assert_eq!(payload["type"], "text");
+        assert_eq!(payload["text"], "Sim, confirmo");
+        assert!(payload.get("reply").is_none(), "typed text must not carry `reply`: {payload}");
+
+        let extended = e2e::Message {
+            extended_text_message: Some(Box::new(e2e::ExtendedTextMessage {
+                text: Some("hello".into()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let (_, _, payload) = e2e_content_columns(Some(&extended), "test");
+        assert_eq!(payload["type"], "text");
+        assert!(payload.get("reply").is_none(), "extended text must not carry `reply`: {payload}");
     }
 
     /// A business template message (HSM) surfaces its visible text (the
@@ -18992,10 +22682,126 @@ mod tests {
         assert!(quoted_context_from_e2e(&plain.encode_to_vec()).is_none());
     }
 
+    /// A message sent by tapping a Click-to-WhatsApp ad carries the ad's identity in
+    /// `contextInfo.externalAdReply`. It is the ONLY signal that tells two ads apart
+    /// when their prefilled text is identical (the case that motivated this: several
+    /// creatives pointing at one funnel), and it rides on the first message only —
+    /// so `ad_context_from_e2e` must surface it, including through the
+    /// `ephemeralMessage` wrapper a disappearing-messages chat adds.
+    #[test]
+    fn inbound_ad_tap_captures_ad_context() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use prost::Message as _;
+
+        let ad = e2e::context_info::ExternalAdReplyInfo {
+            title: Some("Harmonização facial".into()),
+            body: Some("Avaliação gratuita esta semana".into()),
+            source_type: Some("ad".into()),
+            source_id: Some("120210000000000001".into()),
+            source_url: Some("https://fb.me/ad/abc".into()),
+            source_app: Some("instagram".into()),
+            ctwa_clid: Some("CLID123".into()),
+            r#ref: Some("campanha-agosto".into()),
+            ..Default::default()
+        };
+        let from_ad = e2e::Message {
+            extended_text_message: Some(Box::new(e2e::ExtendedTextMessage {
+                text: Some("Quero saber mais".into()),
+                context_info: Some(Box::new(e2e::ContextInfo {
+                    external_ad_reply: Some(ad),
+                    entry_point_conversion_source: Some("ctwa_ad".into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let bytes = from_ad.encode_to_vec();
+
+        // The body still decodes as plain text (unchanged) ...
+        assert!(
+            matches!(decode_e2e_message(&bytes), InboundContent::Text(t) if t == "Quero saber mais")
+        );
+        // ... and the ad the tap came from is captured.
+        let a = ad_context_from_e2e(&bytes).expect("ad tap should yield an ad context");
+        assert_eq!(a.source_id.as_deref(), Some("120210000000000001"));
+        assert_eq!(a.ctwa_clid.as_deref(), Some("CLID123"));
+        assert_eq!(a.title.as_deref(), Some("Harmonização facial"));
+        assert_eq!(a.source_app.as_deref(), Some("instagram"));
+        assert_eq!(a.ad_ref.as_deref(), Some("campanha-agosto"));
+        assert_eq!(a.entry_point.as_deref(), Some("ctwa_ad"));
+
+        // Wrapped in a disappearing-messages envelope: same result.
+        let wrapped = e2e::Message {
+            ephemeral_message: Some(Box::new(e2e::FutureProofMessage {
+                message: Some(Box::new(from_ad.clone())),
+            })),
+            ..Default::default()
+        };
+        let w = ad_context_from_e2e(&wrapped.encode_to_vec()).expect("wrapped ad tap");
+        assert_eq!(w.source_id.as_deref(), Some("120210000000000001"));
+
+        // An ordinary message — and a reply, whose contextInfo carries a quote but
+        // no ad — yield nothing, so nobody is attributed to an ad they never saw.
+        let plain = e2e::Message {
+            conversation: Some("oi".into()),
+            ..Default::default()
+        };
+        assert!(ad_context_from_e2e(&plain.encode_to_vec()).is_none());
+        let reply = e2e::Message {
+            extended_text_message: Some(Box::new(e2e::ExtendedTextMessage {
+                text: Some("isso".into()),
+                context_info: Some(Box::new(e2e::ContextInfo {
+                    stanza_id: Some("ORIG".into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(ad_context_from_e2e(&reply.encode_to_vec()).is_none());
+    }
+
     /// Wrapper messages (ephemeral/disappearing, view-once, edited,
     /// device-sent) carry the real Message inside `.message`; the decoder must
     /// unwrap and classify the inner content, not return Other. Without this
     /// every message in a disappearing-messages chat shows as "unknown".
+    #[test]
+    fn decode_e2e_message_skdm_only_is_protocol_and_skdm_plus_text_is_text() {
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use prost::Message as _;
+
+        // A lone SenderKeyDistributionMessage (group-key handshake carried in a
+        // 1:1 `pkmsg` without an accompanying `skmsg`) is protocol-only: acked,
+        // never stored or surfaced as an "unknown" bubble.
+        let skdm_only = e2e::Message {
+            sender_key_distribution_message: Some(e2e::SenderKeyDistributionMessage {
+                group_id: Some("123@g.us".into()),
+                axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_e2e_message(&skdm_only.encode_to_vec()),
+            InboundContent::Typed { kind, .. } if kind == "protocol"
+        ));
+
+        // The same envelope carrying real content next to the SKDM (how phones
+        // deliver some group text/reactions) surfaces the content.
+        let skdm_plus_text = e2e::Message {
+            sender_key_distribution_message: Some(e2e::SenderKeyDistributionMessage {
+                group_id: Some("123@g.us".into()),
+                axolotl_sender_key_distribution_message: Some(vec![1, 2, 3]),
+            }),
+            conversation: Some("oi".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_e2e_message(&skdm_plus_text.encode_to_vec()),
+            InboundContent::Text(t) if t == "oi"
+        ));
+    }
+
     #[test]
     fn decode_e2e_message_unwraps_container_messages() {
         use crate::proto::wa_web_protobufs_e2e as e2e;
@@ -19240,6 +23046,121 @@ mod tests {
                 assert!(text.is_none());
             }
             _ => panic!("expected [edited] marker for an edit with no stored secret"),
+        }
+    }
+
+    /// A vote on our own poll unseals with the stored poll secret, resolves the
+    /// voted hashes to option names, and updates the poll row's tally; a later
+    /// empty vote withdraws it.
+    #[test]
+    fn poll_vote_decrypts_and_tallies() {
+        use crate::crypto::msg_secret;
+        use crate::proto::wa_web_protobufs_e2e as e2e;
+        use aes_gcm::aead::{Aead, Payload};
+        use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+        use prost::Message as _;
+        use sha2::{Digest, Sha256};
+
+        let store = Arc::new(Store::open(":memory:").unwrap());
+        let (sid, chat, poll_id) = ("s1", "5511888888888@s.whatsapp.net", "POLL-1");
+        let creator = "5511777777777@s.whatsapp.net";
+        let secret = [5u8; 32];
+        store
+            .create_session(
+                &crate::store::NewSession {
+                    id: sid,
+                    label: None,
+                    status: "pending",
+                    jid: None,
+                    registration_id: 1,
+                    noise_priv: &[1u8; 32],
+                    noise_pub: &[2u8; 32],
+                    identity_priv: &[3u8; 32],
+                    identity_pub: &[4u8; 32],
+                    spk_id: 1,
+                    spk_priv: &[5u8; 32],
+                    spk_pub: &[6u8; 32],
+                    spk_sig: &[0u8; 64],
+                    adv_secret: &[7u8; 32],
+                    api_key: "k",
+                    created_at: 1,
+                    updated_at: 1,
+                },
+                &[(1, &[9u8; 32], &[8u8; 32])],
+            )
+            .unwrap();
+        store.message_secret_put(sid, poll_id, chat, creator, &secret, 1).unwrap();
+        let payload = serde_json::json!({
+            "type": "poll", "text": "Dinner?",
+            "poll": {"name": "Dinner?", "options": ["Pizza", "Sushi"], "selectable_count": 1},
+        })
+        .to_string();
+        store
+            .message_insert(
+                &crate::store::NewMessage {
+                    session_id: sid,
+                    chat_jid: chat,
+                    message_id: poll_id,
+                    sender_jid: creator,
+                    from_me: true,
+                    timestamp: 1,
+                    msg_type: "poll",
+                    body_text: Some("Dinner?"),
+                    payload_json: &payload,
+                    status: None,
+                },
+                true,
+            )
+            .unwrap();
+
+        let voter = chat; // 1:1 — the peer votes
+        let seal = |choices: &[&str]| {
+            let vote = e2e::PollVoteMessage {
+                selected_options: choices.iter().map(|c| Sha256::digest(c.as_bytes()).to_vec()).collect(),
+            };
+            let key = msg_secret::derive_key(&secret, poll_id, creator, voter, msg_secret::USE_CASE_POLL_VOTE);
+            let aad = msg_secret::poll_vote_aad(poll_id, voter);
+            let iv = [1u8; 12];
+            let ct = Aes256Gcm::new_from_slice(&key)
+                .unwrap()
+                .encrypt(Nonce::from_slice(&iv), Payload { msg: &vote.encode_to_vec(), aad: &aad })
+                .unwrap();
+            e2e::PollUpdateMessage {
+                poll_creation_message_key: Some(crate::proto::wa_common::MessageKey {
+                    id: Some(poll_id.into()),
+                    from_me: Some(false),
+                    remote_jid: Some(creator.into()),
+                    ..Default::default()
+                }),
+                vote: Some(e2e::PollEncValue { enc_payload: Some(ct), enc_iv: Some(iv.to_vec()) }),
+                ..Default::default()
+            }
+        };
+        let chats = [chat.to_string()];
+
+        match decrypt_poll_vote(&store, sid, &seal(&["Sushi"]), "5511888888888:3@s.whatsapp.net", &chats) {
+            InboundContent::PollVote { poll_id: pid, selected } => {
+                assert_eq!(pid, poll_id);
+                assert_eq!(selected, Some(vec!["Sushi".to_string()]));
+            }
+            _ => panic!("expected a decrypted poll vote"),
+        }
+
+        let tally = |sel: &[serde_json::Value]| {
+            apply_poll_vote(&store, sid, chat, poll_id, voter, sel);
+            let (_, _, p) = store.message_media_lookup(sid, chat, poll_id).unwrap().unwrap();
+            serde_json::from_str::<serde_json::Value>(&p).unwrap()["poll_votes"].clone()
+        };
+        assert_eq!(tally(&[serde_json::json!("Sushi")]), serde_json::json!({ voter: ["Sushi"] }));
+        assert_eq!(tally(&[]), serde_json::json!({}));
+
+        // No stored secret → a marker vote, not a failure.
+        store.message_secret_put(sid, "OTHER", chat, creator, &[0u8; 32], 1).unwrap();
+        let mut other = seal(&["Pizza"]);
+        other.poll_creation_message_key.as_mut().unwrap().id = Some("MISSING".into());
+        match decrypt_poll_vote(&store, sid, &other, voter, &chats) {
+            InboundContent::PollVote { selected, .. } => assert!(selected.is_none()),
+            _ => panic!("expected an unread poll vote marker"),
         }
     }
 
@@ -20752,13 +24673,25 @@ mod tests {
     /// Obviously-fake Graph credentials for a cloud session.
     fn fake_cloud_creds() -> crate::cloud::CloudCreds {
         crate::cloud::CloudCreds {
+            provider: crate::cloud::CloudProvider::Meta,
             phone_number_id: "106540352242922".into(),
             waba_id: Some("102300000000000".into()),
             access_token: "EAAG-fake-access-token".into(),
+            api_key: None,
+            base_url: None,
             app_secret: Some("fake-app-secret".into()),
             verify_token: Some("my-verify".into()),
             graph_version: "v25.0".into(),
         }
+    }
+
+    fn seed_kapso_cloud_session() -> (SessionManager, String, String) {
+        let mgr = SessionManager::new(Arc::new(Store::open(":memory:").unwrap()));
+        let mut creds = fake_cloud_creds();
+        creds.provider = crate::cloud::CloudProvider::Kapso;
+        let session = mgr.create_cloud(None, creds).unwrap();
+        let sid = session.meta.read().id.clone();
+        (mgr, sid, "106540352242922".into())
     }
 
     /// Drain every event currently buffered on a broadcast receiver.
@@ -20850,6 +24783,105 @@ mod tests {
         let mut c = fake_cloud_creds();
         c.waba_id = Some("abc".into());
         assert!(matches!(mgr.create_cloud(None, c), Err(Error::BadRequest(_))));
+    }
+
+    // ---- kapso (Kapso Business Platform) sessions -------------------------
+
+    fn blank_kapso_req() -> KapsoCreateReq {
+        KapsoCreateReq {
+            connection_type: None,
+            country_isos: vec![],
+            language: None,
+            provision_phone_number: false,
+            success_redirect_url: None,
+            failure_redirect_url: None,
+            graph_version: None,
+        }
+    }
+
+    #[test]
+    fn session_status_pending_onboarding_round_trips() {
+        assert_eq!(SessionStatus::PendingOnboarding.as_str(), "pending_onboarding");
+        assert_eq!(
+            "pending_onboarding".to_string().parse_session_status(),
+            SessionStatus::PendingOnboarding
+        );
+        assert_eq!(
+            serde_json::to_value(SessionStatus::PendingOnboarding).unwrap(),
+            serde_json::json!("pending_onboarding")
+        );
+        // Boot normalization leaves it alone (unlike Connecting/Connected).
+        let row = crate::store::SessionRow {
+            id: "x".into(),
+            label: None,
+            status: "pending_onboarding".into(),
+            jid: None,
+            push_name: None,
+            created_at: 0,
+            updated_at: 0,
+            proxy_url: None,
+            mark_online: false,
+            kind: "cloud".into(),
+            cloud_phone_number_id: None,
+            cloud_waba_id: None,
+            cloud_graph_version: None,
+            cloud_provider: "kapso".into(),
+            cloud_internal_id: None,
+            cloud_customer_id: None,
+            cloud_base_url: None,
+            cloud_setup_ref: None,
+            cloud_setup_link: Some("https://app.kapso.ai/s/abc".into()),
+        };
+        let meta = SessionManager::meta_from_row(row);
+        assert_eq!(meta.status, SessionStatus::PendingOnboarding);
+        let c = meta.cloud.unwrap();
+        assert_eq!(c.provider, "kapso");
+        assert_eq!(c.onboarding_status.as_deref(), Some("pending"));
+        assert_eq!(c.setup_link.as_deref(), Some("https://app.kapso.ai/s/abc"));
+    }
+
+    #[test]
+    fn kapso_config_errs_when_unconfigured() {
+        // The test env does not set RUWA_KAPSO_API_KEY.
+        std::env::remove_var("RUWA_KAPSO_API_KEY");
+        assert!(matches!(kapso_config(), Err(Error::BadRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn create_kapso_errs_cleanly_when_unconfigured() {
+        std::env::remove_var("RUWA_KAPSO_API_KEY");
+        let mgr = manager();
+        let r = mgr.create_kapso(Some("x".into()), blank_kapso_req()).await;
+        assert!(matches!(r, Err(Error::BadRequest(_))));
+        // live-tested via api.rs
+    }
+
+    #[tokio::test]
+    async fn kapso_onboarding_complete_acks_unresolvable_event() {
+        let mgr = manager();
+        let ev = crate::cloud::KapsoProjectEvent {
+            event: "whatsapp.phone_number.created".into(),
+            phone_number_id: None,
+            customer_id: Some("no-such-customer".into()),
+            project_id: None,
+            business_account_id: None,
+            occurred_at: None,
+        };
+        // Resolves to no session → acks without touching kapso_config / network.
+        assert!(mgr.kapso_onboarding_complete(&ev).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn kapso_teardown_is_noop_for_non_kapso_sessions() {
+        std::env::remove_var("RUWA_KAPSO_API_KEY");
+        let mgr = manager();
+        // No such session → returns quietly.
+        mgr.kapso_teardown("no-such-session").await;
+        // A plain meta cloud session → provider != kapso, no network touched.
+        let s = mgr.create_cloud(Some("m".into()), fake_cloud_creds()).unwrap();
+        let sid = s.meta.read().id.clone();
+        mgr.kapso_teardown(&sid).await;
+        assert!(mgr.get(&sid).is_ok(), "teardown must not delete the session");
     }
 
     #[test]
@@ -20993,6 +25025,8 @@ mod tests {
                 error: None,
             }],
             errors: vec![],
+            window_expires_at: None,
+            outbound: vec![],
         };
         mgr.cloud_ingest(batch()).await.unwrap();
 
@@ -21053,6 +25087,7 @@ mod tests {
                 assert_eq!(body["text"], "hi there");
                 assert_eq!(body["push_name"], "Alice");
                 assert_eq!(body["from_me"], false);
+                assert_eq!(body["timestamp"], 1_700_000_100);
                 assert_eq!(body["quoted"]["stanza_id"], "wamid.HBgLOUT0001");
                 assert_eq!(body["wa_id"], "5511999999999");
                 assert!(body.get("media").is_none());
@@ -21126,6 +25161,8 @@ mod tests {
                 },
             ],
             errors: vec![],
+            window_expires_at: None,
+            outbound: vec![],
         })
         .await
         .unwrap();
@@ -21164,6 +25201,8 @@ mod tests {
                 },
             ],
             errors: vec![],
+            window_expires_at: None,
+            outbound: vec![],
         })
         .await
         .unwrap();
@@ -21182,10 +25221,103 @@ mod tests {
                 messages: vec![],
                 statuses: vec![],
                 errors: vec![],
+                window_expires_at: None,
+                outbound: vec![],
             })
             .await,
             Err(Error::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn cloud_ingest_outbound_echo_inserts_row_and_emits() {
+        use crate::cloud::{InboundKind, OutboundEcho, StatusUpdate, WebhookBatch};
+
+        let (mgr, sid, pnid) = seed_kapso_cloud_session();
+        let session = mgr.get(&sid).unwrap();
+        let mut rx = session.events.subscribe();
+        let batch = WebhookBatch {
+            phone_number_id: pnid,
+            outbound: vec![OutboundEcho {
+                wamid: "wamid.ECHO1".into(),
+                to: "5511981339622".into(),
+                timestamp: 1_730_000_000,
+                kind: InboundKind::Text { body: "oi".into() },
+                raw: serde_json::json!({"id": "wamid.ECHO1", "type": "text"}),
+            }],
+            statuses: vec![StatusUpdate {
+                wamid: "wamid.ECHO1".into(),
+                recipient: "5511981339622".into(),
+                status: "sent".into(),
+                timestamp: 1_730_000_000,
+                error: None,
+            }],
+            ..Default::default()
+        };
+        mgr.cloud_ingest(batch).await.unwrap();
+
+        let chat = crate::cloud::to_jid("5511981339622");
+        let rows = mgr.store.messages_list(&sid, Some(&chat), None, i64::MAX, 10).unwrap();
+        let row = rows.iter().find(|r| r.message_id == "wamid.ECHO1").unwrap();
+        assert!(row.from_me);
+        let status: String = mgr
+            .store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT status FROM messages WHERE session_id=? AND message_id=?",
+                    rusqlite::params![sid, "wamid.ECHO1"],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(status, "sent");
+
+        let evs = drain_events(&mut rx);
+        assert!(evs.iter().any(|e| matches!(e,
+            SessionEvent::Message { id, chat: c, body, .. }
+            if id == "wamid.ECHO1" && c == &chat && body.get("from_me") == Some(&serde_json::json!(true)))),
+            "{evs:?}");
+        assert!(evs.iter().any(|e| matches!(e,
+            SessionEvent::MessageSent { id, chat: c } if id == "wamid.ECHO1" && c == &chat)),
+            "{evs:?}");
+    }
+
+    #[tokio::test]
+    async fn cloud_ingest_outbound_echo_dedupes_ruwa_own_send() {
+        use crate::cloud::{InboundKind, OutboundEcho, WebhookBatch};
+
+        let (mgr, sid, pnid) = seed_kapso_cloud_session();
+        let chat = crate::cloud::to_jid("5511981339622");
+        mgr.cloud_record_outbound(
+            &sid,
+            &chat,
+            "wamid.MINE",
+            "self",
+            "text",
+            Some("hello"),
+            r#"{"type":"text","text":"hello"}"#,
+            1_730_000_000,
+        )
+        .unwrap();
+        let session = mgr.get(&sid).unwrap();
+        let mut rx = session.events.subscribe();
+        while rx.try_recv().is_ok() {}
+
+        mgr.cloud_ingest(WebhookBatch {
+            phone_number_id: pnid,
+            outbound: vec![OutboundEcho {
+                wamid: "wamid.MINE".into(),
+                to: "5511981339622".into(),
+                timestamp: 1_730_000_050,
+                kind: InboundKind::Text { body: "hello".into() },
+                raw: serde_json::json!({"id": "wamid.MINE", "type": "text"}),
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        assert!(drain_events(&mut rx).iter().all(|e| !matches!(e, SessionEvent::Message { .. })));
     }
 
     #[tokio::test]
@@ -21265,6 +25397,8 @@ mod tests {
             }],
             statuses: vec![],
             errors: vec![],
+            window_expires_at: None,
+            outbound: vec![],
         })
         .await
         .unwrap();
@@ -21339,6 +25473,8 @@ mod tests {
             }],
             statuses: vec![],
             errors: vec![],
+            window_expires_at: None,
+            outbound: vec![],
         })
         .await
         .unwrap();

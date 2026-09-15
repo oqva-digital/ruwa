@@ -11,6 +11,12 @@ export function cloudWebhookUrl(): string {
   return (getBase() || window.location.origin) + "/v1/cloud/webhook"
 }
 
+/** Where Kapso must POST inbound message webhooks for a kapso cloud session.
+ *  Shown for reference in the create panel and the connected panel. */
+export function kapsoWebhookUrl(): string {
+  return (getBase() || window.location.origin) + "/v1/cloud/kapso/webhook"
+}
+
 export interface CloudForm {
   phone_number_id: string
   waba_id: string
@@ -50,6 +56,52 @@ export function cloudFormToInput(c: CloudForm, forCreate: boolean): CloudCredsIn
   const put = (k: keyof CloudForm) => { const v = c[k].trim(); if (v) out[k] = v }
   ;(["phone_number_id", "waba_id", "access_token", "app_secret", "verify_token", "graph_version"] as const).forEach(put)
   if (forCreate && !out.graph_version) out.graph_version = GRAPH_VERSION_DEFAULT
+  return out
+}
+
+// ── Kapso provider (BSP onboarding via hosted setup link) ────────────────────
+
+export interface KapsoForm {
+  connection_type: "dedicated" | "coexistence"
+  /** Comma/space-separated ISO country codes in the form; split to an array on submit. */
+  country_isos: string
+  language: string
+  provision_phone_number: boolean
+  graph_version: string
+}
+export const EMPTY_KAPSO: KapsoForm = {
+  connection_type: "dedicated", country_isos: "", language: "", provision_phone_number: true,
+  graph_version: GRAPH_VERSION_DEFAULT,
+}
+
+export type KapsoFormErrors = Partial<Record<keyof KapsoForm, string>>
+
+/** Nothing is strictly required for a kapso session — the customer supplies the
+ *  number via the setup link. Country ISO codes that aren't 2 letters are warned
+ *  about (not blocked). */
+export function validateKapsoForm(k: KapsoForm): KapsoFormErrors {
+  const errs: KapsoFormErrors = {}
+  const bad = splitIsos(k.country_isos).filter((c) => !/^[A-Za-z]{2}$/.test(c))
+  if (bad.length) errs.country_isos = `Not 2-letter ISO codes: ${bad.join(", ")}`
+  if (k.graph_version && !/^v\d+\.\d+$/.test(k.graph_version)) errs.graph_version = "Format: v25.0"
+  return errs
+}
+
+/** Split the country-ISO free-text field into a clean uppercase array. */
+export function splitIsos(s: string): string[] {
+  return s.split(/[\s,]+/).map((c) => c.trim().toUpperCase()).filter(Boolean)
+}
+
+/** KapsoForm → the wire `cloud` object (always tagged `provider: "kapso"`). */
+export function kapsoFormToInput(k: KapsoForm): CloudCredsInput {
+  const out: CloudCredsInput = { provider: "kapso" }
+  out.connection_type = k.connection_type
+  const isos = splitIsos(k.country_isos)
+  if (isos.length) out.country_isos = isos
+  if (k.language.trim()) out.language = k.language.trim()
+  out.provision_phone_number = k.provision_phone_number
+  const gv = k.graph_version.trim()
+  if (gv) out.graph_version = gv
   return out
 }
 

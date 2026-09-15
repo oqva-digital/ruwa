@@ -4,6 +4,7 @@ import type {
   AiSettings,
   AiSettingsInput,
   AiTestResult,
+  CallInfo,
   CloudCredsInput,
   ImproveTextInput,
   ImproveTextResult,
@@ -143,6 +144,9 @@ export const api = {
   /** Replace Cloud API credentials/metadata (only provided fields change). 501 on web sessions. */
   updateCloud: (id: string, cloud: CloudCredsInput) =>
     req<SessionMeta>("PUT", `/v1/sessions/${id}/cloud`, cloud),
+  /** Regenerate the Kapso onboarding setup link (kapso sessions still pending only). */
+  regenKapsoSetupLink: (id: string) =>
+    req<{ setup_link: string }>("POST", `/v1/sessions/${id}/cloud/setup-link`),
   deleteSession: (id: string) =>
     req<void>("DELETE", `/v1/sessions/${id}?force=1`),
   /** Migrate a paired Baileys/Evolution session (no QR) from its `creds` blob. */
@@ -264,7 +268,7 @@ export const api = {
     req<{ id: string }>("POST", `/v1/sessions/${id}/messages/location`, { to, ...body }),
   sendContact: (id: string, to: string, body: { display_name: string; phone?: string; vcard?: string }) =>
     req<{ id: string }>("POST", `/v1/sessions/${id}/messages/contact`, { to, ...body }),
-  sendPoll: (id: string, to: string, body: { name: string; options: string[]; selectable_count?: number }) =>
+  sendPoll: (id: string, to: string, body: { name: string; options: string[]; selectable_count?: number; end_time?: number; quiz_answer?: string }) =>
     req<{ id: string }>("POST", `/v1/sessions/${id}/messages/poll`, { to, ...body }),
   sendEvent: (id: string, to: string, body: { name: string; description?: string; location?: string; start_time: number; end_time?: number }) =>
     req<{ id: string }>("POST", `/v1/sessions/${id}/messages/event`, { to, ...body }),
@@ -294,6 +298,19 @@ export const api = {
     req<unknown>("POST", `/v1/sessions/${id}/contacts/${encodeURIComponent(jid)}/block`),
   unblockContact: (id: string, jid: string) =>
     req<unknown>("POST", `/v1/sessions/${id}/contacts/${encodeURIComponent(jid)}/unblock`),
+
+  // ── calls (web sessions only) ──
+  listCalls: (id: string) => req<CallInfo[]>("GET", `/v1/sessions/${id}/calls`),
+  rejectCall: (id: string, callId: string, peer: string) =>
+    req<unknown>("POST", `/v1/sessions/${id}/calls/${encodeURIComponent(callId)}/reject`, { peer }),
+  /** WS URL for the call audio bridge. Browsers can't set WS headers, so the
+   * bearer rides as `?token=` (the endpoint accepts either). */
+  callAudioUrl: (id: string, callId: string) =>
+    `${getBase().replace(/^http/, "ws")}/v1/sessions/${id}/calls/${encodeURIComponent(callId)}/audio?token=${encodeURIComponent(getToken())}`,
+  /** WS URL that PLACES an outbound call to `peer` and bridges its audio. The
+   * `start` control frame arrives only once the peer answers. */
+  dialAudioUrl: (id: string, peer: string) =>
+    `${getBase().replace(/^http/, "ws")}/v1/sessions/${id}/calls/dial?peer=${encodeURIComponent(peer)}&token=${encodeURIComponent(getToken())}`,
 
   // ── profile ──
   setProfile: (id: string, body: { name?: string; status?: string; picture?: string }) =>

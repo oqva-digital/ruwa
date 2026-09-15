@@ -17,6 +17,7 @@ export function statusMeta(status: SessionStatus | string): StatusMeta {
     case "connected": return { st: "ok", label: "connected", icon: "wifi" }
     case "connecting": return { st: "progress", label: "connecting", icon: "refresh" }
     case "pending": return { st: "progress", label: "pending", icon: "clock" }
+    case "pending_onboarding": return { st: "progress", label: "onboarding", icon: "clock" }
     case "awaiting_qr": return { st: "progress", label: "awaiting qr", icon: "qr" }
     case "syncing": return { st: "progress", label: "syncing", icon: "refresh" }
     case "disconnected": return { st: "down", label: "disconnected", icon: "wifiOff" }
@@ -42,10 +43,17 @@ export function liveness(status: SessionStatus | string, lastRxSec: number | nul
   if (kind === "cloud" && status === "connected") return { kind: "live", label: "cloud · ready", cls: "chip-live" }
   if (status === "disconnected" || status === "logged_out" || status === "proxy_error" || status === "blocked")
     return { kind: "down", label: "down", cls: "chip-down" }
-  if (status === "connecting" || status === "pending" || status === "awaiting_qr" || status === "syncing")
+  if (
+    status === "connecting" || status === "pending" || status === "pending_onboarding" ||
+    status === "awaiting_qr" || status === "syncing"
+  )
     return {
       kind: "progress",
-      label: status === "awaiting_qr" ? "awaiting qr" : status === "syncing" ? "syncing" : "connecting",
+      label:
+        status === "awaiting_qr" ? "awaiting qr"
+          : status === "syncing" ? "syncing"
+            : status === "pending_onboarding" ? "onboarding"
+              : "connecting",
       cls: "chip-progress",
     }
   const frozen = lastRxSec != null && lastRxSec >= FROZEN_AFTER_SEC
