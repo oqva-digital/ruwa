@@ -324,6 +324,20 @@ pub mod binary {
     /// unchanged (the existing message/receipt paths rely on that).
     fn write_attr_value(v: &str, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
         if let Some((left, server)) = v.rsplit_once('@') {
+            // Bare server JID (`@s.whatsapp.net`, the string form our decoder
+            // gives a JID_PAIR with an empty user — e.g. the `from` of server
+            // notifications). whatsmeow's writeJID emits JID_PAIR + LIST_EMPTY
+            // + server. As a literal string the server can't match it: the
+            // `<ack class="notification" to="@s.whatsapp.net">` we sent was
+            // ignored and every such notification was re-queued and replayed
+            // on each reconnect (prod 2026-09-02: 3,452 `type=business`
+            // notifications re-announced in every `<offline_preview>`).
+            if left.is_empty() && KNOWN_JID_SERVERS.contains(&server) {
+                buf.push(JID_PAIR);
+                buf.push(LIST_EMPTY);
+                write_string(server, buf)?;
+                return Ok(());
+            }
             if !left.is_empty() && !left.contains('@') {
                 // Bare `user@server` (no agent/device) → JID_PAIR.
                 if KNOWN_JID_SERVERS.contains(&server) && !left.contains([':', '.']) {
@@ -332,24 +346,30 @@ pub mod binary {
                     write_string(server, buf)?;
                     return Ok(());
                 }
-                // `user[.agent][:device]@{s.whatsapp.net|lid}` → AD_JID. The server
-                // maps to an agent byte (0=s.whatsapp.net, 1=lid); the inverse of
-                // `format_ad_jid`. Device JIDs MUST be AD_JID-encoded or the prekey
-                // (`<key><user jid=…:N…>`) and per-device message routing silently fail.
+                // `user[.agent][:device]@{s.whatsapp.net|lid|hosted}` → AD_JID. The
+                // server maps to an agent byte (0=s.whatsapp.net, 1=lid); `hosted`
+                // (Cloud-API coexistence devices) always carries its raw agent in
+                // the string (`user.129:99@hosted`, see `format_ad_jid`), and
+                // whatsmeow's writeJID ALWAYS AD_JID-encodes hosted JIDs. Device
+                // JIDs MUST be AD_JID-encoded or the prekey (`<key><user jid=…:N…>`),
+                // per-device message routing, and the `<ack>`/`<receipt>` for a
+                // hosted sender silently fail (prod: receipts from `…:99@hosted`
+                // re-queued and replayed on every reconnect).
+                let (head, device) = match left.rsplit_once(':') {
+                    Some((h, d)) => (h, d.parse::<u8>().ok()),
+                    None => (left, Some(0u8)),
+                };
+                let (user, dot_agent) = match head.split_once('.') {
+                    Some((u, a)) => (u, a.parse::<u8>().ok()),
+                    None => (head, None),
+                };
                 let server_agent = match server {
                     "s.whatsapp.net" => Some(0u8),
                     "lid" => Some(1u8),
+                    "hosted" | "hosted.lid" => dot_agent,
                     _ => None,
                 };
                 if let Some(server_agent) = server_agent {
-                    let (head, device) = match left.rsplit_once(':') {
-                        Some((h, d)) => (h, d.parse::<u8>().ok()),
-                        None => (left, Some(0u8)),
-                    };
-                    let (user, dot_agent) = match head.split_once('.') {
-                        Some((u, a)) => (u, a.parse::<u8>().ok()),
-                        None => (head, None),
-                    };
                     if let Some(device) = device {
                         let agent = dot_agent.unwrap_or(server_agent);
                         if !user.is_empty() && (device > 0 || agent > 0) {
@@ -806,6 +826,36 @@ pub mod binary {
             n.attrs.insert("type".into(), "text".into());
             n.attrs.insert("id".into(), "ABC123".into()); // hex-packable
             n.attrs.insert("phone".into(), "5511999999999".into()); // nibble-packable
+            assert_eq!(roundtrip(&n), n);
+        }
+
+        /// A bare server JID (`@s.whatsapp.net`) must go out as JID_PAIR with
+        /// an empty (LIST_EMPTY) user — whatsmeow's writeJID — not as a literal
+        /// string, or the server ignores our `<ack to="@s.whatsapp.net">` for
+        /// its notifications and replays them on every reconnect.
+        #[test]
+        fn bare_server_jid_encodes_as_jid_pair_with_empty_user() {
+            let mut n = Node::new("ack");
+            n.attrs.insert("to".into(), "@s.whatsapp.net".into());
+            let bytes = encode(&n).unwrap();
+            let pos = bytes.iter().position(|&b| b == JID_PAIR).expect("JID_PAIR emitted");
+            assert_eq!(bytes[pos + 1], LIST_EMPTY, "empty user → LIST_EMPTY");
+            assert!(
+                !bytes.windows(15).any(|w| w == b"@s.whatsapp.net"),
+                "must not be encoded as a literal string"
+            );
+            assert_eq!(roundtrip(&n), n);
+        }
+
+        /// Hosted (Cloud-API coexistence) device JIDs carry their raw agent in
+        /// the string form and must be AD_JID-encoded like whatsmeow does.
+        #[test]
+        fn hosted_device_jid_encodes_as_ad_jid() {
+            let mut n = Node::new("ack");
+            n.attrs.insert("to".into(), "117807329112200.129:99@hosted".into());
+            let bytes = encode(&n).unwrap();
+            let pos = bytes.iter().position(|&b| b == AD_JID).expect("AD_JID emitted");
+            assert_eq!(&bytes[pos + 1..pos + 3], &[129u8, 99u8], "agent, device");
             assert_eq!(roundtrip(&n), n);
         }
 
@@ -1973,10 +2023,29 @@ pub mod connection {
         Ok(tcp)
     }
 
+    /// Hard deadline for bringing the transport up (TCP → proxy tunnel → TLS →
+    /// WS handshake). Every stage below awaits a socket the peer may simply
+    /// never answer on — a proxy that accepts the TCP connection and then goes
+    /// silent leaves the `CONNECT` read parked forever — and none of them carry
+    /// a deadline of their own. The session's own watchdogs can't cover the gap
+    /// either: the Noise timeout starts after this returns, and the rx-idle
+    /// watchdog only arms once the socket is live. Without this bound a single
+    /// dead proxy pins the reconnect driver in `Connecting` until the process
+    /// restarts.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Open the WS to `wss://web.whatsapp.com/ws/chat`. When `proxy` is set, the
     /// whole connection (TCP → tunnel → TLS → WS) egresses through it; otherwise
     /// a direct TCP+TLS connection. Returns the same `Ws` type either way.
+    /// Bounded by [`CONNECT_TIMEOUT`]; a hung peer surfaces as a timeout the
+    /// caller can retry rather than an await that never returns.
     pub async fn connect_wa(proxy: Option<&Proxy>) -> Result<Ws, HandshakeError> {
+        tokio::time::timeout(CONNECT_TIMEOUT, connect_wa_inner(proxy))
+            .await
+            .map_err(|_| HandshakeError::Timeout("transport connect"))?
+    }
+
+    async fn connect_wa_inner(proxy: Option<&Proxy>) -> Result<Ws, HandshakeError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         const WA_HOST: &str = "web.whatsapp.com";
         const WA_PORT: u16 = 443;
@@ -2176,6 +2245,29 @@ pub mod connection {
             let p = Proxy::parse("http://10.0.0.1:8080/").unwrap();
             assert_eq!(p.scheme, ProxyScheme::Http);
             assert_eq!(p.port, 8080);
+        }
+
+        /// A proxy that accepts the TCP connection and then never answers the
+        /// `CONNECT` is the exact shape that used to park a reconnect driver in
+        /// `Connecting` forever. The transport deadline must turn it into an
+        /// ordinary retryable error.
+        #[tokio::test(start_paused = true)]
+        async fn connect_wa_gives_up_on_a_silent_proxy() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            // Accept and then sit on the socket: no CONNECT response, ever.
+            let _accept = tokio::spawn(async move {
+                let (sock, _) = listener.accept().await.unwrap();
+                std::future::pending::<()>().await;
+                drop(sock);
+            });
+            let proxy = Proxy::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+            // `Ws` isn't Debug, so match rather than unwrap_err.
+            match connect_wa(Some(&proxy)).await {
+                Err(HandshakeError::Timeout("transport connect")) => {}
+                Err(other) => panic!("expected a transport-connect timeout, got: {other}"),
+                Ok(_) => panic!("a silent proxy must not yield a connected socket"),
+            }
         }
 
         #[test]

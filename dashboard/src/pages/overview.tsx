@@ -55,7 +55,7 @@ export function OverviewPage({
           <div className="mb-1 flex items-center gap-2.5">
             <h1 className="text-xl font-semibold tracking-tight">{inst.label || "(no label)"}</h1>
             <StatusBadge status={inst.status} />
-            {cloud && <KindBadge kind="cloud" />}
+            {cloud && <KindBadge kind="cloud" provider={inst.cloud?.provider} />}
             {lv.kind === "frozen" && <LivenessChip status={inst.status} lastRxSec={lastRxSec} />}
           </div>
           <div className="mono text-[11px] text-muted-foreground">

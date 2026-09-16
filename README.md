@@ -30,7 +30,7 @@ WhatsApp accounts at once.
 | Multi-tenant | **built-in** — N accounts, per-tenant API keys | yes | do-it-yourself |
 | Dependencies | **in-house** crypto + protocol + Redis/S3 clients | Baileys + full Node stack | Go / TS library |
 | Interface | REST + SSE + webhooks + Redis | REST + webhooks | library calls |
-| **Agent tools (MCP)** | **built-in — 39 tools** | none | none |
+| **Agent tools (MCP)** | **built-in — 47 tools** | none | none |
 | Store | **SQLite or Postgres** | Postgres + Redis | your choice |
 
 **What's different:** ruwa is the lightest WhatsApp server we know of and the fastest
@@ -116,8 +116,11 @@ caveats.
   event-filtered), and **Redis** queues (RPUSH / PUBLISH) — pick one or all.
 - **Media storage** — keep blobs in the DB (default) or offload to **S3 / R2 / MinIO**
   via the in-house SigV4 client.
-- **Number & profile** — onWhatsApp check, profile-picture fetch, block/unblock,
-  set your own name / status / picture, typing & presence, read receipts.
+- **Number & profile** — onWhatsApp check, profile-picture fetch
+  (`GET /v1/sessions/:id/contacts/:jid/picture?preview=true` → `{jid, url}`,
+  `url: null` when hidden or unset, 400 on a malformed jid, 504 if WhatsApp
+  stays silent for 5 s), block/unblock, set your own name / status / picture,
+  typing & presence, read receipts.
 - **Resilience** — automatic reconnect with backoff, a 25 s keepalive, and a
   **zombie-socket watchdog** that force-reconnects a silently half-open connection —
   the failure mode that quietly kills naive clients behind residential proxies.
@@ -125,13 +128,18 @@ caveats.
   rest**, cross-instance **leasing** for multi-replica deployments.
 - **Ops** — `/health`, Prometheus `/metrics`, and a built-in dashboard (ruwa Console)
   served at `GET /`.
-- **Console** — record and send **voice notes (Ogg/Opus)**, **attach files**
-  (image / video / audio / document), and an optional **AI text assistant** that
-  rewrites a draft (improve, formal, casual, shorter, grammar, translate, custom) —
-  bring your own Anthropic or OpenAI-compatible key. See
-  [AI text assistant](#ai-text-assistant).
+- **Voice calls (1:1 audio)** — place and answer WhatsApp voice calls over a
+  **WebSocket that speaks raw 16 kHz PCM**: ruwa does the signaling + SRTP media
+  plane, your side is a browser (the Console has a click-to-call/answer page) or
+  any voice-agent stack (OpenAI Realtime, Deepgram, Pipecat, …). Web sessions
+  only. See [Voice calls](#voice-calls) / [`docs/CALLS.md`](docs/CALLS.md).
+- **Console** — click-to-call/answer **voice calls**, record and send **voice
+  notes (Ogg/Opus)**, **attach files** (image / video / audio / document), and an
+  optional **AI text assistant** that rewrites a draft (improve, formal, casual,
+  shorter, grammar, translate, custom) — bring your own Anthropic or
+  OpenAI-compatible key. See [AI text assistant](#ai-text-assistant).
 - **Agent-ready (MCP)** — a first-party **Model Context Protocol** server (`mcp/`)
-  exposing 39 tools so any MCP client (Claude, etc.) can create instances, pair them,
+  exposing 47 tools so any MCP client (Claude, etc.) can create instances, pair them,
   send every message type, manage chats, and **search history by meaning** — no other
   WhatsApp stack ships this.
 
@@ -141,7 +149,7 @@ ruwa ships a first-party **Model Context Protocol** server (`mcp/ruwa-mcp`) so a
 agent can drive WhatsApp directly — no REST glue. As far as we know, no other WhatsApp
 stack (Evolution, whatsmeow, Baileys) offers this out of the box.
 
-**39 tools** cover the full lifecycle — _create an instance → pair it (QR or phone
+**47 tools** cover the full lifecycle — _create an instance → pair it (QR or phone
 code) → hold a conversation → wire up webhooks_: `create_session`, `get_qr`,
 `pair_phone`, `connect_session`,
 `send_text` (with @mentions / quote), `send_media` / `location` / `poll` / `reaction`,
@@ -245,9 +253,16 @@ curl -H "Authorization: Bearer $RUWA_API_TOKEN" \
 | `RUWA_LEASING` | unset | `1` enables cross-instance session leasing |
 | `RUWA_MODERN_LID_SEND` | unset | `1` enables the modern LID 1:1 stanza (`addressing_mode`/`phash`/`peer_recipient_pn`). Off by default — some servers reject it (error 479) for migrated peers; the default legacy stanza delivers |
 | `RUWA_PROXY_DOWNLOADS` | on | `0` routes media + history-sync **downloads** direct (off the session's egress proxy) to save metered proxy bandwidth; the WebSocket and uploads always stay on the proxy |
+| `RUWA_QR_MAX_REFRESHES` | 8 | QR-window refreshes an **unpaired** session may burn per connect (each ≈20–40s) before it parks `disconnected`; caps the proxy cost of an abandoned QR. `POST /connect` reopens the window |
+| `RUWA_BODY_LIMIT_MB` | 20 | Max HTTP request body on `/v1/*` (multipart media upload, base64 sends). The Cloud webhook keeps its own 4 MB cap |
+| `RUWA_HEAVY_INGEST_CONCURRENCY` | 1 | How many heavy ingests (history-sync blobs, app-state snapshots) may run at once process-wide. Each inflates + decodes hundreds of MB; serializing them bounds peak RSS when several accounts pair or resync together |
 | `RUWA_SKIP_REDUNDANT_HISTORY` | on | `0` disables the reconnect gate that skips re-downloading heavy history-sync chunks (BOOTSTRAP/FULL/RECENT) the phone re-pushes on reconnect |
 | `RUWA_CLOUD_VERIFY_TOKEN` | unset | Verify token Meta sends on the webhook subscription handshake (`GET /v1/cloud/webhook`). Unset → any cloud session's own `verify_token` is accepted |
 | `RUWA_CLOUD_ALLOW_UNSIGNED` | unset | `1` accepts Meta webhooks for cloud sessions created **without** an `app_secret` (no `X-Hub-Signature-256` check). Off by default — unsigned deliveries are rejected 401 |
+| `RUWA_KAPSO_API_KEY` | unset | Kapso Business Platform API key — authenticates every Kapso call. Required for `cloud.provider = "kapso"` sessions |
+| `RUWA_PUBLIC_BASE_URL` | unset | This ruwa's public HTTPS origin. Required for kapso — used to build the webhook URLs registered with Kapso |
+| `RUWA_KAPSO_BASE_URL` | `https://api.kapso.ai` | Kapso API base URL (the `/meta/whatsapp` and `/platform/v1` paths derive from it) |
+| `RUWA_KAPSO_PROJECT_WEBHOOK_SECRET` | unset | Shared secret Kapso signs the project webhook with (`X-Webhook-Signature`). Unset → project-webhook signature not enforced |
 | `RUST_LOG` | `info` | Tracing filter |
 
 Full list (S3, leasing, retention, WA version override) in [`.env.example`](.env.example).
@@ -356,6 +371,75 @@ components array, used verbatim when present) and `reply_to` are accepted on
 Inbound messages, template button taps (`type: "button"`) and interactive replies
 (`type: "interactive"`) arrive as normal `message` events; delivery receipts arrive
 as `message_sent` / `message_delivered` / `message_read` / `message_failed`.
+Every `message` event body carries `timestamp` — the message's **original send
+time** (unix secs, from the stanza), not the delivery time. Offline drains and
+history replays deliver hours-old messages in a burst; use `timestamp` (not the
+envelope `ts`, which is emission time) to tell a fresh message from a replayed one.
+
+**Contact presence (`web` sessions).** A contact's typing indicator and
+availability arrive as a `presence` event — ephemeral (never stored), 1:1 chats
+only, emitted straight off the wire:
+
+```json
+{"session":"<id>","event":"presence","data":{"jid":"5511999998888@s.whatsapp.net","state":"composing"},"ts":1700000000}
+```
+
+`state` is `composing` | `paused` (chat state) or `available` | `unavailable`
+(presence). `jid` is the contact in PN form (LID senders are resolved through
+the session's LID↔PN map; an unmapped LID is passed through as `…@lid`).
+Consecutive `composing` from the same contact within 3 s are collapsed. Group
+chat states and our own devices are not surfaced.
+
+**Location (`web` sessions).** A dropped pin (`locationMessage`) and the first
+frame of a live-location share (`liveLocationMessage`) both arrive as a
+`location` message with the coordinates next to the human label:
+
+```json
+{"type":"location","text":"Praça da Sé","location":{"latitude":-23.55052,"longitude":-46.633308,"name":"Praça da Sé","address":"Sé, São Paulo","live":false}}
+```
+
+`text` is `name`, else `address`, else `"lat,lng"`. A live share has `live: true`
+and the caption as `name`; later position updates are not surfaced.
+
+**Polls and votes (`web` sessions).** A poll arrives with its options, and each
+vote is unsealed and resolved to the option names:
+
+```json
+{"type":"poll","text":"Dinner?","poll":{"name":"Dinner?","options":["Pizza","Sushi"],"selectable_count":1}}
+{"type":"poll_vote","text":"Sushi","poll_vote":{"poll_id":"3EB0…","selected_options":["Sushi"]}}
+```
+
+When sending, `end_time` (unix seconds) closes voting on the phones at that
+time, and `quiz_answer` (one of `options`, single-choice) turns the poll into a
+quiz with that correct answer. WhatsApp controls vote changes: voters can always
+change or withdraw a regular poll vote; enforcing "first vote counts" is up to
+your consumer (e.g. edit/revoke the poll after the first answer).
+
+A vote carries the voter's whole current selection (it replaces their previous
+one; `[]` means they withdrew it). Votes can only be read for polls this session
+saw being created — sent through the API or received while connected —
+otherwise `selected_options` is `null`. `GET …/messages` also returns the
+running tally on the poll row as `poll.votes` (voter JID → option names).
+
+**Interactive replies (`web` sessions).** When the other side taps a button,
+a template (HSM) button, or picks a row from a list, the event is still
+`type: "text"` — `text` is the label they saw, and consumers treat it as the
+customer speaking — plus a `reply` object that marks its origin:
+
+```json
+{"type":"text","text":"Sim, confirmo","reply":{"kind":"button","id":"confirm_yes"},"enc_type":"msg"}
+```
+
+| `reply.kind` | Source message | `reply.id` |
+|---|---|---|
+| `button` | `buttonsResponseMessage` (quick-reply button) | `selectedButtonID` |
+| `template` | `templateButtonReplyMessage` (business template button) | `selectedID` |
+| `list` | `listResponseMessage` (list row) | `singleSelectReply.selectedRowID` |
+
+`reply.id` is `null` when the sender set none. Plain typed text never carries
+`reply`; `messages.msg_type` stays `"text"` either way, so history readers are
+unaffected. Reactions, edits/revokes, media and `cloud` sessions are not
+affected (Cloud API interactive replies keep their `type: "interactive"` shape).
 
 **Capability matrix**
 
@@ -389,6 +473,99 @@ in the sandbox allow-list) → `400`; `130429`, `131056`, `80007` (rate limits) 
 anything else → `500` with the Graph code + message. Failed sends return the error
 and persist **no** row; asynchronous failures come back as `message_failed`
 events (`reason: "<code>: <title>"`).
+
+### Kapso Business Platform provider
+
+A `kind=cloud` session can run on a second provider, **`kapso`**, where ruwa acts
+as a **BSP on top of the [Kapso Business Platform](https://kapso.ai)** instead of
+holding per-session Meta credentials. The operator generates a hosted **setup
+link**, sends it to their customer, the customer completes Meta embedded-signup on
+Kapso, and a Kapso **project-webhook** tells ruwa the number is live. Everything
+downstream — the `/v1/*` routes, the message/contact/chat tables, the events — is
+**identical to the Meta cloud provider**; the capability matrix above applies
+unchanged.
+
+**Server config** (all server-wide, not per session):
+
+| Env | Required | Purpose |
+|---|---|---|
+| `RUWA_KAPSO_API_KEY` | yes | Kapso platform API key — authenticates every Kapso call |
+| `RUWA_PUBLIC_BASE_URL` | yes | This ruwa's public HTTPS origin — used to build the webhook URLs registered with Kapso |
+| `RUWA_KAPSO_BASE_URL` | no (default `https://api.kapso.ai`) | Kapso API base URL |
+| `RUWA_KAPSO_PROJECT_WEBHOOK_SECRET` | no | Signs the project webhook (`X-Webhook-Signature`) |
+
+**Create**
+
+```sh
+curl -H "Authorization: Bearer $RUWA_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"label":"acme-support","kind":"cloud",
+       "cloud":{"provider":"kapso","connection_type":"dedicated","country_isos":["BR"]}}' \
+  http://127.0.0.1:8080/v1/sessions
+# → 201 {"id":"<id>","kind":"cloud","status":"pending_onboarding",
+#        "cloud":{"provider":"kapso","phone_number_id":"","onboarding_status":"pending",
+#                 "setup_link":"https://app.kapso.ai/setup/…"}}
+```
+
+**Onboarding flow**
+
+- Send `cloud.setup_link` to the customer (regenerate it any time it expires with
+  `POST /v1/sessions/:id/cloud/setup-link` -> `200 {"setup_link":"…"}`).
+- The customer completes Meta embedded-signup on Kapso's hosted page.
+- Kapso posts `whatsapp.phone_number.created` to
+  `POST /v1/cloud/kapso/project-webhook`; ruwa records the `phone_number_id`,
+  registers the message webhook, validates the number, and flips the session
+  `pending_onboarding` → `connected` (emitting `paired` + `connected`).
+
+**Webhook URLs Kapso must reach** (both under this ruwa's public origin, no bearer):
+
+- `POST /v1/cloud/kapso/webhook` — inbound messages + delivery receipts, signed
+  `X-Webhook-Signature` per number.
+- `POST /v1/cloud/kapso/project-webhook` — connection lifecycle
+  (`whatsapp.phone_number.created`, …).
+
+Sends, templates, interactive messages and inbound handling are the same as the
+Meta provider — ruwa routes Kapso's meta-compatible proxy transparently.
+
+`DELETE /v1/sessions/:id` on a kapso session also offboards the number and
+deletes the Kapso customer ruwa created for it (best-effort — a failure is
+logged, not fatal). Pass `?keep_remote=1` to delete only the local session and
+leave the Kapso resources in place.
+
+**Broadcasts** (bulk-template campaigns) are exposed **for kapso sessions only**
+under `/v1/sessions/:id/broadcasts` — a thin proxy over the Kapso Platform
+Broadcasts API, no local state. Workflow: `POST …/broadcasts` `{name,
+template_id}` (draft) → `POST …/broadcasts/:bid/recipients` with up to 1000
+`{phone_number, components:[…]}` objects (Meta component syntax, verbatim) →
+`POST …/broadcasts/:bid/send` (or `…/schedule` `{scheduled_at}`). Track by
+polling `GET …/broadcasts/:bid` (counts) and `GET …/broadcasts/:bid/recipients`
+(per-recipient status); `…/stop` halts a running send, `…/cancel` unschedules.
+`template_id` is the Meta id returned by `GET`/`POST /v1/sessions/:id/templates`.
+A web or `meta` cloud session gets `501` on every broadcasts route.
+
+## Voice calls
+
+ruwa handles WhatsApp **1:1 audio calls** as *infrastructure* — the signaling
+and the SRTP media plane — and hands you the audio over a **WebSocket that
+speaks raw 16 kHz mono PCM** (20 ms / 640-byte frames). What sits on the other
+end is yours: the built-in **Console** has a click-to-call / answer page (mic +
+speaker in the browser), or point any voice-agent stack (OpenAI Realtime,
+Deepgram, Pipecat, a TTS/STT pipeline) at the socket. **Web sessions only.**
+
+```sh
+# Place a call (WebSocket): ws(s)://…/v1/sessions/<id>/calls/dial?peer=<digits>&token=<API_TOKEN>
+# Answer a ringing call:    ws(s)://…/v1/sessions/<id>/calls/<call_id>/audio?token=<API_TOKEN>
+# List ringing calls:
+curl -H "Authorization: Bearer $RUWA_API_TOKEN" http://127.0.0.1:8080/v1/sessions/<id>/calls
+# Decline:
+curl -X POST -H "Authorization: Bearer $RUWA_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"peer":"5511999999999@s.whatsapp.net"}' \
+  http://127.0.0.1:8080/v1/sessions/<id>/calls/<call_id>/reject
+```
+
+Inbound calls raise a `call_offer` event (SSE/webhook) and end with
+`call_terminate`. Opening the audio WebSocket **is** how you answer/dial; closing
+it hangs up. Full contract (frame format, the `start` control frame, a Node.js
+client example, limits) → **[`docs/CALLS.md`](docs/CALLS.md)**.
 
 ## AI text assistant
 

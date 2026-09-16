@@ -99,7 +99,26 @@ async fn track_http_metrics(
 }
 
 /// Max accepted `POST /v1/cloud/webhook` body (Meta caps deliveries at 3 MB).
+/// Only for the direct Meta webhook — Kapso's webhook (`/v1/cloud/kapso/webhook`)
+/// uses `body_limit()` instead, since Kapso batches up to 100 messages per
+/// delivery (`max_buffer_size`) with no documented byte cap of its own, and a
+/// batch of media/location-bearing messages routinely exceeds Meta's own limit.
 const CLOUD_WEBHOOK_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Max accepted request body on every other `/v1/*` route. axum's default is
+/// 2 MB, which silently 413s the multipart media upload and base64 sends for
+/// anything bigger than a small photo. Overridable via `RUWA_BODY_LIMIT_MB`.
+const DEFAULT_BODY_LIMIT_MB: usize = 20;
+
+fn body_limit() -> usize {
+    std::env::var("RUWA_BODY_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .unwrap_or(DEFAULT_BODY_LIMIT_MB)
+        * 1024
+        * 1024
+}
 
 pub fn router(state: AppState) -> Router {
     // Stamp process start once (this is built once per process) so
@@ -130,6 +149,9 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/:id/logout", post(logout_session))
         .route("/sessions/:id/proxy", get(get_session_proxy).post(set_session_proxy))
         .route("/sessions/:id/proxy/check", post(check_session_proxy))
+        .route("/sessions/:id/calls", get(list_calls))
+        .route("/sessions/:id/calls/dial", get(dial_call_audio_ws))
+        .route("/sessions/:id/calls/:call_id/audio", get(call_audio_ws))
         .route("/sessions/:id/calls/:call_id/reject", post(reject_call))
         .route("/sessions/:id/cloud", put(set_session_cloud))
         .route("/sessions/:id/label", post(set_session_label))
@@ -153,6 +175,27 @@ pub fn router(state: AppState) -> Router {
             "/sessions/:id/templates/:name",
             axum::routing::delete(delete_template),
         )
+        .route(
+            "/sessions/:id/broadcasts",
+            get(list_broadcasts_h).post(create_broadcast_h),
+        )
+        .route("/sessions/:id/broadcasts/:bid", get(get_broadcast_h))
+        .route(
+            "/sessions/:id/broadcasts/:bid/recipients",
+            get(list_broadcast_recipients_h)
+                .post(add_broadcast_recipients_h)
+                .delete(clear_broadcast_recipients_h),
+        )
+        .route("/sessions/:id/broadcasts/:bid/send", post(send_broadcast_h))
+        .route(
+            "/sessions/:id/broadcasts/:bid/schedule",
+            post(schedule_broadcast_h),
+        )
+        .route(
+            "/sessions/:id/broadcasts/:bid/cancel",
+            post(cancel_broadcast_h),
+        )
+        .route("/sessions/:id/broadcasts/:bid/stop", post(stop_broadcast_h))
         // Meta webhook: no bearer auth (Meta can't send one) — the POST is
         // authenticated by `X-Hub-Signature-256` over the raw body instead, and
         // the GET by the verify token. Exempt from the readonly gate (inbound
@@ -164,6 +207,22 @@ pub fn router(state: AppState) -> Router {
             get(cloud_webhook_verify)
                 .post(cloud_webhook_receive)
                 .layer(axum::extract::DefaultBodyLimit::max(CLOUD_WEBHOOK_BODY_LIMIT)),
+        )
+        // Kapso webhooks: same "no bearer auth" treatment as `/cloud/webhook`
+        // (the handlers don't call `check_auth`; the POSTs are signature-verified).
+        .route(
+            "/cloud/kapso/webhook",
+            get(cloud_kapso_webhook_verify)
+                .post(cloud_kapso_webhook_receive)
+                .layer(axum::extract::DefaultBodyLimit::max(body_limit())),
+        )
+        .route(
+            "/cloud/kapso/project-webhook",
+            get(cloud_kapso_webhook_verify).post(cloud_kapso_project_webhook_receive),
+        )
+        .route(
+            "/sessions/:id/cloud/setup-link",
+            post(regen_kapso_setup_link),
         )
         .route(
             "/sessions/:id/messages/media/multipart",
@@ -240,6 +299,7 @@ pub fn router(state: AppState) -> Router {
 
     router
         .with_state(state)
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit()))
         .layer(axum::middleware::from_fn(track_http_metrics))
 }
 
@@ -415,6 +475,9 @@ struct ConfirmQuery {
     /// crypto so the next pairing is a brand-new device (recovers a session
     /// WhatsApp/peers have stopped trusting). Default re-pairs the same identity.
     fresh: Option<String>,
+    /// Delete only, `provider=kapso`: `?keep_remote=1` deletes the local session
+    /// but leaves the Kapso number + customer in place (default offboards them).
+    keep_remote: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -462,12 +525,17 @@ struct CreateSessionReq {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CloudCredsReq {
-    /// Graph node id of the business phone number (required).
+    /// Upstream: `"meta"` (default — Graph direct, needs the creds below) or
+    /// `"kapso"` (onboarded through the Kapso Business Platform; the fields
+    /// below are the hosted-signup options instead).
+    #[serde(default)]
+    provider: Option<String>,
+    /// Graph node id of the business phone number (required for `meta`).
     phone_number_id: Option<String>,
     /// WhatsApp Business Account id — needed for template management.
     #[serde(default)]
     waba_id: Option<String>,
-    /// System-user / business access token (required).
+    /// System-user / business access token (required for `meta`).
     access_token: Option<String>,
     /// Meta app secret: signs inbound webhooks. Optional but strongly
     /// recommended (without it webhooks need `RUWA_CLOUD_ALLOW_UNSIGNED=1`).
@@ -479,6 +547,25 @@ struct CloudCredsReq {
     /// Graph API version (default `v25.0`).
     #[serde(default)]
     graph_version: Option<String>,
+    // ---- kapso (`provider = "kapso"`) hosted-signup options ----
+    /// `"coexistence"` | `"dedicated"`.
+    #[serde(default)]
+    connection_type: Option<String>,
+    /// ISO-3166-1 alpha-2 codes offered in the hosted signup.
+    #[serde(default)]
+    country_isos: Option<Vec<String>>,
+    /// Hosted-signup UI language.
+    #[serde(default)]
+    language: Option<String>,
+    /// Ask Kapso to provision a fresh phone number for the customer.
+    #[serde(default)]
+    provision_phone_number: bool,
+    /// Redirect target after a successful hosted signup.
+    #[serde(default)]
+    success_redirect_url: Option<String>,
+    /// Redirect target after a failed hosted signup.
+    #[serde(default)]
+    failure_redirect_url: Option<String>,
 }
 
 /// Non-empty trimmed string, or `None` (blank/absent collapse together).
@@ -695,26 +782,63 @@ async fn create_session(
         SessionKind::Cloud => {
             let c = req.cloud.ok_or_else(|| {
                 Error::BadRequest(
-                    "kind \"cloud\" requires a \"cloud\" object with phone_number_id + access_token"
+                    "kind \"cloud\" requires a \"cloud\" object (provider \"meta\" needs \
+                     phone_number_id + access_token; provider \"kapso\" needs neither)"
                         .into(),
                 )
             })?;
-            let phone_number_id = non_blank(c.phone_number_id)
-                .ok_or_else(|| Error::BadRequest("cloud.phone_number_id is required".into()))?;
-            let access_token = non_blank(c.access_token)
-                .ok_or_else(|| Error::BadRequest("cloud.access_token is required".into()))?;
-            state.manager.create_cloud(
-                req.label,
-                cloud::CloudCreds {
-                    phone_number_id,
-                    waba_id: non_blank(c.waba_id),
-                    access_token,
-                    app_secret: non_blank(c.app_secret),
-                    verify_token: non_blank(c.verify_token),
-                    graph_version: non_blank(c.graph_version)
-                        .unwrap_or_else(|| cloud::DEFAULT_GRAPH_VERSION.to_string()),
-                },
-            )?
+            let provider = c
+                .provider
+                .as_deref()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "meta".to_string());
+            match provider.as_str() {
+                "kapso" => {
+                    state
+                        .manager
+                        .create_kapso(
+                            req.label,
+                            crate::session::KapsoCreateReq {
+                                connection_type: non_blank(c.connection_type),
+                                country_isos: c.country_isos.unwrap_or_default(),
+                                language: non_blank(c.language),
+                                provision_phone_number: c.provision_phone_number,
+                                success_redirect_url: non_blank(c.success_redirect_url),
+                                failure_redirect_url: non_blank(c.failure_redirect_url),
+                                graph_version: non_blank(c.graph_version),
+                            },
+                        )
+                        .await?
+                }
+                "meta" => {
+                    let phone_number_id = non_blank(c.phone_number_id).ok_or_else(|| {
+                        Error::BadRequest("cloud.phone_number_id is required".into())
+                    })?;
+                    let access_token = non_blank(c.access_token).ok_or_else(|| {
+                        Error::BadRequest("cloud.access_token is required".into())
+                    })?;
+                    state.manager.create_cloud(
+                        req.label,
+                        cloud::CloudCreds {
+                            provider: cloud::CloudProvider::Meta,
+                            phone_number_id,
+                            waba_id: non_blank(c.waba_id),
+                            access_token,
+                            api_key: None,
+                            base_url: None,
+                            app_secret: non_blank(c.app_secret),
+                            verify_token: non_blank(c.verify_token),
+                            graph_version: non_blank(c.graph_version)
+                                .unwrap_or_else(|| cloud::DEFAULT_GRAPH_VERSION.to_string()),
+                        },
+                    )?
+                }
+                other => {
+                    return Err(Error::BadRequest(format!(
+                        "unknown cloud provider {other:?}: expected \"meta\" or \"kapso\""
+                    )))
+                }
+            }
         }
     };
     let id = session.meta.read().id.clone();
@@ -783,6 +907,12 @@ async fn delete_session(
 ) -> Result<StatusCode> {
     check_session_auth_write(&headers, &state, &id)?;
     require_confirmation("deleting a session", &q, &body)?;
+    let keep_remote = matches!(q.keep_remote.as_deref(), Some("1") | Some("true") | Some("yes"));
+    if !keep_remote {
+        // Best-effort: offboard the number + drop the customer on Kapso. No-op
+        // for non-Kapso sessions. Must run before the local rows are deleted.
+        state.manager.kapso_teardown(&id).await;
+    }
     state.manager.delete(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -810,6 +940,398 @@ async fn set_session_proxy(
     state.manager.set_proxy(&id, req.proxy)?;
     let meta = state.manager.get(&id)?.meta.read().clone();
     Ok(Json(SessionResp::new(meta)))
+}
+
+/// Answer an incoming call and bridge its audio over a WebSocket. On upgrade:
+/// decrypt the callKey, derive the SRTP keys, ship `<preaccept>`+`<accept>`,
+/// connect the relay transport, and run the media loop bridged to this socket.
+/// Binary WS frames are 20 ms of s16le PCM (640 B); ruwa aggregates 3 → one
+/// 60 ms WA frame and slices inbound frames back to 20 ms. Auth via bearer
+/// header or `?token=` (browsers can't set WS headers). See SPEC "Calls".
+async fn call_audio_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, call_id)): Path<(String, String)>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Result<axum::response::Response> {
+    // Bearer via header, or ?token= for browser WS clients.
+    if check_session_auth(&headers, &state, &id).is_err() {
+        let tok = q.get("token").map(String::as_str).unwrap_or("");
+        if tok != state.api_token.as_str() {
+            return Err(Error::Unauthorized);
+        }
+    }
+    let session = state.manager.get(&id)?;
+    require_web(&session, "calls are not supported on cloud sessions")?;
+    let offer = session
+        .pending_call_get(&call_id)
+        .ok_or_else(|| Error::NotFound(format!("no ringing call {call_id}")))?;
+    let keys = state
+        .manager
+        .load_device_keys(&id)
+        .map_err(|e| Error::Internal(anyhow::anyhow!(e)))?;
+    Ok(ws.on_upgrade(move |socket| async move {
+        if let Err(e) = run_call_audio_bridge(state, id, call_id, offer, keys, socket).await {
+            tracing::warn!(error = %e, "call audio bridge ended with error");
+        }
+    }))
+}
+
+/// The post-upgrade orchestration: decrypt → derive keys → answer stanzas →
+/// connect relay → run the media loop, bridging PCM to/from the WebSocket.
+async fn run_call_audio_bridge(
+    state: AppState,
+    id: String,
+    call_id: String,
+    offer: crate::call::ParsedOffer,
+    keys: crate::crypto::identity::DeviceKeys,
+    socket: axum::extract::ws::WebSocket,
+) -> anyhow::Result<()> {
+    use anyhow::anyhow;
+
+    let session = state.manager.get(&id)?;
+    let store = state.manager.store.clone();
+
+    // Our own device LID (selects our SRTP participant id); the peer is the caller.
+    let own_lid = {
+        let meta = session.meta.read();
+        meta.jid.as_ref().and_then(|jid| {
+            let user = jid.split(':').next().unwrap_or(jid).split('@').next().unwrap_or(jid);
+            let device = jid.split(':').nth(1).and_then(|s| s.split('@').next()).unwrap_or("0");
+            store.pn_to_lid(&id, user).ok().flatten().map(|lu| format!("{lu}:{device}@lid"))
+        })
+    }
+    .ok_or_else(|| anyhow!("session has no LID (not paired?)"))?;
+    let peer_lid = offer.call_creator.clone();
+
+    // Decrypt the callKey (consumes a prekey — only now, at answer time).
+    let call_key = crate::session::decrypt_call_key(
+        &store, &id, &keys, &peer_lid, &offer.enc.enc_type, offer.enc.version, &offer.enc.ciphertext,
+    )
+    .ok_or_else(|| anyhow!("could not decrypt callKey"))?;
+
+    // SRTP keys: send from our LID, recv from the peer's; audio SSRC is slot 0.
+    let own_pid = crate::call::format_participant_id(&own_lid);
+    let peer_pid = crate::call::format_participant_id(&peer_lid);
+    let send_keys = crate::call::derive_e2e_keys(&call_key, &own_pid)
+        .ok_or_else(|| anyhow!("derive send keys"))?;
+    let recv_keys = crate::call::derive_e2e_keys(&call_key, &peer_pid)
+        .ok_or_else(|| anyhow!("derive recv keys"))?;
+    let send_ssrc = crate::call::derive_wasm_participant_ssrc(&call_id, &own_pid, 0);
+
+    // Relay endpoint + STUN material.
+    let relay = offer.relay.as_ref().ok_or_else(|| anyhow!("offer carried no <relay>"))?;
+    let ep = crate::call::get_media_relay_endpoint(relay).ok_or_else(|| anyhow!("no relay endpoint"))?;
+    let (relay_ip, relay_port) =
+        crate::call::get_primary_ipv4_address(ep).ok_or_else(|| anyhow!("relay has no IPv4"))?;
+    let token = relay
+        .relay_tokens
+        .get(ep.token_id as usize)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow!("relay token {} missing", ep.token_id))?
+        .clone();
+    let integrity_key = relay
+        .relay_key_ascii
+        .clone()
+        .ok_or_else(|| anyhow!("relay <key> missing"))?;
+
+    // Ship the answer stanzas (stop sibling ringing, then accept).
+    let to = offer.from.clone();
+    let rates: Vec<&str> = offer.audio_rates.iter().map(|_| "16000").take(1).collect();
+    let rates = if rates.is_empty() { vec!["16000"] } else { rates };
+    session.enqueue_send(crate::session::SendOp::RawNode(crate::call::build_preaccept(
+        &call_id, &to, &peer_lid, &generate_message_id(), &rates,
+    )))?;
+    session.enqueue_send(crate::session::SendOp::RawNode(crate::call::build_accept(
+        &call_id, &to, &peer_lid, &generate_message_id(), &rates,
+    )))?;
+
+    // Connect + allocate the relay transport.
+    let transport = crate::call::RelayTransport::connect_and_allocate(
+        &relay_ip, relay_port, &token, &integrity_key, &call_id, &own_pid,
+    )
+    .await?;
+
+    session.pending_call_remove(&call_id);
+    if offer.mlow {
+        tracing::info!(call_id = %call_id, "answer: peer offered MLow — using MLow codec");
+    }
+    bridge_media_over_ws(
+        &session, &call_id, &offer.from, &peer_lid, transport, send_keys, send_ssrc, recv_keys,
+        offer.mlow, socket,
+    )
+    .await
+}
+
+/// Run the media loop and bridge its 60 ms PCM frames to/from the WebSocket as
+/// 20 ms s16le frames. Shared by the answer (`run_call_audio_bridge`) and dial
+/// (`run_dial_audio_bridge`) paths — the only difference between them is how the
+/// transport + SRTP keys are obtained (offer decrypt vs. our own callKey). On
+/// exit, if WE ended the call, ship a `<terminate reason=hangup>`.
+#[allow(clippy::too_many_arguments)]
+async fn bridge_media_over_ws(
+    session: &Arc<crate::session::Session>,
+    call_id: &str,
+    peer_from: &str,
+    peer_lid: &str,
+    transport: crate::call::RelayTransport,
+    send_keys: crate::call::E2eSrtpKeys,
+    send_ssrc: u32,
+    recv_keys: crate::call::E2eSrtpKeys,
+    mlow: bool,
+    socket: axum::extract::ws::WebSocket,
+) -> anyhow::Result<()> {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+
+    // Media loop ⇄ WS bridge channels (60 ms PCM frames). The agent→WA buffer is
+    // deliberately shallow (8 × 60 ms = 480 ms max): if the browser mic outpaces
+    // the 60 ms send tick (clock drift on a long call), a deep buffer would grow
+    // unbounded latency, so we drop-newest past the cap rather than accumulate
+    // seconds of lag. WA→agent stays roomier (the browser worklet drops its own
+    // backlog past ~600 ms).
+    let (to_wa_tx, to_wa_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(8);
+    let (from_wa_tx, mut from_wa_rx) = tokio::sync::mpsc::channel::<Vec<i16>>(64);
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    let media = crate::call::MediaLoop {
+        transport,
+        send_keys,
+        send_ssrc,
+        recv_keys,
+        from_agent: to_wa_rx,
+        to_agent: from_wa_tx,
+        shutdown: shutdown.clone(),
+        mlow,
+    };
+    let media_task = tokio::spawn(media.run());
+    // Register so an inbound peer <terminate> tears down this live media loop.
+    session.active_call_register(call_id, shutdown.clone());
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let _ = ws_tx
+        .send(Message::Text(serde_json::json!({
+            "event": "start", "call_id": call_id, "from": peer_from,
+            "audio": {"encoding": "pcm_s16le", "rate": 16000, "channels": 1, "frame_ms": 20},
+            "codec": "opus"
+        }).to_string()))
+        .await;
+
+    // Inbound (WA → agent): 60 ms PCM → three 20 ms (640 B) binary frames.
+    let ws_out = tokio::spawn(async move {
+        while let Some(frame) = from_wa_rx.recv().await {
+            for chunk in frame.chunks(320) {
+                let mut bytes = Vec::with_capacity(chunk.len() * 2);
+                for &s in chunk {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                if ws_tx.send(Message::Binary(bytes)).await.is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = ws_tx.send(Message::Close(None)).await;
+    });
+
+    // Outbound (agent → WA): accumulate 20 ms binary frames into 60 ms (960-sample)
+    // frames. Also break when the call ends from the peer side (shutdown fired by
+    // the inbound <terminate> handler) — the notified future is created once, up
+    // front, so a fire between iterations isn't missed.
+    let mut acc: Vec<i16> = Vec::with_capacity(960);
+    let ended = shutdown.notified();
+    tokio::pin!(ended);
+    loop {
+        tokio::select! {
+            _ = &mut ended => break,
+            msg = ws_rx.next() => match msg {
+                Some(Ok(Message::Binary(b))) => {
+                    if b.len() % 2 != 0 {
+                        continue;
+                    }
+                    for pair in b.as_chunks::<2>().0 {
+                        acc.push(i16::from_le_bytes(*pair));
+                    }
+                    while acc.len() >= 960 {
+                        let frame: Vec<i16> = acc.drain(..960).collect();
+                        // Non-blocking: drop-newest when the shallow buffer is full
+                        // (bounds latency); only stop when the media loop is gone.
+                        match to_wa_tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    }
+
+    // Teardown. `active_call_end` removes the call and notifies the media loop,
+    // returning true iff WE are ending it (the peer's <terminate> handler would
+    // have already removed it → false). Only then do we tell WA we hung up.
+    if session.active_call_end(call_id) {
+        let node = crate::call::build_terminate(
+            &generate_message_id(), peer_from, peer_lid, call_id, Some("hangup"),
+        );
+        let _ = session.enqueue_send(crate::session::SendOp::RawNode(node));
+    }
+    ws_out.abort();
+    let _ = media_task.await;
+    Ok(())
+}
+
+/// WS upgrade for an OUTBOUND (dial) call: `GET …/calls/dial?peer=<number>`.
+/// On upgrade: place the call (offer + relay), connect the transport, wait for
+/// the peer to answer, derive the recv keys for the answering device, and bridge
+/// audio. Auth via bearer header or `?token=` (browser WS).
+///
+/// LIVE-UNVERIFIED: exercises the outbound `place_call` path end-to-end but has
+/// not been validated against a live WhatsApp peer.
+async fn dial_call_audio_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Result<axum::response::Response> {
+    if check_session_auth(&headers, &state, &id).is_err() {
+        let tok = q.get("token").map(String::as_str).unwrap_or("");
+        if tok != state.api_token.as_str() {
+            return Err(Error::Unauthorized);
+        }
+    }
+    let peer = q
+        .get("peer")
+        .cloned()
+        .ok_or_else(|| Error::BadRequest("missing ?peer=<number>".into()))?;
+    let session = state.manager.get(&id)?;
+    require_web(&session, "calls are not supported on cloud sessions")?;
+    let keys = state
+        .manager
+        .load_device_keys(&id)
+        .map_err(|e| Error::Internal(anyhow::anyhow!(e)))?;
+    Ok(ws.on_upgrade(move |socket| async move {
+        if let Err(e) = run_dial_audio_bridge(state, id, peer, keys, socket).await {
+            tracing::warn!(error = %e, "dial audio bridge ended with error");
+        }
+    }))
+}
+
+async fn run_dial_audio_bridge(
+    state: AppState,
+    id: String,
+    peer: String,
+    keys: crate::crypto::identity::DeviceKeys,
+    socket: axum::extract::ws::WebSocket,
+) -> anyhow::Result<()> {
+    use anyhow::anyhow;
+
+    let session = state.manager.get(&id)?;
+    let store = state.manager.store.clone();
+    let dispatcher = session
+        .iq_client_clone()
+        .ok_or_else(|| anyhow!("session offline — cannot place a call"))?;
+
+    // Ship the offer + capture the relay.
+    let setup = crate::session::place_call(&session, &store, &keys, &dispatcher, &peer).await?;
+
+    // Our send keys/SSRC are known immediately (keyed on our own LID).
+    let own_pid = crate::call::format_participant_id(&setup.own_lid);
+    let send_keys = crate::call::derive_e2e_keys(&setup.call_key, &own_pid)
+        .ok_or_else(|| anyhow!("derive send keys"))?;
+    let send_ssrc = crate::call::derive_wasm_participant_ssrc(&setup.call_id, &own_pid, 0);
+
+    // Relay endpoint + STUN material (same extraction as the answer path).
+    let ep = crate::call::get_media_relay_endpoint(&setup.relay)
+        .ok_or_else(|| anyhow!("no relay endpoint"))?;
+    let (relay_ip, relay_port) =
+        crate::call::get_primary_ipv4_address(ep).ok_or_else(|| anyhow!("relay has no IPv4"))?;
+    tracing::info!(
+        %relay_ip, relay_port, own_pid = %own_pid, send_ssrc,
+        want_web_port = crate::call::WEB_CLIENT_RELAY_PORT,
+        "dial: relay endpoint chosen (port != 3480 risks one-way audio)"
+    );
+    let token = setup
+        .relay
+        .relay_tokens
+        .get(ep.token_id as usize)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow!("relay token {} missing", ep.token_id))?
+        .clone();
+    let integrity_key = setup
+        .relay
+        .relay_key_ascii
+        .clone()
+        .ok_or_else(|| anyhow!("relay <key> missing"))?;
+
+    let transport = crate::call::RelayTransport::connect_and_allocate(
+        &relay_ip, relay_port, &token, &integrity_key, &setup.call_id, &own_pid,
+    )
+    .await?;
+
+    // Wait for the peer to pick up (which device answered decides the recv keys).
+    // ~60 s ring; on timeout/decline, cancel the call.
+    let answering = match tokio::time::timeout(std::time::Duration::from_secs(60), setup.accept_rx)
+        .await
+    {
+        Ok(Ok(jid)) => jid,
+        _ => {
+            session.outbound_accept_cancel(&setup.call_id);
+            let node = crate::call::build_terminate(
+                &generate_message_id(), &setup.peer_addr, &setup.call_creator, &setup.call_id, None,
+            );
+            let _ = session.enqueue_send(crate::session::SendOp::RawNode(node));
+            return Ok(());
+        }
+    };
+    let peer_pid = crate::call::format_participant_id(&answering);
+    let recv_keys = crate::call::derive_e2e_keys(&setup.call_key, &peer_pid)
+        .ok_or_else(|| anyhow!("derive recv keys for answering device"))?;
+    tracing::info!(
+        answering = %answering, peer_pid = %peer_pid,
+        "dial: peer answered — recv keys derived, starting media bridge"
+    );
+
+    bridge_media_over_ws(
+        &session, &setup.call_id, &setup.peer_addr, &setup.call_creator, transport, send_keys,
+        send_ssrc, recv_keys, false, socket,
+    )
+    .await
+}
+
+/// One ringing incoming call in the `GET /calls` listing. Neutral shape — no
+/// protobuf, no callKey ciphertext.
+#[derive(Serialize)]
+struct CallResp {
+    call_id: String,
+    from: String,
+    is_video: bool,
+    audio_rates: Vec<u32>,
+}
+
+/// List the calls currently ringing on a web session (populated from inbound
+/// `<offer>`s, cleared on terminate/reject). Read-only; media isn't answered here.
+async fn list_calls(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<CallResp>>> {
+    check_session_auth(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    let calls = session
+        .pending_calls_snapshot()
+        .into_iter()
+        .map(|o| CallResp {
+            call_id: o.call_id,
+            from: o.from,
+            is_video: o.is_video,
+            audio_rates: o.audio_rates,
+        })
+        .collect();
+    Ok(Json(calls))
 }
 
 /// Non-sensitive breakdown of a proxy URL: scheme/host/port + the sticky-session
@@ -965,6 +1487,19 @@ async fn set_session_cloud(
     check_session_auth_write(&headers, &state, &id)?;
     let session = state.manager.get(&id)?;
     require_cloud(&session, "cloud credentials are only available on cloud sessions")?;
+    // A kapso session's Meta credentials are managed by Kapso via the hosted
+    // setup link — there is nothing here for an operator to patch.
+    if session
+        .meta
+        .read()
+        .cloud
+        .as_ref()
+        .is_some_and(|c| c.provider == "kapso")
+    {
+        return Err(Error::NotImplemented(
+            "cloud credentials for a kapso session are managed through the setup link",
+        ));
+    }
     // Re-pointing a session at a different Meta number is an operator action:
     // a per-session key may rotate tokens/secrets, not claim other numbers.
     if patch.phone_number_id.is_some() && bearer_token(&headers)? != state.api_token.as_str() {
@@ -1500,6 +2035,17 @@ struct SendPollReq {
     /// How many options a voter may select. Default 1 (single-choice).
     #[serde(default = "default_selectable")]
     selectable_count: u32,
+    /// Optional poll end time, unix seconds. Voting closes on the phones at
+    /// that time ("Ends in …"); must be in the future.
+    #[serde(default)]
+    end_time: Option<i64>,
+    /// Makes the poll a quiz with this option as the correct answer. Must be
+    /// one of `options`; a quiz is single-choice.
+    #[serde(default)]
+    quiz_answer: Option<String>,
+    /// Message field carrying the poll: `v1` (default), `v3`, `v5` or `v6`.
+    #[serde(default)]
+    wire_version: Option<String>,
 }
 
 async fn send_poll(
@@ -1520,10 +2066,27 @@ async fn send_poll(
             "selectable_count must be between 1 and the number of options".into(),
         ));
     }
+    if let Some(a) = &req.quiz_answer {
+        if !req.options.contains(a) {
+            return Err(Error::BadRequest("quiz_answer must be one of the options".into()));
+        }
+        if req.selectable_count != 1 {
+            return Err(Error::BadRequest("a quiz must have selectable_count 1".into()));
+        }
+    }
+    let wire_version = match req.wire_version.as_deref() {
+        None => crate::session::PollWireVersion::default(),
+        Some(v) => crate::session::PollWireVersion::parse(v).ok_or_else(|| {
+            Error::BadRequest("wire_version must be one of v1, v3, v5, v6".into())
+        })?,
+    };
 
     let session = state.manager.get(&id)?;
     require_web(&session, "polls are not supported on cloud sessions")?;
     let now = chrono::Utc::now().timestamp();
+    if req.end_time.is_some_and(|t| t <= now) {
+        return Err(Error::BadRequest("end_time must be a future unix timestamp (seconds)".into()));
+    }
     let chat_jid = normalize_recipient_jid(&req.to);
     let msg_id = generate_message_id();
     let sender_jid = session.meta.read().jid.clone().unwrap_or_else(|| "self".into());
@@ -1535,20 +2098,44 @@ async fn send_poll(
 
     let payload = serde_json::json!({
         "type": "poll",
-        "name": req.name,
-        "options": req.options,
-        "selectable_count": req.selectable_count,
+        "text": req.name,
+        "poll": {
+            "name": req.name,
+            "options": req.options,
+            "selectable_count": req.selectable_count,
+            "end_time": req.end_time,
+            "quiz_answer": req.quiz_answer,
+        },
     });
     state.manager.persist_outgoing(
         &id, &chat_jid, &msg_id, &sender_jid, "poll",
         Some(&req.name), &payload.to_string(), now,
     )?;
+    // Keep the secret: every vote on this poll comes back sealed under a key
+    // derived from it, and without it the votes can't be read.
+    if sender_jid != "self" {
+        let _ = state.manager.store.message_secret_put(
+            &id,
+            &msg_id,
+            &chat_jid,
+            &crate::session::to_non_ad_jid(&sender_jid),
+            &secret,
+            now,
+        );
+    }
 
-    let inner = crate::session::build_poll_message(
+    let inner = crate::session::build_poll_message_ext(
         &req.name,
         &req.options,
         req.selectable_count,
         &secret,
+        &crate::session::PollExtras {
+            // WhatsApp's `endTime` is milliseconds: a seconds value reads as
+            // 1970 and the poll arrives already ended (verified live).
+            end_time: req.end_time.map(|t| t * 1000),
+            quiz_answer: req.quiz_answer.clone(),
+            wire_version,
+        },
     );
     let _ = session.enqueue_send_persistent(&state.manager.store, &id, SendOp::EncryptedInner {
         chat_jid: chat_jid.clone(),
@@ -1660,7 +2247,7 @@ fn normalize_recipient_jid(input: &str) -> String {
 /// Whatsmeow-style 16-byte hex message id (32 hex chars). The server is
 /// fairly tolerant of the format; uniqueness within a session is what
 /// matters.
-fn generate_message_id() -> String {
+pub(crate) fn generate_message_id() -> String {
     use rand::RngCore;
     let mut buf = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut buf);
@@ -1868,6 +2455,7 @@ async fn send_media(
         &payload.to_string(),
         Some(&req.file_path),
     )?;
+    offload_outbound_media(&state, &id, &chat_jid, &msg_id, &req.file_path, &req.mime);
 
     // Enqueue the live upload + send. The pump runs the mediaconn IQ +
     // upload + Signal encrypt + ship pipeline.
@@ -1953,6 +2541,21 @@ async fn cloud_send_media(
     ))
 }
 
+/// Map a multipart extractor error to ours. axum reports the body-limit
+/// overflow (see `RUWA_BODY_LIMIT_MB`) as a 413 `MultipartError`; surface it
+/// as such instead of a generic 400 so clients can tell "too big" from
+/// "malformed".
+fn multipart_err(e: axum::extract::multipart::MultipartError) -> Error {
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        Error::PayloadTooLarge(format!(
+            "multipart body exceeds RUWA_BODY_LIMIT_MB ({} MB)",
+            body_limit() / (1024 * 1024)
+        ))
+    } else {
+        Error::BadRequest(format!("multipart parse: {e}"))
+    }
+}
+
 /// Multipart variant of `POST /messages/media` for clients that can't
 /// write files server-side. Form fields:
 ///   `file`     : the binary content (required)
@@ -1976,7 +2579,7 @@ async fn send_media_multipart(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| Error::BadRequest(format!("multipart parse: {e}")))?
+        .map_err(multipart_err)?
     {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
@@ -1984,7 +2587,7 @@ async fn send_media_multipart(
                 let bytes = field
                     .bytes()
                     .await
-                    .map_err(|e| Error::BadRequest(format!("read file field: {e}")))?;
+                    .map_err(multipart_err)?;
                 file_bytes = Some(bytes.to_vec());
             }
             "metadata" => {
@@ -2031,7 +2634,18 @@ async fn send_media_multipart(
     };
 
     if session.kind() == SessionKind::Cloud {
-        // Cloud: the bytes go straight to Graph's media upload — no spool file.
+        // Cloud: the bytes go to the provider's media upload. Also spool a local
+        // copy and record it as the row's media_path, so `GET …/media` streams
+        // it back directly — the provider's media-read API (Graph `GET /{id}`)
+        // isn't reliably reachable (Kapso returns 401), so without this the
+        // dashboard can't render an outbound image it just sent.
+        let dir = std::path::PathBuf::from("data/uploads").join(&id);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| Error::Internal(anyhow::anyhow!("mkdir uploads: {e}")))?;
+        let spool_path = dir.join(format!("{}.bin", generate_message_id()));
+        std::fs::write(&spool_path, &bytes)
+            .map_err(|e| Error::Internal(anyhow::anyhow!("spool: {e}")))?;
+        let spool_path_str = spool_path.to_string_lossy().into_owned();
         let upload_name = meta.filename.clone().unwrap_or_else(|| "file".into());
         return cloud_send_media(
             &state,
@@ -2045,7 +2659,7 @@ async fn send_media_multipart(
                 filename: meta.filename.as_deref(),
                 upload_name: &upload_name,
                 bytes,
-                local_path: None,
+                local_path: Some(&spool_path_str),
             },
         )
         .await;
@@ -2088,6 +2702,7 @@ async fn send_media_multipart(
         &payload.to_string(),
         Some(&spool_path_str),
     )?;
+    offload_outbound_media(&state, &id, &chat_jid, &msg_id, &spool_path_str, &meta.mime);
 
     let _ = session.enqueue_send_persistent(&state.manager.store, &id, SendOp::Media {
         chat_jid: chat_jid.clone(),
@@ -2109,6 +2724,36 @@ async fn send_media_multipart(
             status: "queued",
         }),
     ))
+}
+
+/// Best-effort durable copy of an OUTBOUND media file: when an S3 store is
+/// configured, upload the plaintext now and point `media_path` at the object
+/// URL, so `GET …/media` keeps working after the ephemeral spool file is gone
+/// (a redeploy wipes `data/uploads`). Spawned off the request; failures are
+/// logged and leave the local path in place (the WhatsApp-CDN re-download
+/// fallback still covers it once the upload descriptor lands).
+fn offload_outbound_media(state: &AppState, id: &str, chat: &str, msg_id: &str, path: &str, mime: &str) {
+    let Some(s3) = state.media_store.clone() else { return };
+    let store = Arc::clone(&state.manager.store);
+    let (id, chat, msg_id, path, mime) =
+        (id.to_string(), chat.to_string(), msg_id.to_string(), path.to_string(), mime.to_string());
+    tokio::spawn(async move {
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(id = %msg_id, error = %e, "outbound media offload: read failed");
+                return;
+            }
+        };
+        let key = format!("{id}/{chat}/{msg_id}");
+        match crate::media::put_object(&s3, &key, &bytes, &mime).await {
+            Ok(object_url) => {
+                let _ = store.message_set_media_path(&id, &chat, &msg_id, &object_url);
+                tracing::info!(id = %msg_id, "outbound media offloaded to object store");
+            }
+            Err(e) => tracing::warn!(id = %msg_id, error = ?e, "outbound media offload failed"),
+        }
+    });
 }
 
 /// Stream the decrypted media bytes for a stored message. If `media_path`
@@ -2171,27 +2816,62 @@ async fn get_message_media(
         if is_remote_url(&path) {
             return Ok(axum::response::Redirect::temporary(&path).into_response());
         }
-        let bytes =
-            std::fs::read(&path).map_err(|e| Error::Internal(anyhow::anyhow!("read: {e}")))?;
-        return Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response());
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                return Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response());
+            }
+            // The local cache/spool is ephemeral (wiped on redeploy). Fall
+            // through to a fresh download from WhatsApp's CDN when the row
+            // carries the descriptor; only a row with no way to re-fetch is a
+            // real miss (404 below, not a 500).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(session = %id, id = %msgid, path = %path, "cached media file gone — re-downloading");
+            }
+            Err(e) => return Err(Error::Internal(anyhow::anyhow!("read: {e}"))),
+        }
     }
 
-    // Cloud: the row carries Meta's `media_id` (inbound webhook or our own
-    // upload). Resolve the short-lived download URL via Graph, fetch with the
-    // bearer token, then cache exactly like the web path below.
+    // Cloud: an inbound row carries `media_id` (Meta) and/or a ready `url`
+    // (Kapso re-hosts inbound media and hands back `media_url`). Prefer the
+    // ready URL — Meta's `GET /{media_id}` lookup isn't reliably proxied by
+    // Kapso (401) — and only fall back to the id→media_info round-trip.
     if session.kind() == SessionKind::Cloud {
+        let client = cloud_client(&state, &id, &session)?;
+        let ready_url = payload
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let media_id = payload
             .get("media_id")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::NotFound("media not downloaded and media_id missing".into()))?;
-        let client = cloud_client(&state, &id, &session)?;
-        let info = client.media_info(media_id).await?;
-        let bytes = client.download(&info.url).await?;
-        let content_type = info
-            .mime_type
-            .filter(|m| !m.trim().is_empty())
-            .unwrap_or(content_type);
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let (bytes, content_type) = if let Some(u) = ready_url {
+            match client.download(u).await {
+                Ok(bytes) => (bytes, content_type),
+                // A Kapso webhook can carry Meta's direct URL in `media_url`.
+                // It is not readable with Kapso's project key, but the media-id
+                // lookup returns Kapso's short-lived signed `download_url`.
+                // Meta URLs can expire too, so this fallback is safe for both.
+                Err(e) if media_id.is_some() => {
+                    tracing::debug!(session = %id, id = %msgid, error = %e, "cloud ready media url failed; retrying via media id");
+                    cloud_download_media_by_id(
+                        &client,
+                        media_id.expect("guarded above"),
+                        &content_type,
+                    )
+                    .await?
+                }
+                Err(e) => return Err(e),
+            }
+        } else if let Some(mid) = media_id {
+            cloud_download_media_by_id(&client, mid, &content_type).await?
+        } else {
+            return Err(Error::NotFound(
+                "media not downloaded and neither url nor media_id present".into(),
+            ));
+        };
         return cache_media_and_respond(&state, &id, &chat, &msgid, bytes, &content_type).await;
     }
 
@@ -2200,7 +2880,11 @@ async fn get_message_media(
     let url = payload
         .get("url")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::NotFound("media not downloaded and url missing".into()))?;
+        .ok_or_else(|| {
+            Error::NotFound(
+                "media bytes are no longer cached and the message carries no download url (sent before the upload descriptor was persisted)".into(),
+            )
+        })?;
     let media_key_b64 = payload
         .get("media_key_b64")
         .and_then(|v| v.as_str())
@@ -2241,6 +2925,23 @@ async fn get_message_media(
         .map_err(|e| Error::Internal(anyhow::anyhow!("decrypt: {e:?}")))?;
 
     cache_media_and_respond(&state, &id, &chat, &msgid, plaintext, &content_type).await
+}
+
+/// Resolve a cloud media id to a fresh download URL, then fetch its bytes.
+/// Kapso's lookup returns its short-lived signed URL, unlike Meta's direct URL
+/// that may appear in a webhook payload.
+async fn cloud_download_media_by_id(
+    client: &cloud::CloudClient,
+    media_id: &str,
+    fallback_content_type: &str,
+) -> Result<(Vec<u8>, String)> {
+    let info = client.media_info(media_id).await?;
+    let bytes = client.download(&info.url).await?;
+    let content_type = info
+        .mime_type
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| fallback_content_type.to_string());
+    Ok((bytes, content_type))
 }
 
 /// Cache freshly fetched media bytes and serve them. s3 mode: offload to the
@@ -2949,9 +3650,43 @@ struct PictureQuery {
     preview: bool,
 }
 
+/// Deadline for the profile-picture IQ. The server answers in well under a
+/// second when it answers at all; a silent drop must surface fast (504), not
+/// after the generic 30 s, because avatar consumers poll many contacts.
+const PICTURE_IQ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Normalize + validate the `:jid` of a profile-picture lookup into the bare
+/// form the `target` attribute wants: device/agent suffixes stripped, `c.us`
+/// mapped to `s.whatsapp.net`, digits-only user (or `digits-digits` for
+/// groups). Anything else is a 400 — a bogus target would otherwise be
+/// silently dropped by the server and burn the whole timeout.
+fn picture_target_jid(input: &str) -> Result<String> {
+    let full = normalize_recipient_jid(input.trim());
+    let (head, server) = full
+        .rsplit_once('@')
+        .ok_or_else(|| Error::BadRequest("invalid jid".into()))?;
+    // Strip `:device` and `.agent` — the picture belongs to the account.
+    let user = &head[..head.find([':', '.']).unwrap_or(head.len())];
+    let server = match server {
+        "c.us" => "s.whatsapp.net",
+        s @ ("s.whatsapp.net" | "lid" | "g.us") => s,
+        other => {
+            return Err(Error::BadRequest(format!(
+                "unsupported jid server '{other}' (expected s.whatsapp.net, lid or g.us)"
+            )))
+        }
+    };
+    let digits_or_dash = |c: char| c.is_ascii_digit() || (server == "g.us" && c == '-');
+    if user.is_empty() || !user.chars().all(digits_or_dash) || user.len() > 32 {
+        return Err(Error::BadRequest(format!("invalid jid user '{user}'")));
+    }
+    Ok(format!("{user}@{server}"))
+}
+
 /// Fetch a contact's (or group's) profile picture URL. Requires a live
 /// connection. Returns `{ jid, url }`; `url` is null when there's no picture or
-/// it's hidden from us.
+/// it's hidden from us. 400 for a malformed jid, 504 when WhatsApp doesn't
+/// answer within [`PICTURE_IQ_TIMEOUT`].
 async fn get_contact_picture(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2959,12 +3694,15 @@ async fn get_contact_picture(
     axum::extract::Query(q): axum::extract::Query<PictureQuery>,
 ) -> Result<Json<serde_json::Value>> {
     check_session_auth(&headers, &state, &id)?;
+    let target = picture_target_jid(&jid)?;
     let session = state.manager.get(&id)?;
     require_web(&session, "profile pictures are not supported on cloud sessions")?;
-    let target = normalize_recipient_jid(&jid);
+    // The peer's privacy token (if we hold a fresh one) — lets the query
+    // through "my contacts"-style profile-photo privacy, like whatsmeow.
+    let tctoken = crate::session::peer_tctoken_for_jid(&state.manager.store, &id, &target);
     let iq_id = crate::session::uuid_v4();
-    let iq = crate::session::build_picture_iq(&iq_id, &target, q.preview);
-    let reply = session.iq_request(iq).await?;
+    let iq = crate::session::build_picture_iq(&iq_id, &target, q.preview, tctoken.as_deref());
+    let reply = session.iq_request_timeout(iq, PICTURE_IQ_TIMEOUT).await?;
     let url = crate::session::parse_picture_response(&reply);
     Ok(Json(serde_json::json!({ "jid": target, "url": url })))
 }
@@ -3573,6 +4311,229 @@ async fn delete_template(
     Ok(Json(json!({ "success": true })))
 }
 
+// ---------------------------------------------------------------------------
+// Kapso Broadcasts (bulk-template campaigns) — pure proxy, kapso-only
+// ---------------------------------------------------------------------------
+
+/// Body of `POST /v1/sessions/:id/broadcasts`. Fields are optional at the serde
+/// layer so a missing one is a clean 400 (not axum's 422) from the handler.
+#[derive(Deserialize)]
+struct CreateBroadcastReq {
+    #[serde(default)]
+    name: Option<String>,
+    /// Meta template id (the `id` returned by `GET/POST /v1/sessions/:id/templates`).
+    #[serde(default)]
+    template_id: Option<String>,
+}
+
+/// Body of `POST /v1/sessions/:id/broadcasts/:bid/schedule`.
+#[derive(Deserialize)]
+struct ScheduleBroadcastReq {
+    /// ISO-8601 instant in the future.
+    #[serde(default)]
+    scheduled_at: Option<String>,
+}
+
+/// Query for `GET /v1/sessions/:id/broadcasts`.
+#[derive(Deserialize)]
+struct ListBroadcastsQuery {
+    status: Option<String>,
+    page: Option<u32>,
+    per_page: Option<u32>,
+}
+
+/// Query for `GET /v1/sessions/:id/broadcasts/:bid/recipients`.
+#[derive(Deserialize)]
+struct BroadcastPageQuery {
+    page: Option<u32>,
+    per_page: Option<u32>,
+}
+
+const BROADCASTS_NOT_CLOUD: &str = "broadcasts are only available on cloud sessions";
+
+/// `GET /v1/sessions/:id/broadcasts` → `BroadcastList`.
+async fn list_broadcasts_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<ListBroadcastsQuery>,
+) -> Result<Json<cloud::BroadcastList>> {
+    check_session_auth(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    let list = state
+        .manager
+        .broadcast_list(&id, q.status.as_deref(), q.page, q.per_page)
+        .await?;
+    Ok(Json(list))
+}
+
+/// `POST /v1/sessions/:id/broadcasts` → 201 `BroadcastView`.
+async fn create_broadcast_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CreateBroadcastReq>,
+) -> Result<(StatusCode, Json<cloud::BroadcastView>)> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    let name = body.name.as_deref().unwrap_or_default().trim();
+    let template_id = body.template_id.as_deref().unwrap_or_default().trim();
+    if name.is_empty() {
+        return Err(Error::BadRequest("broadcast name is required".into()));
+    }
+    if template_id.is_empty() {
+        return Err(Error::BadRequest("broadcast template_id is required".into()));
+    }
+    let bc = state.manager.broadcast_create(&id, name, template_id).await?;
+    Ok((StatusCode::CREATED, Json(bc)))
+}
+
+/// `GET /v1/sessions/:id/broadcasts/:bid` → `BroadcastView`.
+async fn get_broadcast_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, bid)): Path<(String, String)>,
+) -> Result<Json<cloud::BroadcastView>> {
+    check_session_auth(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    Ok(Json(state.manager.broadcast_get(&id, &bid).await?))
+}
+
+/// Pull the recipient array out of `{recipients:[…]}` or a bare `[…]`; enforce
+/// `1..=1000`.
+fn extract_recipients(body: serde_json::Value) -> Result<serde_json::Value> {
+    let arr = match body {
+        serde_json::Value::Array(_) => body,
+        serde_json::Value::Object(mut m) => m
+            .remove("recipients")
+            .ok_or_else(|| Error::BadRequest("recipients array is required".into()))?,
+        _ => return Err(Error::BadRequest("recipients must be an array".into())),
+    };
+    let n = arr
+        .as_array()
+        .ok_or_else(|| Error::BadRequest("recipients must be an array".into()))?
+        .len();
+    if n == 0 {
+        return Err(Error::BadRequest("recipients must not be empty".into()));
+    }
+    if n > 1000 {
+        return Err(Error::BadRequest(
+            "at most 1000 recipients per request".into(),
+        ));
+    }
+    Ok(arr)
+}
+
+/// `POST /v1/sessions/:id/broadcasts/:bid/recipients` → 201 `AddRecipientsResult`.
+async fn add_broadcast_recipients_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, bid)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<cloud::AddRecipientsResult>)> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    let recipients = extract_recipients(body)?;
+    let res = state
+        .manager
+        .broadcast_add_recipients(&id, &bid, recipients)
+        .await?;
+    Ok((StatusCode::CREATED, Json(res)))
+}
+
+/// `DELETE /v1/sessions/:id/broadcasts/:bid/recipients` → `BroadcastView`.
+async fn clear_broadcast_recipients_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, bid)): Path<(String, String)>,
+) -> Result<Json<cloud::BroadcastView>> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    Ok(Json(
+        state.manager.broadcast_clear_recipients(&id, &bid).await?,
+    ))
+}
+
+/// `GET /v1/sessions/:id/broadcasts/:bid/recipients` → `BroadcastRecipientList`.
+async fn list_broadcast_recipients_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, bid)): Path<(String, String)>,
+    Query(q): Query<BroadcastPageQuery>,
+) -> Result<Json<cloud::BroadcastRecipientList>> {
+    check_session_auth(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    let list = state
+        .manager
+        .broadcast_list_recipients(&id, &bid, q.page, q.per_page)
+        .await?;
+    Ok(Json(list))
+}
+
+/// `POST /v1/sessions/:id/broadcasts/:bid/send` → 202 `BroadcastView`.
+async fn send_broadcast_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, bid)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<cloud::BroadcastView>)> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    let bc = state.manager.broadcast_send(&id, &bid).await?;
+    Ok((StatusCode::ACCEPTED, Json(bc)))
+}
+
+/// `POST /v1/sessions/:id/broadcasts/:bid/schedule` → 202 `BroadcastView`.
+async fn schedule_broadcast_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, bid)): Path<(String, String)>,
+    Json(body): Json<ScheduleBroadcastReq>,
+) -> Result<(StatusCode, Json<cloud::BroadcastView>)> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    let scheduled_at = body.scheduled_at.as_deref().unwrap_or_default().trim();
+    if scheduled_at.is_empty() {
+        return Err(Error::BadRequest("scheduled_at is required".into()));
+    }
+    let bc = state
+        .manager
+        .broadcast_schedule(&id, &bid, scheduled_at)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(bc)))
+}
+
+/// `POST /v1/sessions/:id/broadcasts/:bid/cancel` → `BroadcastView`.
+async fn cancel_broadcast_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, bid)): Path<(String, String)>,
+) -> Result<Json<cloud::BroadcastView>> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    Ok(Json(state.manager.broadcast_cancel(&id, &bid).await?))
+}
+
+/// `POST /v1/sessions/:id/broadcasts/:bid/stop` → `BroadcastView`.
+async fn stop_broadcast_h(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, bid)): Path<(String, String)>,
+) -> Result<Json<cloud::BroadcastView>> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let session = state.manager.get(&id)?;
+    require_cloud(&session, BROADCASTS_NOT_CLOUD)?;
+    Ok(Json(state.manager.broadcast_stop(&id, &bid).await?))
+}
+
 /// Query string of Meta's webhook subscription handshake.
 #[derive(Deserialize)]
 struct WebhookVerifyQuery {
@@ -3722,6 +4683,166 @@ async fn cloud_webhook_receive(
         }
     }
     Ok(Json(json!({})))
+}
+
+// ---------------------------------------------------------------------------
+// Kapso webhooks — `GET|POST /v1/cloud/kapso/{webhook,project-webhook}`
+// ---------------------------------------------------------------------------
+//
+// Distinct routes from the Meta `/v1/cloud/webhook` so the two envelope
+// formats + verification schemes never mix in one handler. Like the Meta
+// webhook, these carry no bearer auth (the handlers do not call `check_auth`);
+// the message webhook is authenticated per-batch by `X-Webhook-Signature` under
+// the session's per-number secret, the project webhook by
+// `RUWA_KAPSO_PROJECT_WEBHOOK_SECRET`.
+
+/// `GET /v1/cloud/kapso/{webhook,project-webhook}` — Kapso has no verification
+/// handshake, so this just stays permissive: echoes `hub.challenge` if a prober
+/// sends one, else `200 "ok"`.
+async fn cloud_kapso_webhook_verify(
+    Query(q): Query<WebhookVerifyQuery>,
+) -> impl IntoResponse {
+    let body = q
+        .challenge
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ok".to_string());
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+}
+
+/// `POST /v1/cloud/kapso/webhook` — inbound Kapso message events (native
+/// envelope). Mirrors `cloud_webhook_receive`: resolve each batch's session by
+/// `phone_number_id`, verify `X-Webhook-Signature` under that session's
+/// per-number secret (`RUWA_CLOUD_ALLOW_UNSIGNED` for a secret-less session),
+/// then hand the batches to the shared `cloud_ingest`. Any mapped batch failing
+/// verification → 401, nothing stored; unmapped numbers are acked and ignored.
+async fn cloud_kapso_webhook_receive(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>> {
+    let batches = cloud::parse_kapso_webhook(&body)?;
+    let signature = headers.get("x-webhook-signature").and_then(|v| v.to_str().ok());
+
+    let mut mapped = 0usize;
+    for b in &batches {
+        let Some(sid) = state
+            .manager
+            .store
+            .cloud_session_id_by_phone_number_id(&b.phone_number_id)?
+        else {
+            continue;
+        };
+        mapped += 1;
+        let creds = match state.manager.store.session_cloud_creds(&sid) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                tracing::warn!(session = %sid, "kapso webhook: session has no cloud creds row");
+                return Err(Error::Unauthorized);
+            }
+            Err(e) => {
+                tracing::warn!(session = %sid, error = %e, "kapso webhook: creds unreadable");
+                return Err(Error::Unauthorized);
+            }
+        };
+        match creds.webhook_secret.as_deref() {
+            Some(secret) => {
+                if !cloud::verify_kapso_signature(secret, &body, signature) {
+                    tracing::warn!(session = %sid, "kapso webhook: X-Webhook-Signature mismatch");
+                    return Err(Error::Unauthorized);
+                }
+            }
+            None if cloud_allow_unsigned() => {
+                tracing::debug!(session = %sid, "kapso webhook: accepted unsigned (RUWA_CLOUD_ALLOW_UNSIGNED)");
+            }
+            None => {
+                tracing::warn!(
+                    session = %sid,
+                    "kapso webhook: session has no webhook secret and RUWA_CLOUD_ALLOW_UNSIGNED is not set"
+                );
+                return Err(Error::Unauthorized);
+            }
+        }
+    }
+    if mapped == 0 {
+        tracing::debug!(
+            batches = batches.len(),
+            "kapso webhook: no batch maps to a cloud session — acked and ignored"
+        );
+        return Ok(Json(json!({})));
+    }
+
+    for batch in batches {
+        let pnid = batch.phone_number_id.clone();
+        if let Err(e) = state.manager.cloud_ingest(batch).await {
+            match e {
+                Error::NotFound(_) => {
+                    tracing::debug!(phone_number_id = %pnid, "kapso webhook: unknown phone_number_id ignored")
+                }
+                other => {
+                    tracing::warn!(phone_number_id = %pnid, error = %other, "kapso webhook: ingest failed")
+                }
+            }
+        }
+    }
+    Ok(Json(json!({})))
+}
+
+/// `POST /v1/cloud/kapso/project-webhook` — Kapso project-level lifecycle
+/// events (`whatsapp.phone_number.*`). Verified against
+/// `RUWA_KAPSO_PROJECT_WEBHOOK_SECRET` (or `RUWA_CLOUD_ALLOW_UNSIGNED` when that
+/// is unset); on a good signature the event drives `kapso_onboarding_complete`.
+/// Always 200 once authenticated — handler errors are logged, not surfaced.
+async fn cloud_kapso_project_webhook_receive(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>> {
+    let event_header = headers.get("x-webhook-event").and_then(|v| v.to_str().ok());
+    let ev = cloud::parse_kapso_project_event(&body, event_header)?;
+    let signature = headers.get("x-webhook-signature").and_then(|v| v.to_str().ok());
+    let secret = std::env::var("RUWA_KAPSO_PROJECT_WEBHOOK_SECRET")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match secret {
+        Some(sec) => {
+            if !cloud::verify_kapso_signature(&sec, &body, signature) {
+                tracing::warn!("kapso project webhook: X-Webhook-Signature mismatch");
+                return Err(Error::Unauthorized);
+            }
+        }
+        None if cloud_allow_unsigned() => {
+            tracing::debug!("kapso project webhook: accepted unsigned (RUWA_CLOUD_ALLOW_UNSIGNED)");
+        }
+        None => {
+            tracing::warn!(
+                "kapso project webhook: RUWA_KAPSO_PROJECT_WEBHOOK_SECRET unset and \
+                 RUWA_CLOUD_ALLOW_UNSIGNED not set — refusing"
+            );
+            return Err(Error::Unauthorized);
+        }
+    }
+    if let Err(e) = state.manager.kapso_onboarding_complete(&ev).await {
+        tracing::warn!(event = %ev.event, error = %e, "kapso project webhook: handler failed");
+    }
+    Ok(Json(json!({})))
+}
+
+/// `POST /v1/sessions/:id/cloud/setup-link` — re-issue a kapso session's hosted
+/// setup link. `501` on a non-kapso session, `409` once onboarded.
+async fn regen_kapso_setup_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    check_session_auth_write(&headers, &state, &id)?;
+    let url = state.manager.regenerate_kapso_setup_link(&id).await?;
+    Ok(Json(json!({ "setup_link": url })))
 }
 
 // ---------------------------------------------------------------------------
@@ -4127,6 +5248,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_calls_reflects_pending_and_guards_auth() {
+        let state = test_state();
+        let sid = state.manager.create(None).unwrap().meta.read().id.clone();
+        let app = router(state.clone());
+
+        // No bearer → 401.
+        let (status, _) =
+            send(app.clone(), "GET", &format!("/v1/sessions/{sid}/calls"), None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Authed but nothing ringing → empty array.
+        let (status, body) = send(
+            app.clone(), "GET", &format!("/v1/sessions/{sid}/calls"), Some("test-token"), None,
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]));
+
+        // Stash a pending call directly, then it appears in the listing.
+        let session = state.manager.get(&sid).unwrap();
+        session.pending_call_insert(crate::call::ParsedOffer {
+            call_id: "C9".into(),
+            call_creator: "111@lid".into(),
+            from: "111@lid".into(),
+            is_video: false,
+            audio_rates: vec![16000],
+            enc: crate::call::OfferEnc { enc_type: "pkmsg".into(), version: 2, ciphertext: vec![1] },
+            relay: None,
+            mlow: false,
+        });
+        let (status, body) = send(
+            app, "GET", &format!("/v1/sessions/{sid}/calls"), Some("test-token"), None,
+        ).await;
+        assert_eq!(status, StatusCode::OK);
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["call_id"], "C9");
+        assert_eq!(arr[0]["audio_rates"], serde_json::json!([16000]));
+        // The callKey ciphertext must NOT leak into the listing.
+        assert!(arr[0].get("enc").is_none());
+    }
+
+    #[tokio::test]
     async fn metrics_history_endpoint_serves_persisted_series() {
         let state = test_state();
         let now = chrono::Utc::now().timestamp();
@@ -4431,6 +5594,26 @@ mod tests {
             .find(|m| m["message_id"] == mid)
             .expect("poll message in list");
         assert_eq!(row["msg_type"], "poll");
+        assert_eq!(row["poll"]["options"], serde_json::json!(["Pizza", "Sushi"]));
+        assert_eq!(row["poll"]["votes"], serde_json::json!({}));
+
+        // end_time in the past, a quiz answer that isn't an option, or an
+        // unknown wire version → 400.
+        for bad in [
+            serde_json::json!({"to": "5511999999999", "name": "Q", "options": ["a", "b"], "end_time": 1000}),
+            serde_json::json!({"to": "5511999999999", "name": "Q", "options": ["a", "b"], "quiz_answer": "z"}),
+            serde_json::json!({"to": "5511999999999", "name": "Q", "options": ["a", "b"], "wire_version": "v9"}),
+        ] {
+            let (st, _) = send(
+                app.clone(),
+                "POST",
+                &format!("/v1/sessions/{id}/messages/poll"),
+                Some("test-token"),
+                Some(bad),
+            )
+            .await;
+            assert_eq!(st, StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]
@@ -4542,6 +5725,60 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    /// Profile-picture lookup: malformed jids are a 400 before any IQ is
+    /// attempted (a bogus `target` would be silently dropped by the server and
+    /// burn the whole timeout), valid ones are normalized to the bare account
+    /// jid, and an unconnected session answers 400 immediately.
+    #[tokio::test]
+    async fn contact_picture_validates_jid_and_fails_fast_when_offline() {
+        assert_eq!(picture_target_jid("5511999999999").unwrap(), "5511999999999@s.whatsapp.net");
+        assert_eq!(picture_target_jid("5511999999999@c.us").unwrap(), "5511999999999@s.whatsapp.net");
+        // Device / agent suffixes are stripped — the picture belongs to the account.
+        assert_eq!(picture_target_jid("550000000002:1@s.whatsapp.net").unwrap(), "550000000002@s.whatsapp.net");
+        assert_eq!(picture_target_jid("64000000000001.1@lid").unwrap(), "64000000000001@lid");
+        assert_eq!(picture_target_jid("120363001234-5678@g.us").unwrap(), "120363001234-5678@g.us");
+        for bad in ["abc", "foo@bar.com", "@s.whatsapp.net", "55 11@s.whatsapp.net", "x-y@s.whatsapp.net"] {
+            assert!(
+                matches!(picture_target_jid(bad), Err(Error::BadRequest(_))),
+                "{bad} must be rejected"
+            );
+        }
+
+        let app = router(test_state());
+        let (_st, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(serde_json::json!({"label": "pic"})),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let started = std::time::Instant::now();
+        let (st, body) = send(
+            app.clone(),
+            "GET",
+            &format!("/v1/sessions/{id}/contacts/not-a-jid/picture?preview=true"),
+            Some("test-token"),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+
+        // Valid jid, no live socket → 400 right away, no timeout.
+        let (st, body) = send(
+            app.clone(),
+            "GET",
+            &format!("/v1/sessions/{id}/contacts/5511999999999/picture"),
+            Some("test-token"),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     #[tokio::test]
@@ -5749,6 +6986,86 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Bodies above axum's 2 MB default used to 413 on the multipart upload.
+    /// The router now applies `RUWA_BODY_LIMIT_MB` (default 20 MB) to /v1/*,
+    /// so a ~5 MB file must be accepted; one past the cap must still 413.
+    #[tokio::test]
+    async fn multipart_body_limit_is_raised_above_axum_default() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (_, body) = send(
+            app.clone(),
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(serde_json::json!({"label": "phone"})),
+        )
+        .await;
+        let id = body["id"].as_str().unwrap().to_string();
+
+        let build = |file_len: usize| {
+            let boundary = "------------big-boundary";
+            let metadata = serde_json::json!({
+                "to": "5511999999999",
+                "type": "document",
+                "mime": "application/octet-stream",
+                "filename": "big.bin",
+            })
+            .to_string();
+            let mut body: Vec<u8> = Vec::with_capacity(file_len + 512);
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                b"Content-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n",
+            );
+            body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+            body.extend(std::iter::repeat_n(0xABu8, file_len));
+            body.extend_from_slice(b"\r\n");
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(b"Content-Disposition: form-data; name=\"metadata\"\r\n\r\n");
+            body.extend_from_slice(metadata.as_bytes());
+            body.extend_from_slice(b"\r\n");
+            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/sessions/{id}/messages/media/multipart"))
+                .header("authorization", "Bearer test-token")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        // 5 MB: over axum's old 2 MB default, under our 20 MB cap.
+        let resp = app.clone().oneshot(build(5 * 1024 * 1024)).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(status, StatusCode::ACCEPTED, "body: {v}");
+        if let Some(msg_id) = v["id"].as_str() {
+            let path: Option<String> = state
+                .manager
+                .store
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT media_path FROM messages \
+                           WHERE session_id = ? AND message_id = ?",
+                        rusqlite::params![id, msg_id],
+                        |r| r.get(0),
+                    )
+                })
+                .ok();
+            if let Some(p) = path {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+
+        // 21 MB: past the cap → 413, not a spooled file.
+        let resp = app.oneshot(build(21 * 1024 * 1024)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     // ===== Cloud API sessions + Meta webhook ================================
 
     /// Fixture ids: an obviously fake Graph phone-number id + recipient.
@@ -6441,6 +7758,276 @@ mod tests {
         let (_, listed) = send(app, "GET", &format!("/v1/sessions/{id}/messages"), Some(&key), None).await;
         assert_eq!(listed.as_array().unwrap().len(), 1);
         assert_eq!(listed[0]["from_me"], true);
+    }
+
+    // ===== Kapso provider ==================================================
+
+    const KAPSO_PNID: &str = "123456789012345";
+    const KAPSO_SECRET: &str = "kapso-hook-secret-000000000000000";
+    const KAPSO_CUSTOMER: &str = "cust-abc-123";
+
+    /// Seed a `provider = kapso`, connected cloud session straight into the
+    /// store (no network), returning its id. `webhook_secret` = `KAPSO_SECRET`.
+    fn seed_kapso_session(state: &AppState) -> String {
+        let id = crate::session::uuid_v4();
+        let now = 1_700_000_000;
+        state
+            .manager
+            .store
+            .create_kapso_session(&crate::store::NewKapsoSession {
+                id: &id,
+                label: Some("kapso tenant"),
+                status: "connected",
+                api_key: "kapsotenantkey0000000000000000000",
+                proxy_url: None,
+                created_at: now,
+                updated_at: now,
+                customer_id: KAPSO_CUSTOMER,
+                setup_ref: &id,
+                setup_link: Some("https://app.kapso.ai/setup/x"),
+                base_url: None,
+                graph_version: "v25.0",
+                webhook_secret: KAPSO_SECRET,
+            })
+            .unwrap();
+        state
+            .manager
+            .store
+            .session_set_cloud_phone_number(&id, KAPSO_PNID, Some("int-uuid-1"), Some("waba-kapso-1"), now)
+            .unwrap();
+        id
+    }
+
+    /// Kapso native message-webhook body: one inbound text from `CLOUD_USER`.
+    fn kapso_text_fixture(wamid: &str, text: &str) -> Vec<u8> {
+        json!({
+            "message": {
+                "id": wamid, "timestamp": "1730092800", "type": "text",
+                "from": CLOUD_USER, "text": { "body": text },
+                "kapso": { "direction": "inbound" }
+            },
+            "conversation": {
+                "contact_name": "Kapso User", "phone_number": CLOUD_USER,
+                "phone_number_id": KAPSO_PNID
+            },
+            "is_new_conversation": true,
+            "phone_number_id": KAPSO_PNID
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn kapso_create_without_config_is_clean_400() {
+        std::env::remove_var("RUWA_KAPSO_API_KEY");
+        let app = router(test_state());
+        let (st, body) = send(
+            app,
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            Some(json!({ "kind": "cloud", "cloud": { "provider": "kapso" } })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn kapso_webhook_get_is_permissive() {
+        let app = router(test_state());
+        let (st, body) =
+            send_raw(app, "GET", "/v1/cloud/kapso/webhook", &[], Vec::new()).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn kapso_webhook_signed_text_message_is_stored_and_bad_signature_401s() {
+        let state = test_state();
+        let app = router(state.clone());
+        let id = seed_kapso_session(&state);
+        state.manager.restore_all().await.unwrap();
+
+        let body = kapso_text_fixture("wamid.kapso.1", "olá via kapso");
+        let sig = cloud::hmac_sha256_hex(KAPSO_SECRET.as_bytes(), &body);
+        let (st, resp) = send_raw(
+            app.clone(),
+            "POST",
+            "/v1/cloud/kapso/webhook",
+            &[("content-type", "application/json"), ("x-webhook-signature", &sig)],
+            body.clone(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&resp));
+
+        let chat = format!("{CLOUD_USER}@s.whatsapp.net");
+        let rows = state
+            .manager
+            .store
+            .messages_list(&id, Some(&chat), None, i64::MAX, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_id, "wamid.kapso.1");
+        assert!(!rows[0].from_me);
+        assert_eq!(rows[0].body_text.as_deref(), Some("olá via kapso"));
+
+        // Bad signature → 401, nothing more stored.
+        let (st, _) = send_raw(
+            app,
+            "POST",
+            "/v1/cloud/kapso/webhook",
+            &[("content-type", "application/json"), ("x-webhook-signature", "deadbeef")],
+            body,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let rows = state
+            .manager
+            .store
+            .messages_list(&id, Some(&chat), None, i64::MAX, 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn web_only_route_on_kapso_session_is_501() {
+        let state = test_state();
+        let app = router(state.clone());
+        let id = seed_kapso_session(&state);
+        state.manager.restore_all().await.unwrap();
+        let (st, _) = send(
+            app,
+            "GET",
+            &format!("/v1/sessions/{id}/qr"),
+            Some("test-token"),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    // ---- Kapso Broadcasts (bulk-template campaigns) ------------------------
+
+    /// Like [`seed_kapso_session`] but leaves the session in the pending-
+    /// onboarding state: no `cloud_phone_number_id` yet.
+    fn seed_kapso_session_onboarding(state: &AppState) -> String {
+        let id = crate::session::uuid_v4();
+        let now = 1_700_000_000;
+        state
+            .manager
+            .store
+            .create_kapso_session(&crate::store::NewKapsoSession {
+                id: &id,
+                label: Some("kapso onboarding"),
+                status: "connected",
+                api_key: "kapsotenantkey0000000000000000001",
+                proxy_url: None,
+                created_at: now,
+                updated_at: now,
+                customer_id: KAPSO_CUSTOMER,
+                setup_ref: &id,
+                setup_link: Some("https://app.kapso.ai/setup/y"),
+                base_url: None,
+                graph_version: "v25.0",
+                webhook_secret: KAPSO_SECRET,
+            })
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn broadcasts_on_web_session_are_501() {
+        let state = test_state();
+        let app = router(state.clone());
+        let id = state.manager.create(None).unwrap().meta.read().id.clone();
+        let (st, _) = send(
+            app,
+            "POST",
+            &format!("/v1/sessions/{id}/broadcasts"),
+            Some("test-token"),
+            Some(json!({ "name": "Promo", "template_id": "123456" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn broadcasts_on_meta_cloud_session_are_501() {
+        let state = test_state();
+        let app = router(state.clone());
+        let (id, key) = create_cloud_session(app.clone(), Some(CLOUD_APP_SECRET)).await;
+        let (st, body) = send(
+            app,
+            "POST",
+            &format!("/v1/sessions/{id}/broadcasts"),
+            Some(&key),
+            Some(json!({ "name": "Promo", "template_id": "123456" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{body}");
+    }
+
+    #[tokio::test]
+    async fn broadcasts_on_onboarding_kapso_session_are_400() {
+        let state = test_state();
+        let app = router(state.clone());
+        let id = seed_kapso_session_onboarding(&state);
+        state.manager.restore_all().await.unwrap();
+        let (st, body) = send(
+            app,
+            "POST",
+            &format!("/v1/sessions/{id}/broadcasts"),
+            Some("test-token"),
+            Some(json!({ "name": "Promo", "template_id": "123456" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("onboarding"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_create_validates_body_before_network() {
+        let state = test_state();
+        let app = router(state.clone());
+        let id = seed_kapso_session(&state);
+        state.manager.restore_all().await.unwrap();
+        // Missing / blank template_id → 400, no Kapso round-trip.
+        let (st, body) = send(
+            app,
+            "POST",
+            &format!("/v1/sessions/{id}/broadcasts"),
+            Some("test-token"),
+            Some(json!({ "name": "" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn broadcast_recipients_rejects_oversized_list() {
+        let state = test_state();
+        let app = router(state.clone());
+        let id = seed_kapso_session(&state);
+        state.manager.restore_all().await.unwrap();
+        let recipients: Vec<serde_json::Value> = (0..1001)
+            .map(|i| json!({ "phone_number": format!("+155500{i:05}"), "components": [] }))
+            .collect();
+        let (st, body) = send(
+            app,
+            "POST",
+            &format!("/v1/sessions/{id}/broadcasts/{}/recipients", "b-1"),
+            Some("test-token"),
+            Some(json!({ "recipients": recipients })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("1000"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 
 export type SessionStatus =
   | "pending"
+  | "pending_onboarding"
   | "connecting"
   | "awaiting_qr"
   | "syncing"
@@ -15,25 +16,46 @@ export type SessionStatus =
  *  `cloud` = Meta WhatsApp Cloud API (Graph credentials, inbound via webhook). */
 export type SessionKind = "web" | "cloud"
 
+/** Which official-API backend a `kind:"cloud"` session runs on: `meta` = direct
+ *  Meta Graph credentials; `kapso` = Kapso Business Platform (BSP onboarding via
+ *  a hosted setup link, no per-session Meta credentials). */
+export type CloudProvider = "meta" | "kapso"
+
 /** Non-secret Cloud API metadata echoed on cloud sessions (never the token/secret). */
 export interface CloudMeta {
+  /** Absent on older servers ⇒ treat as "meta". */
+  provider?: CloudProvider
   phone_number_id: string
   waba_id?: string | null
   graph_version?: string | null
   display_phone_number?: string | null
   verified_name?: string | null
+  /** kapso only — `pending` until the customer completes onboarding, then `connected`. */
+  onboarding_status?: "pending" | "connected"
+  /** kapso only — hosted setup link to hand to the customer while onboarding is pending. */
+  setup_link?: string
 }
 
-/** Cloud credentials as sent on create / PUT /cloud. Every field optional on
- *  update (only provided ones replace); create requires phone_number_id and
- *  access_token (waba_id only for template management). */
+/** Cloud credentials/config as sent on create / PUT /cloud. Every field optional
+ *  on update (only provided ones replace). For `provider:"meta"` (default) create
+ *  requires phone_number_id + access_token (waba_id only for template management);
+ *  for `provider:"kapso"` none of the Meta fields apply — the customer connects
+ *  their own number via the setup link. */
 export interface CloudCredsInput {
+  provider?: CloudProvider
   phone_number_id?: string
   waba_id?: string
   access_token?: string
   app_secret?: string
   verify_token?: string
   graph_version?: string
+  // ── kapso create-only fields ──
+  connection_type?: "dedicated" | "coexistence"
+  country_isos?: string[]
+  language?: string
+  provision_phone_number?: boolean
+  success_redirect_url?: string
+  failure_redirect_url?: string
 }
 
 export interface SessionMeta {
@@ -274,3 +296,11 @@ export interface ImproveTextResult {
 
 /** `type` field of the multipart media send; `ptt` = WhatsApp voice note. */
 export type MediaSendType = "image" | "video" | "audio" | "ptt" | "voice" | "document" | "sticker"
+
+/** One ringing incoming call (`GET /v1/sessions/:id/calls`). Web sessions only. */
+export interface CallInfo {
+  call_id: string
+  from: string
+  is_video: boolean
+  audio_rates: number[]
+}

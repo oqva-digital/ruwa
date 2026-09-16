@@ -3,8 +3,9 @@ import { useQuery, useQueryClient, keepPreviousData } from "@tanstack/react-quer
 import { toast } from "sonner"
 import {
   Search, Send, SmilePlus, Trash2, Pencil, MessageSquare, MessageSquarePlus, Loader2,
-  LayoutTemplate, MousePointerClick, RefreshCw, Sparkles, Mic, Paperclip, Square, X, Undo2, Check,
+  LayoutTemplate, MousePointerClick, RefreshCw, Sparkles, Mic, Paperclip, Square, X, Undo2, Check, ListChecks,
 } from "lucide-react"
+import { Checkbox } from "@/components/ui/checkbox"
 import { api, ApiError } from "@/lib/api"
 import type { SessionMeta, MessageRow, TemplateRow, ImproveMode, MediaSendType } from "@/lib/types"
 import { isCloud } from "@/lib/types"
@@ -41,6 +42,37 @@ const MEDIA_TYPES = new Set(["image", "video", "audio", "ptt", "voice", "sticker
  *  inbound taps they produce (`button` = template quick-reply, `interactive` =
  *  button_reply/list_reply). Rendered as a labelled bubble, not `[type]`. */
 const STRUCTURED_TYPES = new Set(["template", "interactive", "button", "button_reply", "list_reply"])
+
+interface PollInfo {
+  name?: string | null
+  options?: string[] | null
+  selectable_count?: number | null
+  /** voter JID → chosen option names */
+  votes?: Record<string, string[]>
+}
+
+/** Poll bubble: question plus each option with its current vote count. */
+function PollBubble({ m }: { m: MessageRow }) {
+  const poll = m.poll as PollInfo
+  const votes = Object.values(poll.votes ?? {})
+  const count = (o: string) => votes.filter((v) => v.includes(o)).length
+  return (
+    <div className="flex min-w-48 flex-col gap-1">
+      <span className="inline-flex w-fit items-center gap-1 rounded-full bg-background/60 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        <ListChecks className="h-2.5 w-2.5" />
+        poll{poll.selectable_count === 1 ? "" : " · multiple"}
+      </span>
+      <span className="font-medium">{poll.name ?? m.body_text}</span>
+      {(poll.options ?? []).map((o) => (
+        <div key={o} className="flex items-center justify-between gap-3 rounded bg-background/60 px-2 py-1 text-xs">
+          <span>{o}</span>
+          <span className="mono text-muted-foreground">{count(o)}</span>
+        </div>
+      ))}
+      <span className="text-[10px] text-muted-foreground">{votes.length} {votes.length === 1 ? "vote" : "votes"}</span>
+    </div>
+  )
+}
 
 /**
  * Bubble for template / interactive / button rows. The list endpoint carries
@@ -380,6 +412,12 @@ export function MessagingPage({ inst }: { inst: SessionMeta }) {
                       </div>
                     ) : STRUCTURED_TYPES.has(m.msg_type) ? (
                       <StructuredBubble m={m} />
+                    ) : m.msg_type === "poll" && m.poll ? (
+                      <PollBubble m={m} />
+                    ) : m.msg_type === "poll_vote" ? (
+                      <span className="italic text-muted-foreground">
+                        {m.body_text ? `voted: ${m.body_text}` : "poll vote"}
+                      </span>
                     ) : (
                       m.body_text ?? <span className="text-muted-foreground">[{m.msg_type}]</span>
                     )}
@@ -658,7 +696,17 @@ function Composer({ inst, to, onSent }: { inst: SessionMeta; to: string; onSent:
       } else if (tab === "contact") {
         await api.sendContact(inst.id, to, { display_name: f.cname, phone: f.cphone })
       } else if (tab === "poll") {
-        await api.sendPoll(inst.id, to, { name: f.pq, options: (f.popts || "").split("\n").map((s) => s.trim()).filter(Boolean) })
+        const options = (f.popts || "").split("\n").map((s) => s.trim()).filter(Boolean)
+        const quiz = f.pquiz?.trim() || undefined
+        if (quiz && !options.includes(quiz)) { toast.error("The correct answer must be one of the options"); return }
+        await api.sendPoll(inst.id, to, {
+          name: f.pq,
+          options,
+          // "Multiple answers" lets a voter pick any of the options; a quiz is single-choice.
+          selectable_count: f.pmulti && !quiz ? options.length : 1,
+          end_time: f.pend ? Math.floor(new Date(f.pend).getTime() / 1000) : undefined,
+          quiz_answer: quiz,
+        })
       } else if (tab === "event") {
         await api.sendEvent(inst.id, to, {
           name: f.ename, description: f.edesc, location: f.eloc,
@@ -823,6 +871,18 @@ function Composer({ inst, to, onSent }: { inst: SessionMeta; to: string; onSent:
         <Fields onSend={send} busy={busy}>
           <Input className="text-xs" placeholder="question" onChange={(e) => set("pq", e.target.value)} />
           <Textarea className="text-xs" placeholder="options (one per line)" onChange={(e) => set("popts", e.target.value)} />
+          <label className="flex flex-col gap-1 text-[10px] text-muted-foreground">
+            Ends at (optional)
+            <Input className="text-xs" type="datetime-local" onChange={(e) => set("pend", e.target.value)} />
+          </label>
+          <label className="flex flex-col gap-1 text-[10px] text-muted-foreground">
+            Quiz: correct answer (optional)
+            <Input className="text-xs" placeholder="one of the options" onChange={(e) => set("pquiz", e.target.value)} />
+          </label>
+          <label className="col-span-2 flex items-center gap-2 text-xs text-muted-foreground">
+            <Checkbox checked={!!f.pmulti && !f.pquiz} disabled={!!f.pquiz} onCheckedChange={(c) => set("pmulti", c === true ? "1" : "")} />
+            Allow multiple answers
+          </label>
         </Fields>
       )}
       {tab === "event" && (

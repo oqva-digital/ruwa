@@ -58,21 +58,62 @@ const cloudCredsShape = {
   graph_version: z.string().optional().describe("Graph API version, default v25.0"),
 }
 
+// Kapso-provider create fields (used instead of the Meta credentials above when
+// provider='kapso'): the customer connects their own number via a hosted link.
+const kapsoCreateShape = {
+  connection_type: z.enum(["dedicated", "coexistence"]).optional().describe("kapso: 'dedicated' (number used only for the API) or 'coexistence' (keep using the number in the WhatsApp app). Default 'dedicated'."),
+  country_isos: z.array(z.string()).optional().describe("kapso: ISO-3166 alpha-2 country codes to offer in embedded-signup, e.g. [\"BR\",\"US\"]"),
+  language: z.string().optional().describe("kapso: setup-flow UI language — one of en/es/pt/hi/id/ar"),
+  provision_phone_number: z.boolean().optional().describe("kapso: let Kapso provision a phone number for the customer (default true)"),
+  success_redirect_url: z.string().optional().describe("kapso: where to send the customer after a successful connect"),
+  failure_redirect_url: z.string().optional().describe("kapso: where to send the customer after a failed connect"),
+}
+
 server.tool(
   "create_session",
-  "Create a new WhatsApp session (instance). Returns its id. kind='web' (default): a WhatsApp Web linked device — pair it with get_qr (scan a QR) or pair_phone (enter an 8-char code) in WhatsApp → Linked devices. kind='cloud': a Meta WhatsApp Cloud API number — no QR/pairing; pass the credentials in `cloud` (phone_number_id + access_token required, waba_id needed for templates), then call connect_session to validate them. Point the Meta webhook at <ruwa origin>/v1/cloud/webhook. Cloud sessions can only initiate conversations with approved templates (send_template); free-form sends work only inside the 24h customer-service window after the contact last wrote.",
+  "Create a new WhatsApp session (instance). Returns its id. kind='web' (default): a WhatsApp Web linked device — pair it with get_qr (scan a QR) or pair_phone (enter an 8-char code) in WhatsApp → Linked devices. kind='cloud': an official WhatsApp Business Platform number, selected by `provider`:\n • provider='meta' (default): paste the Meta Cloud API credentials in `cloud` (phone_number_id + access_token required, waba_id needed for templates), then call connect_session to validate them. Point the Meta webhook at <ruwa origin>/v1/cloud/webhook.\n • provider='kapso': ruwa acts as a BSP on the Kapso Business Platform — no Meta credentials. Pass the optional kapso fields (connection_type, country_isos, language, provision_phone_number, success_redirect_url, failure_redirect_url); the response carries cloud.setup_link. Send that link to the customer to complete Meta embedded-signup; a Kapso project-webhook then flips the session from 'pending_onboarding' to 'connected'. Use kapso_setup_link to regenerate the link while still pending.\nCloud sessions can only initiate conversations with approved templates (send_template); free-form sends work only inside the 24h customer-service window after the contact last wrote.",
   {
     label: z.string().optional().describe("human-friendly label for the instance"),
     proxy: z.string().optional().describe("optional egress proxy URL (socks5/socks5h/http)"),
-    kind: z.enum(["web", "cloud"]).optional().describe("session backend: 'web' (linked device, default) or 'cloud' (Meta Cloud API)"),
-    cloud: z.object(cloudCredsShape).optional().describe("Cloud API credentials — required when kind='cloud'"),
+    kind: z.enum(["web", "cloud"]).optional().describe("session backend: 'web' (linked device, default) or 'cloud' (official Cloud API)"),
+    provider: z.enum(["meta", "kapso"]).optional().describe("cloud backend: 'meta' (default — direct Meta credentials) or 'kapso' (Kapso Business Platform, hosted setup link)"),
+    cloud: z.object(cloudCredsShape).optional().describe("Meta Cloud API credentials — used when kind='cloud' and provider!='kapso'"),
+    ...kapsoCreateShape,
   },
-  async ({ label, proxy, kind, cloud }) => {
+  async ({ label, proxy, kind, provider, cloud, ...kapso }) => {
     try {
       const body: Record<string, unknown> = { label, proxy }
       if (kind) body.kind = kind
-      if (cloud) body.cloud = cloud
-      return ok(await call("POST", "/v1/sessions", body))
+      if (provider === "kapso") {
+        body.kind = "cloud"
+        const c: Record<string, unknown> = { provider: "kapso" }
+        for (const [k, v] of Object.entries(kapso)) if (v !== undefined) c[k] = v
+        body.cloud = c
+      } else if (cloud) {
+        body.cloud = cloud
+      }
+      const res = (await call("POST", "/v1/sessions", body)) as { cloud?: { provider?: string; setup_link?: string } }
+      if (res?.cloud?.provider === "kapso" && res.cloud.setup_link) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Send this setup link to the customer: ${res.cloud.setup_link}\n\n${JSON.stringify(res, null, 2)}`,
+          }],
+        }
+      }
+      return ok(res)
+    } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
+  "kapso_setup_link",
+  "Regenerate the Kapso onboarding setup link for a cloud session that is still 'pending_onboarding' (provider='kapso' only). Returns the new setup_link to hand to the customer. 409 once the session is connected; 501 for a Meta-provider or web session.",
+  { session: z.string().describe("session id") },
+  async ({ session }) => {
+    try {
+      const r = (await call("POST", `/v1/sessions/${enc(session)}/cloud/setup-link`)) as { setup_link?: string }
+      return ok(r?.setup_link ? { setup_link: r.setup_link, note: `Send this link to the customer: ${r.setup_link}` } : r)
     } catch (e) { return err(e) }
   },
 )
@@ -187,6 +228,30 @@ server.tool(
   { session_id: z.string() },
   async ({ session_id }) => {
     try { return ok(await call("GET", `/v1/sessions/${enc(session_id)}/health`)) } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
+  "list_calls",
+  "List the WhatsApp voice calls currently ringing on a session (call_id, from, is_video, audio_rates); empty when none. Web sessions only. Note: answering/placing a call streams live 16 kHz PCM audio over a WebSocket (…/calls/:id/audio and …/calls/dial) — that runs outside MCP; this tool is the control plane (see who's calling, then reject or answer via the WS). See docs/CALLS.md.",
+  { session_id: z.string() },
+  async ({ session_id }) => {
+    try { return ok(await call("GET", `/v1/sessions/${enc(session_id)}/calls`)) } catch (e) { return err(e) }
+  },
+)
+
+server.tool(
+  "reject_call",
+  "Decline a ringing WhatsApp voice call. call_id comes from a call_offer event or list_calls; peer is the caller's JID (or bare digits). Web sessions only.",
+  {
+    session_id: z.string(),
+    call_id: z.string(),
+    peer: z.string().describe("caller JID or bare phone digits (from the call_offer event)"),
+  },
+  async ({ session_id, call_id, peer }) => {
+    try {
+      return ok(await call("POST", `/v1/sessions/${enc(session_id)}/calls/${enc(call_id)}/reject`, { peer }))
+    } catch (e) { return err(e) }
   },
 )
 

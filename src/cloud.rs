@@ -25,6 +25,46 @@ pub const DEFAULT_GRAPH_VERSION: &str = "v25.0";
 /// Graph API host. Every Cloud API call is `{GRAPH_BASE}/{version}/{path}`.
 pub const GRAPH_BASE: &str = "https://graph.facebook.com";
 
+/// Kapso's Meta-compatible proxy host. Kapso mirrors the Graph surface 1:1 at
+/// `{KAPSO_WA_BASE}/{version}/{path}` (same paths, same request/response bodies),
+/// so the whole [`CloudClient`] send/upload/template code path is shared — only
+/// the base host and the auth header differ (see [`CloudClient::api_base`] /
+/// [`CloudClient::auth`]).
+pub const KAPSO_WA_BASE: &str = "https://api.kapso.ai/meta/whatsapp";
+
+/// Which upstream a cloud session talks to. `Meta` = Graph directly (bearer
+/// token). `Kapso` = Kapso's Meta-compatible proxy (platform `X-API-Key`),
+/// used when the number was onboarded through the Kapso Business Platform.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CloudProvider {
+    #[default]
+    Meta,
+    Kapso,
+}
+
+impl CloudProvider {
+    /// Parse the persisted `sessions.cloud_provider` column; anything
+    /// unrecognized (including the empty string / NULL) is `Meta`.
+    // `parse` / `as_str` land with the store column that feeds them (WP-D).
+    #[allow(dead_code)]
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "kapso" => CloudProvider::Kapso,
+            _ => CloudProvider::Meta,
+        }
+    }
+
+    /// Value for the `sessions.cloud_provider` column.
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloudProvider::Meta => "meta",
+            CloudProvider::Kapso => "kapso",
+        }
+    }
+}
+
 /// Total timeout for the small JSON Graph calls (send, validate, templates,
 /// media metadata) — and the connect timeout for every call.
 const GRAPH_TIMEOUT_SECS: u64 = 30;
@@ -47,17 +87,30 @@ const USER_AGENT: &str = concat!("ruwa/", env!("CARGO_PKG_VERSION"));
 /// store layer and must never be serialized into an API response.
 #[derive(Clone, Debug)]
 pub struct CloudCreds {
+    /// Upstream this session talks to (`meta` direct, or `kapso` proxy).
+    pub provider: CloudProvider,
     /// Graph node id of the business phone number (`/{phone_number_id}/messages`).
     pub phone_number_id: String,
     /// WhatsApp Business Account id; required for template management only.
     pub waba_id: Option<String>,
     /// System-user (or business) access token, sent as `Authorization: Bearer`.
+    /// Empty for `provider = kapso` (Kapso holds the Meta token; ruwa
+    /// authenticates with the platform key in `api_key`).
     pub access_token: String,
+    /// Kapso platform `X-API-Key` — server-wide (`RUWA_KAPSO_API_KEY`), injected
+    /// when the client is built. Only read for `provider = kapso`.
+    pub api_key: Option<String>,
+    /// Override for the upstream base host. `None` → the provider default
+    /// ([`GRAPH_BASE`] / [`KAPSO_WA_BASE`]).
+    pub base_url: Option<String>,
     /// Meta app secret used to verify `X-Hub-Signature-256` on inbound webhooks.
+    /// Unused for `provider = kapso` (Kapso signs with a per-number secret; see
+    /// [`verify_kapso_signature`]).
     pub app_secret: Option<String>,
-    /// Token echoed by Meta on the webhook `GET` verification handshake.
+    /// Token echoed on the webhook `GET` verification handshake.
     pub verify_token: Option<String>,
-    /// Graph API version (`v25.0`), see [`DEFAULT_GRAPH_VERSION`].
+    /// Graph API version (`v25.0`), see [`DEFAULT_GRAPH_VERSION`]. Kapso pins its
+    /// own supported version in the proxy path (e.g. `v24.0`).
     pub graph_version: String,
 }
 
@@ -146,14 +199,39 @@ impl CloudClient {
         &self.creds.phone_number_id
     }
 
-    /// Absolute Graph URL for `path` (no leading slash), e.g. `graph_url("123/messages")`.
+    /// Upstream base host for this session — the provider default unless the
+    /// session pins an override in `base_url`. No trailing slash.
+    pub fn api_base(&self) -> &str {
+        if let Some(b) = self.creds.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            return b.trim_end_matches('/');
+        }
+        match self.creds.provider {
+            CloudProvider::Meta => GRAPH_BASE,
+            CloudProvider::Kapso => KAPSO_WA_BASE,
+        }
+    }
+
+    /// Absolute upstream URL for `path` (no leading slash), e.g.
+    /// `graph_url("123/messages")`. Structure is identical for Meta and Kapso
+    /// (`{base}/{version}/{path}`).
     pub fn graph_url(&self, path: &str) -> String {
         let version = if self.creds.graph_version.trim().is_empty() {
             DEFAULT_GRAPH_VERSION
         } else {
             self.creds.graph_version.trim()
         };
-        format!("{GRAPH_BASE}/{version}/{path}")
+        format!("{}/{version}/{path}", self.api_base())
+    }
+
+    /// Attach the provider's auth to a request: `Authorization: Bearer <token>`
+    /// for Meta, `X-API-Key: <platform key>` for Kapso.
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.creds.provider {
+            CloudProvider::Meta => req.bearer_auth(&self.creds.access_token),
+            CloudProvider::Kapso => {
+                req.header("X-API-Key", self.creds.api_key.as_deref().unwrap_or_default())
+            }
+        }
     }
 
     fn waba_id(&self) -> Result<&str> {
@@ -170,8 +248,8 @@ impl CloudClient {
     /// Execute a prepared request, mapping transport failures and non-2xx
     /// Graph error envelopes; returns the parsed JSON body.
     async fn exec_json(&self, req: reqwest::RequestBuilder) -> Result<Value> {
-        let resp = req
-            .bearer_auth(&self.creds.access_token)
+        let resp = self
+            .auth(req)
             .send()
             .await
             .map_err(|e| Error::Internal(anyhow!("cloud: graph request failed: {e}")))?;
@@ -280,9 +358,17 @@ impl CloudClient {
                     .query(&[("phone_number_id", self.creds.phone_number_id.as_str())]),
             )
             .await?;
-        let dl = str_of(&v, "url").ok_or_else(|| {
-            Error::NotFound(format!("cloud: media {media_id} has no download url"))
-        })?;
+        // Kapso returns both Meta's `url` (which still expects a Meta bearer
+        // token) and its own short-lived `download_url`. Prefer the latter:
+        // its credential is embedded in the URL and a Kapso session has no
+        // Meta bearer token to use against the former.
+        let dl = (self.creds.provider == CloudProvider::Kapso)
+            .then(|| str_of(&v, "download_url"))
+            .flatten()
+            .or_else(|| str_of(&v, "url"))
+            .ok_or_else(|| {
+                Error::NotFound(format!("cloud: media {media_id} has no download url"))
+            })?;
         Ok(MediaInfo {
             url: dl,
             mime_type: str_of(&v, "mime_type"),
@@ -291,22 +377,58 @@ impl CloudClient {
         })
     }
 
+    /// Is `url` a host we may send this session's credentials to when fetching
+    /// media? Meta sessions: Meta-operated hosts only ([`is_meta_media_url`]).
+    /// Kapso sessions: also the Kapso API host / `*.kapso.ai` (Kapso re-hosts
+    /// inbound media and hands back a ready `media_url`).
+    fn media_url_allowed(&self, url: &str) -> bool {
+        if is_meta_media_url(url) {
+            return true;
+        }
+        if self.creds.provider != CloudProvider::Kapso {
+            return false;
+        }
+        let Ok(u) = reqwest::Url::parse(url) else {
+            return false;
+        };
+        if u.scheme() != "https" {
+            return false;
+        }
+        let Some(host) = u.host_str().map(|h| h.to_ascii_lowercase()) else {
+            return false;
+        };
+        let base_host = reqwest::Url::parse(self.api_base())
+            .ok()
+            .and_then(|b| b.host_str().map(|h| h.to_ascii_lowercase()));
+        host == "kapso.ai"
+            || host.ends_with(".kapso.ai")
+            || base_host.as_deref() == Some(host.as_str())
+    }
+
     /// Download media bytes from a URL obtained via [`CloudClient::media_info`]
-    /// (or the `url` carried in a webhook). The bearer token is mandatory, so
-    /// the URL must point at a Meta-operated host ([`is_meta_media_url`]) —
-    /// the token is never sent anywhere else.
+    /// (or the `url` carried in a webhook). The auth header is mandatory, so the
+    /// URL must point at a host [`media_url_allowed`](Self::media_url_allowed)
+    /// accepts — the credential is never sent anywhere else.
     pub async fn download(&self, url: &str) -> Result<Vec<u8>> {
-        if !is_meta_media_url(url) {
+        if !self.media_url_allowed(url) {
             return Err(Error::BadRequest(format!(
-                "cloud: refusing to download media from a non-Meta url ({})",
+                "cloud: refusing to download media from an untrusted url ({})",
                 url_host(url).unwrap_or_default()
             )));
         }
-        let resp = self
+        // Kapso's `download_url` carries a short-lived credential in its
+        // query string. Sending the project API key too is unnecessary and
+        // some Kapso media endpoints reject that mixed authentication.
+        let req = self
             .http
             .get(url)
-            .timeout(Duration::from_secs(MEDIA_TIMEOUT_SECS))
-            .bearer_auth(&self.creds.access_token)
+            .timeout(Duration::from_secs(MEDIA_TIMEOUT_SECS));
+        let req = if self.creds.provider == CloudProvider::Kapso && is_kapso_signed_media_url(url) {
+            req
+        } else {
+            self.auth(req)
+        };
+        let resp = req
             .send()
             .await
             .map_err(|e| Error::Internal(anyhow!("cloud: media download failed: {e}")))?;
@@ -1169,6 +1291,20 @@ fn url_host(url: &str) -> Option<String> {
         .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
 }
 
+/// Kapso's short-lived `download_url` embeds its authorization as a `token`
+/// query parameter. It must be fetched as-is, without adding `X-API-Key`.
+fn is_kapso_signed_media_url(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = u.host_str().map(|h| h.to_ascii_lowercase()) else {
+        return false;
+    };
+    (host == "kapso.ai" || host.ends_with(".kapso.ai"))
+        && u.query_pairs()
+            .any(|(key, value)| key == "token" && !value.is_empty())
+}
+
 /// Whether a media download URL points at a Meta-operated host over HTTPS —
 /// the only places the session's bearer token may be sent. Meta serves
 /// media from `lookaside.fbsbx.com`, `mmg.whatsapp.net`, `*.fbcdn.net` and
@@ -1249,6 +1385,18 @@ fn u64_of(v: &Value) -> Option<u64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
+/// Seconds in the WhatsApp customer-service window.
+pub(crate) const CS_WINDOW_SECS: i64 = 24 * 3600;
+
+/// `v[key]` as an RFC-3339 timestamp → unix seconds (e.g. Kapso's
+/// `"2025-10-28T17:25:01.000000Z"`).
+fn rfc3339_secs(v: &Value, key: &str) -> Option<i64> {
+    let s = v.get(key).and_then(Value::as_str)?.trim();
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
 // ---------------------------------------------------------------------------
 // Webhook parsing
 // ---------------------------------------------------------------------------
@@ -1263,6 +1411,15 @@ pub struct WebhookBatch {
     pub statuses: Vec<StatusUpdate>,
     /// `value.errors[]` (account / system level), passed through verbatim.
     pub errors: Vec<Value>,
+    /// Unix seconds when this conversation's 24 h customer-service window
+    /// closes, when the provider reports it: Meta's
+    /// `statuses[].conversation.expiration_timestamp`, or Kapso's
+    /// `conversation.kapso.last_inbound_at + 24 h`. `None` = not in this batch —
+    /// callers fall back to (latest inbound message timestamp + 24 h).
+    pub window_expires_at: Option<i64>,
+    /// Kapso only: business-originated messages echoed on an outbound webhook
+    /// that ruwa did not send itself. The Meta parser never populates this.
+    pub outbound: Vec<OutboundEcho>,
 }
 
 /// A user → business message from `value.messages[]`.
@@ -1350,6 +1507,23 @@ pub struct StatusUpdate {
     pub error: Option<String>,
 }
 
+/// A business → user message echoed back on a Kapso `whatsapp.message.sent`
+/// webhook (`message.kapso.direction == "outbound"`). Covers sends ruwa did
+/// NOT originate: typed in the WhatsApp Business App (`origin: business_app`)
+/// or dispatched by another system against the same number.
+#[derive(Debug, Clone)]
+pub struct OutboundEcho {
+    /// Meta's `wamid.…` — correlates with `statuses[]` in the same batch and
+    /// with later standalone `whatsapp.message.{delivered,read}` webhooks.
+    pub wamid: String,
+    /// Recipient phone digits (`message.to`).
+    pub to: String,
+    pub timestamp: i64,
+    pub kind: InboundKind,
+    /// Raw `message` object, kept for `InboundKind::Unknown` passthrough.
+    pub raw: Value,
+}
+
 /// Parse a raw Meta webhook POST body into normalized batches — one per
 /// `entry[].changes[]` whose `field == "messages"`. Unknown fields are
 /// ignored; other change fields (`message_template_status_update`, …) are
@@ -1399,11 +1573,17 @@ pub fn parse_webhook(raw: &[u8]) -> Result<Vec<WebhookBatch>> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let statuses = value
-                .get("statuses")
-                .and_then(Value::as_array)
+            let status_arr = value.get("statuses").and_then(Value::as_array);
+            let statuses = status_arr
                 .map(|a| a.iter().filter_map(parse_status).collect())
                 .unwrap_or_default();
+            // Meta reports the window close on status webhooks
+            // (`statuses[].conversation.expiration_timestamp`, unix seconds).
+            let window_expires_at = status_arr
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.get("conversation").and_then(|c| i64_of(c.get("expiration_timestamp")?)))
+                .max();
             let errors = value
                 .get("errors")
                 .and_then(Value::as_array)
@@ -1415,6 +1595,8 @@ pub fn parse_webhook(raw: &[u8]) -> Result<Vec<WebhookBatch>> {
                 messages,
                 statuses,
                 errors,
+                window_expires_at,
+                outbound: Vec::new(),
             });
         }
     }
@@ -1546,6 +1728,30 @@ fn parse_inbound_kind(m: &Value, type_name: &str) -> InboundKind {
     }
 }
 
+/// Overlay Kapso's ready media URL + file metadata (carried on `message.kapso`,
+/// not the type sub-object) onto a freshly parsed `InboundKind::Media`.
+fn overlay_kapso_media(kind: &mut InboundKind, kapso: Option<&Value>) {
+    let InboundKind::Media { url, mime, filename, .. } = kind else {
+        return;
+    };
+    if url.is_none() {
+        *url = kapso
+            .and_then(|k| str_of(k, "download_url"))
+            .or_else(|| kapso.and_then(|k| str_of(k, "media_url")));
+    }
+    if let Some(md) = kapso.and_then(|k| k.get("media_data")) {
+        if url.is_none() {
+            *url = str_of(md, "download_url").or_else(|| str_of(md, "url"));
+        }
+        if mime.is_none() {
+            *mime = str_of(md, "content_type");
+        }
+        if filename.is_none() {
+            *filename = str_of(md, "filename");
+        }
+    }
+}
+
 fn parse_inbound_message(m: &Value, contacts: &[&Value]) -> Option<InboundMessage> {
     let wamid = str_of(m, "id").filter(|s| !s.is_empty())?;
     let from_raw = str_of(m, "from").filter(|s| !s.trim().is_empty());
@@ -1652,6 +1858,178 @@ fn parse_status(s: &Value) -> Option<StatusUpdate> {
 }
 
 // ---------------------------------------------------------------------------
+// Kapso webhook parsing (native envelope)
+// ---------------------------------------------------------------------------
+// `verify_kapso_signature` / `parse_kapso_webhook` are wired into the HTTP
+// layer by WP-F (`POST /v1/cloud/kapso/webhook`).
+
+/// Verify Kapso's `X-Webhook-Signature` header (hex HMAC-SHA256 of the RAW
+/// request body under the per-number `secret_key`; constant-time). Accepts the
+/// bare hex or a `sha256=` prefix. `false` on a missing / malformed header.
+pub fn verify_kapso_signature(secret: &str, raw_body: &[u8], header_value: Option<&str>) -> bool {
+    let Some(header) = header_value.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let hex_sig = header
+        .strip_prefix("sha256=")
+        .or_else(|| header.strip_prefix("SHA256="))
+        .unwrap_or(header)
+        .trim();
+    let Ok(sig) = hex::decode(hex_sig) else {
+        return false;
+    };
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key length");
+    mac.update(raw_body);
+    mac.verify_slice(&sig).is_ok()
+}
+
+/// Parse a Kapso native message webhook body (`whatsapp.message.received` and the
+/// `whatsapp.message.{sent,delivered,read,failed}` status events) into the same
+/// normalized [`WebhookBatch`] vec the Meta parser produces — so `cloud_ingest`
+/// is shared. Handles the buffered `{ "batch": true, "data": [ … ] }` envelope
+/// and a single top-level item alike. Returns `BadRequest` only when the body is
+/// not JSON; anything unrecognized yields an empty vec.
+pub fn parse_kapso_webhook(raw: &[u8]) -> Result<Vec<WebhookBatch>> {
+    let root: Value = serde_json::from_slice(raw)
+        .map_err(|e| Error::BadRequest(format!("kapso webhook: invalid json: {e}")))?;
+    let items: Vec<&Value> = if root.get("batch").and_then(Value::as_bool) == Some(true) {
+        root.get("data")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().collect())
+            .unwrap_or_default()
+    } else if root.get("message").is_some() {
+        vec![&root]
+    } else {
+        tracing::debug!("kapso webhook: body has neither `message` nor a `data` batch");
+        Vec::new()
+    };
+    Ok(items.into_iter().filter_map(kapso_item_to_batch).collect())
+}
+
+/// One `{ message, conversation, is_new_conversation, phone_number_id }` item →
+/// a single-element `WebhookBatch` (inbound message OR that message's status
+/// updates, keyed by `phone_number_id`).
+fn kapso_item_to_batch(item: &Value) -> Option<WebhookBatch> {
+    let msg = item.get("message")?;
+    let convo = item.get("conversation");
+    let pnid = str_of(item, "phone_number_id")
+        .or_else(|| convo.and_then(|c| str_of(c, "phone_number_id")))
+        .filter(|s| !s.is_empty())?;
+    let kapso = msg.get("kapso");
+    let direction = kapso
+        .and_then(|k| str_of(k, "direction"))
+        .unwrap_or_default();
+
+    let mut batch = WebhookBatch {
+        phone_number_id: pnid,
+        display_phone_number: convo.and_then(|c| str_of(c, "phone_number")),
+        // Kapso gives `conversation.kapso.last_inbound_at`; the window closes
+        // 24 h after the customer's last inbound.
+        window_expires_at: convo
+            .and_then(|c| c.get("kapso"))
+            .and_then(|k| rfc3339_secs(k, "last_inbound_at"))
+            .map(|t| t + CS_WINDOW_SECS),
+        ..Default::default()
+    };
+
+    if direction == "outbound" {
+        // Status event — `message.kapso.statuses[]` has Meta's exact shape.
+        if let Some(arr) = kapso.and_then(|k| k.get("statuses")).and_then(Value::as_array) {
+            batch.statuses = arr.iter().filter_map(parse_status).collect();
+        }
+        if batch.statuses.is_empty() {
+            // Fall back to the single `message.kapso.status` + top-level ids.
+            if let (Some(st), Some(id)) = (
+                kapso.and_then(|k| str_of(k, "status")),
+                str_of(msg, "id").filter(|s| !s.is_empty()),
+            ) {
+                let mut status = st.to_ascii_lowercase();
+                if status == "played" {
+                    status = "read".into();
+                }
+                batch.statuses.push(StatusUpdate {
+                    wamid: id,
+                    recipient: str_of(msg, "to").map(|r| to_digits(&r)).unwrap_or_default(),
+                    status,
+                    timestamp: msg
+                        .get("timestamp")
+                        .and_then(i64_of)
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                    error: kapso
+                        .and_then(|k| k.get("errors"))
+                        .and_then(Value::as_array)
+                        .and_then(|a| a.first())
+                        .map(format_error_entry),
+                });
+            }
+        }
+        // Also surface the message body when the echo carries content (a
+        // `whatsapp.message.sent` for a Business-App / external send). A bare
+        // status-only echo has no usable `type` — skip those.
+        let type_name = str_of(msg, "type").unwrap_or_default();
+        if let Some(id) = str_of(msg, "id").filter(|s| !s.is_empty()) {
+            if !type_name.is_empty() {
+                let mut kind = parse_inbound_kind(msg, &type_name);
+                overlay_kapso_media(&mut kind, kapso);
+                batch.outbound.push(OutboundEcho {
+                    wamid: id,
+                    to: str_of(msg, "to").map(|t| to_digits(&t)).unwrap_or_default(),
+                    timestamp: msg
+                        .get("timestamp")
+                        .and_then(i64_of)
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                    kind,
+                    raw: msg.clone(),
+                });
+            }
+        }
+        return Some(batch);
+    }
+
+    // Inbound message.
+    let wamid = str_of(msg, "id").filter(|s| !s.is_empty())?;
+    let type_name = str_of(msg, "type").unwrap_or_default();
+    let mut kind = parse_inbound_kind(msg, &type_name);
+    overlay_kapso_media(&mut kind, kapso);
+
+    let from_digits = str_of(msg, "from").map(|f| to_digits(&f)).unwrap_or_default();
+    let from_user_id = str_of(msg, "from_user_id").filter(|s| !s.is_empty());
+    let wa_id = convo
+        .and_then(|c| str_of(c, "phone_number"))
+        .filter(|s| !s.is_empty())
+        .or_else(|| str_of(msg, "from"));
+    let from = if !from_digits.is_empty() {
+        from_digits
+    } else if let Some(w) = wa_id.as_deref().map(to_digits).filter(|s| !s.is_empty()) {
+        w
+    } else {
+        from_user_id.clone().unwrap_or_default()
+    };
+
+    batch.messages.push(InboundMessage {
+        wamid,
+        from,
+        from_user_id,
+        timestamp: msg
+            .get("timestamp")
+            .and_then(i64_of)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        push_name: convo
+            .and_then(|c| str_of(c, "contact_name"))
+            .filter(|s| !s.trim().is_empty()),
+        wa_id,
+        kind,
+        context_id: msg
+            .get("context")
+            .and_then(|c| str_of(c, "id"))
+            .filter(|s| !s.is_empty()),
+        raw: msg.clone(),
+    });
+    Some(batch)
+}
+
+// ---------------------------------------------------------------------------
 // Error mapping
 // ---------------------------------------------------------------------------
 
@@ -1683,7 +2061,11 @@ pub fn map_graph_error(status: u16, body: &[u8]) -> Error {
             403 => Error::Forbidden(text),
             404 => Error::NotFound(text),
             400 => Error::BadRequest(text),
-            429 => Error::Conflict(text),
+            // 402 = Kapso "insufficient credits"; 409 = Kapso "message already
+            // in-flight". Both are account/state conditions the caller can act
+            // on, not ruwa bugs — surface as Conflict, not 500.
+            402 => Error::Conflict(format!("{text} (insufficient Kapso credits)")),
+            409 | 429 => Error::Conflict(text),
             _ => Error::Internal(anyhow!(text)),
         };
     };
@@ -1700,6 +2082,8 @@ pub fn map_graph_error(status: u16, body: &[u8]) -> Error {
     match code {
         190 | 0 => Error::Unauthorized,
         _ if status == 401 => Error::Unauthorized,
+        _ if status == 402 => Error::Conflict(format!("{text} (insufficient Kapso credits)")),
+        _ if status == 409 => Error::Conflict(text),
         3 | 10 | 200 => Error::Forbidden(text),
         131047 => Error::BadRequest(
             "cloud: 131047 outside 24h customer-service window — send a template".into(),
@@ -1717,6 +2101,922 @@ pub fn map_graph_error(status: u16, body: &[u8]) -> Error {
 }
 
 // ---------------------------------------------------------------------------
+// Kapso Business Platform API (onboarding / provisioning)
+// ---------------------------------------------------------------------------
+// `KapsoPlatform` + `parse_kapso_project_event` are wired into the HTTP layer
+// and the embedded-signup callback flow by WP-E / WP-F.
+
+/// Base URL for the Kapso Business Platform API (customers, setup-links,
+/// phone-number + webhook provisioning). Distinct from [`KAPSO_WA_BASE`], which
+/// is the Meta-compatible *send* proxy.
+pub const KAPSO_PLATFORM_BASE: &str = "https://api.kapso.ai/platform/v1";
+
+/// Platform API path for webhook CRUD. Both project-scoped (no `phone_number_id`)
+/// and number-scoped (with `phone_number_id` in the body) webhooks POST here.
+/// Kapso spells its WhatsApp resources `whatsapp/…` (slash + underscore), not
+/// `whatsapp-…` — a hyphen here 404s.
+const KAPSO_WEBHOOKS_PATH: &str = "whatsapp/webhooks";
+
+/// Platform API path for the connected-number collection
+/// (`GET …?customer_id=…`). Same `whatsapp/…` spelling caveat as above.
+const KAPSO_PHONE_NUMBERS_PATH: &str = "whatsapp/phone_numbers";
+
+/// Platform API path for the broadcast (bulk-template campaign) collection.
+/// Same `whatsapp/…` spelling caveat as [`KAPSO_WEBHOOKS_PATH`] — a hyphen 404s.
+const KAPSO_BROADCASTS_PATH: &str = "whatsapp/broadcasts";
+
+/// Default `events` for a per-number webhook (number-scoped `whatsapp/webhooks`).
+const KAPSO_NUMBER_WEBHOOK_EVENTS: [&str; 5] = [
+    "whatsapp.message.received",
+    "whatsapp.message.sent",
+    "whatsapp.message.delivered",
+    "whatsapp.message.read",
+    "whatsapp.message.failed",
+];
+
+/// Default `events` for a project-level webhook (lifecycle of the numbers
+/// onboarded under the Kapso project).
+const KAPSO_PROJECT_WEBHOOK_EVENTS: [&str; 5] = [
+    "whatsapp.phone_number.created",
+    "whatsapp.phone_number.deleted",
+    "whatsapp.phone_number.offboarded",
+    "whatsapp.phone_number.disconnected",
+    "whatsapp.phone_number.reconnected",
+];
+
+/// A customer record in the Kapso platform (`POST /customers`).
+#[derive(Debug, Clone, Serialize)]
+pub struct KapsoCustomer {
+    pub id: String,
+    pub external_customer_id: Option<String>,
+}
+
+/// A hosted embedded-signup setup link (`POST /customers/{id}/setup_links`).
+#[derive(Debug, Clone, Serialize)]
+pub struct KapsoSetupLink {
+    pub id: String,
+    pub url: String,
+    pub status: String,
+    pub whatsapp_setup_status: String,
+    pub whatsapp_setup_error: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// A provisioned WhatsApp business phone number
+/// (`GET /whatsapp/phone_numbers?customer_id=…`).
+#[derive(Debug, Clone, Serialize)]
+pub struct KapsoPhoneNumber {
+    pub id: String,
+    pub internal_id: String,
+    pub phone_number_id: String,
+    /// Meta WABA id the number belongs to — needed for template management.
+    pub business_account_id: Option<String>,
+    pub display_phone_number: Option<String>,
+    pub verified_name: Option<String>,
+    pub quality_rating: Option<String>,
+    pub customer_id: Option<String>,
+    pub status: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Kapso Broadcasts (bulk-template campaigns) — neutral views
+// ---------------------------------------------------------------------------
+
+/// The approved template a broadcast fans out (`broadcast.whatsapp_template`).
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcastTemplateView {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub language_code: Option<String>,
+    pub category: Option<String>,
+    pub status: Option<String>,
+    pub meta_template_id: Option<String>,
+}
+
+/// A broadcast campaign (`POST/GET /whatsapp/broadcasts…`), translated out of
+/// the Kapso `data` envelope. Count fields default to `0`; timestamps pass
+/// through as the verbatim ISO-8601 strings Kapso returns.
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcastView {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    /// draft | scheduled | copying | sending | stopped | completed | failed
+    pub status: Option<String>,
+    pub total_recipients: u64,
+    pub pending_count: u64,
+    pub sent_count: u64,
+    pub delivered_count: u64,
+    pub read_count: u64,
+    pub failed_count: u64,
+    pub suppressed_count: u64,
+    pub responded_count: u64,
+    pub response_rate: Option<f64>,
+    pub phone_number_id: Option<String>,
+    pub scheduled_at: Option<String>,
+    pub started_at: Option<String>,
+    pub stopped_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub template: Option<BroadcastTemplateView>,
+}
+
+/// One recipient of a broadcast (`GET /whatsapp/broadcasts/{id}/recipients`).
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcastRecipientView {
+    pub id: Option<String>,
+    pub phone_number: Option<String>,
+    /// pending | sent | failed | suppressed
+    pub status: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub sent_at: Option<String>,
+    pub failed_at: Option<String>,
+    pub delivered_at: Option<String>,
+    pub read_at: Option<String>,
+    pub responded_at: Option<String>,
+    pub error_message: Option<String>,
+    /// Meta component objects rendered for this recipient — passed through 1:1.
+    pub template_components: Value,
+    /// Provider error envelope, or `null`.
+    pub error_details: Value,
+}
+
+/// A page of broadcasts with Kapso's `meta` pagination flattened in.
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcastList {
+    pub items: Vec<BroadcastView>,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+    pub total_count: u64,
+}
+
+/// A page of broadcast recipients with Kapso's `meta` pagination flattened in.
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcastRecipientList {
+    pub items: Vec<BroadcastRecipientView>,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+    pub total_count: u64,
+}
+
+/// Outcome of `POST /whatsapp/broadcasts/{id}/recipients`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AddRecipientsResult {
+    pub added: u64,
+    pub duplicates: u64,
+    pub errors: Vec<String>,
+}
+
+/// `meta.{page,per_page,total_pages,total_count}` as `u64` (each defaults to 0).
+fn parse_broadcast_meta(v: &Value) -> (u64, u64, u64, u64) {
+    let m = v.get("meta").unwrap_or(&Value::Null);
+    let read = |k: &str| m.get(k).and_then(u64_of).unwrap_or(0);
+    (
+        read("page"),
+        read("per_page"),
+        read("total_pages"),
+        read("total_count"),
+    )
+}
+
+/// Translate a Kapso broadcast object (bare or `{data:{…}}`) into [`BroadcastView`].
+fn parse_broadcast(v: &Value) -> BroadcastView {
+    let d = v.get("data").unwrap_or(v);
+    let count = |k: &str| d.get(k).and_then(u64_of).unwrap_or(0);
+    let template = d.get("whatsapp_template").filter(|t| t.is_object()).map(|t| {
+        BroadcastTemplateView {
+            id: str_of(t, "id"),
+            name: str_of(t, "name"),
+            language_code: str_of(t, "language_code"),
+            category: str_of(t, "category"),
+            status: str_of(t, "status"),
+            meta_template_id: str_of(t, "meta_template_id"),
+        }
+    });
+    BroadcastView {
+        id: str_of(d, "id"),
+        name: str_of(d, "name"),
+        status: str_of(d, "status"),
+        total_recipients: count("total_recipients"),
+        pending_count: count("pending_count"),
+        sent_count: count("sent_count"),
+        delivered_count: count("delivered_count"),
+        read_count: count("read_count"),
+        failed_count: count("failed_count"),
+        suppressed_count: count("suppressed_count"),
+        responded_count: count("responded_count"),
+        response_rate: d.get("response_rate").and_then(f64_of),
+        phone_number_id: str_of(d, "phone_number_id"),
+        scheduled_at: str_of(d, "scheduled_at"),
+        started_at: str_of(d, "started_at"),
+        stopped_at: str_of(d, "stopped_at"),
+        completed_at: str_of(d, "completed_at"),
+        created_at: str_of(d, "created_at"),
+        updated_at: str_of(d, "updated_at"),
+        template,
+    }
+}
+
+/// Translate one Kapso broadcast-recipient object into [`BroadcastRecipientView`].
+fn parse_broadcast_recipient(v: &Value) -> BroadcastRecipientView {
+    let d = v.get("data").unwrap_or(v);
+    BroadcastRecipientView {
+        id: str_of(d, "id"),
+        phone_number: str_of(d, "phone_number"),
+        status: str_of(d, "status"),
+        created_at: str_of(d, "created_at"),
+        updated_at: str_of(d, "updated_at"),
+        sent_at: str_of(d, "sent_at"),
+        failed_at: str_of(d, "failed_at"),
+        delivered_at: str_of(d, "delivered_at"),
+        read_at: str_of(d, "read_at"),
+        responded_at: str_of(d, "responded_at"),
+        error_message: str_of(d, "error_message"),
+        template_components: d
+            .get("template_components")
+            .cloned()
+            .unwrap_or(Value::Null),
+        error_details: d.get("error_details").cloned().unwrap_or(Value::Null),
+    }
+}
+
+/// Options for [`KapsoPlatform::create_setup_link`]. Every optional field is
+/// omitted from the request body when unset / blank.
+#[derive(Debug, Clone, Default)]
+pub struct SetupLinkOpts {
+    pub provision_phone_number: bool,
+    /// `"coexistence"` | `"dedicated"` → `allowed_connection_types: [<it>]`.
+    pub connection_type: Option<String>,
+    /// `"partner_managed"` (default when `None`) | `"customer_managed"`.
+    pub meta_billing_mode: Option<String>,
+    pub success_redirect_url: Option<String>,
+    pub failure_redirect_url: Option<String>,
+    /// ISO-3166-1 alpha-2 codes for `phone_number_country_isos`.
+    pub country_isos: Vec<String>,
+    pub language: Option<String>,
+}
+
+/// Build the `POST /setup-links` request body from [`SetupLinkOpts`], omitting
+/// null / empty optionals. Factored out so the mapping is unit-testable without
+/// a network; `meta_billing_mode` defaults to `"partner_managed"`.
+pub(crate) fn setup_link_body(opts: &SetupLinkOpts) -> Value {
+    let mut m = Map::new();
+    m.insert(
+        "provision_phone_number".into(),
+        json!(opts.provision_phone_number),
+    );
+    if let Some(ct) = opts
+        .connection_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        m.insert("allowed_connection_types".into(), json!([ct]));
+    }
+    let billing = opts
+        .meta_billing_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("partner_managed");
+    m.insert("meta_billing_mode".into(), json!(billing));
+    if let Some(u) = opts
+        .success_redirect_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        m.insert("success_redirect_url".into(), json!(u));
+    }
+    if let Some(u) = opts
+        .failure_redirect_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        m.insert("failure_redirect_url".into(), json!(u));
+    }
+    let isos: Vec<&str> = opts
+        .country_isos
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !isos.is_empty() {
+        m.insert("phone_number_country_isos".into(), json!(isos));
+    }
+    if let Some(l) = opts
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        m.insert("language".into(), json!(l));
+    }
+    json!({ "setup_link": Value::Object(m) })
+}
+
+/// Whether `s` is a plausible Kapso resource id to interpolate into a URL path:
+/// a numeric Graph id, or a non-empty `[A-Za-z0-9_-]` token (UUIDs). Anything
+/// with a slash, space, dot or query char is refused.
+fn is_kapso_id(s: &str) -> bool {
+    is_graph_id(s)
+        || (!s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+}
+
+fn parse_kapso_setup_link(d: &Value) -> Option<KapsoSetupLink> {
+    Some(KapsoSetupLink {
+        id: str_of(d, "id")?,
+        url: str_of(d, "url").unwrap_or_default(),
+        status: str_of(d, "status").unwrap_or_default(),
+        whatsapp_setup_status: str_of(d, "whatsapp_setup_status").unwrap_or_default(),
+        whatsapp_setup_error: str_of(d, "whatsapp_setup_error"),
+        expires_at: str_of(d, "expires_at"),
+    })
+}
+
+fn parse_kapso_phone_number(d: &Value) -> Option<KapsoPhoneNumber> {
+    let internal_id = str_of(d, "internal_id")?;
+    Some(KapsoPhoneNumber {
+        id: str_of(d, "id").unwrap_or_default(),
+        internal_id,
+        phone_number_id: str_of(d, "phone_number_id").unwrap_or_default(),
+        business_account_id: str_of(d, "business_account_id")
+            .or_else(|| str_of(d, "whatsapp_business_account_id")),
+        display_phone_number: str_of(d, "display_phone_number"),
+        verified_name: str_of(d, "verified_name"),
+        quality_rating: str_of(d, "quality_rating"),
+        customer_id: str_of(d, "customer_id"),
+        status: str_of(d, "status"),
+    })
+}
+
+/// A project-level lifecycle webhook event (`whatsapp.phone_number.*`), parsed
+/// from the Kapso `POST` body plus the `X-Webhook-Event` header.
+#[derive(Debug, Clone, Serialize)]
+pub struct KapsoProjectEvent {
+    pub event: String,
+    pub phone_number_id: Option<String>,
+    pub customer_id: Option<String>,
+    pub project_id: Option<String>,
+    pub business_account_id: Option<String>,
+    pub occurred_at: Option<String>,
+}
+
+/// Parse a Kapso project-webhook body. The event name is taken from the
+/// `X-Webhook-Event` header when present, else the body `event` / `type` field.
+/// Pure; `BadRequest` only when the body is not JSON. Wired by WP-F.
+pub fn parse_kapso_project_event(
+    raw: &[u8],
+    event_header: Option<&str>,
+) -> Result<KapsoProjectEvent> {
+    let root: Value = serde_json::from_slice(raw)
+        .map_err(|e| Error::BadRequest(format!("kapso project webhook: invalid json: {e}")))?;
+    let event = event_header
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| str_of(&root, "event"))
+        .or_else(|| str_of(&root, "type"))
+        .unwrap_or_default();
+    Ok(KapsoProjectEvent {
+        event,
+        phone_number_id: str_of(&root, "phone_number_id"),
+        customer_id: root.get("customer").and_then(|c| str_of(c, "id")),
+        project_id: root.get("project").and_then(|p| str_of(p, "id")),
+        business_account_id: root
+            .get("source")
+            .and_then(|s| str_of(s, "business_account_id")),
+        occurred_at: str_of(&root, "occurred_at"),
+    })
+}
+
+/// Thin client for the Kapso Business Platform API (customer + setup-link +
+/// phone-number provisioning). Separate from [`CloudClient`] (which speaks the
+/// Meta-compatible *send* surface): different base host, always `X-API-Key`
+/// auth, JSON-only. Wired by WP-E / WP-F.
+pub struct KapsoPlatform {
+    http: reqwest::Client,
+    api_key: String,
+    base: String,
+}
+
+impl std::fmt::Debug for KapsoPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KapsoPlatform")
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)]
+impl KapsoPlatform {
+    /// Build a client with the same 30 s connect + call timeout and optional
+    /// egress proxy as [`CloudClient::new`]. `base` defaults to
+    /// [`KAPSO_PLATFORM_BASE`]; a trailing slash is trimmed.
+    pub fn new(api_key: impl Into<String>, base: Option<&str>, proxy: Option<&str>) -> Result<Self> {
+        let mut b = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(GRAPH_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(GRAPH_TIMEOUT_SECS))
+            .user_agent(USER_AGENT);
+        if let Some(url) = proxy.map(str::trim).filter(|s| !s.is_empty()) {
+            let p = reqwest::Proxy::all(url).map_err(|e| {
+                Error::BadRequest(format!("kapso platform: invalid proxy url: {e}"))
+            })?;
+            b = b.proxy(p);
+        }
+        let http = b
+            .build()
+            .map_err(|e| Error::Internal(anyhow!("kapso platform: http client: {e}")))?;
+        let base = base
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(KAPSO_PLATFORM_BASE)
+            .trim_end_matches('/')
+            .to_string();
+        Ok(Self {
+            http,
+            api_key: api_key.into(),
+            base,
+        })
+    }
+
+    /// Absolute URL for `path` (leading slash optional): `{base}/{path}`.
+    fn url(&self, path: &str) -> String {
+        format!("{}/{}", self.base, path.trim_start_matches('/'))
+    }
+
+    /// Send a prepared request with `X-API-Key`, mapping transport failures and
+    /// non-2xx bodies via [`map_graph_error`] (Kapso returns the Meta error
+    /// envelope, plus 402/409). Empty body → `Value::Null`.
+    async fn exec_json(&self, req: reqwest::RequestBuilder) -> Result<Value> {
+        let resp = req
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(anyhow!("kapso platform: request failed: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Internal(anyhow!("kapso platform: read failed: {e}")))?;
+        if !status.is_success() {
+            return Err(map_graph_error(status.as_u16(), &body));
+        }
+        if body.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_slice(&body)
+            .map_err(|e| Error::Internal(anyhow!("kapso platform: invalid json: {e}")))
+    }
+
+    /// `POST /customers` — create (or upsert by `external_customer_id`) a customer.
+    pub async fn create_customer(
+        &self,
+        name: &str,
+        external_id: Option<&str>,
+    ) -> Result<KapsoCustomer> {
+        let body = json!({
+            "customer": { "name": name, "external_customer_id": external_id },
+        });
+        let v = self
+            .exec_json(self.http.post(self.url("customers")).json(&body))
+            .await?;
+        let d = v.get("data").unwrap_or(&v);
+        let id = str_of(d, "id").ok_or_else(|| {
+            Error::Internal(anyhow!("kapso platform: create-customer response without data.id"))
+        })?;
+        Ok(KapsoCustomer {
+            id,
+            external_customer_id: str_of(d, "external_customer_id"),
+        })
+    }
+
+    /// `POST /customers/{customer_id}/setup_links` — mint a hosted embedded-signup
+    /// link for `customer_id`.
+    // TODO(kapso-verify): docs show POST /setup-links; customer-scoped path assumed
+    pub async fn create_setup_link(
+        &self,
+        customer_id: &str,
+        opts: SetupLinkOpts,
+    ) -> Result<KapsoSetupLink> {
+        let cid = customer_id.trim();
+        if !is_kapso_id(cid) {
+            return Err(Error::BadRequest(format!(
+                "kapso platform: invalid customer id {cid:?}"
+            )));
+        }
+        let path = format!("customers/{cid}/setup_links");
+        let v = self
+            .exec_json(self.http.post(self.url(&path)).json(&setup_link_body(&opts)))
+            .await?;
+        let d = v.get("data").unwrap_or(&v);
+        parse_kapso_setup_link(d).ok_or_else(|| {
+            Error::Internal(anyhow!("kapso platform: setup-link response without data.id"))
+        })
+    }
+
+    /// `GET /customers/{customer_id}/setup_links` — list a customer's setup links.
+    pub async fn list_setup_links(&self, customer_id: &str) -> Result<Vec<KapsoSetupLink>> {
+        let cid = customer_id.trim();
+        if !is_kapso_id(cid) {
+            return Err(Error::BadRequest(format!(
+                "kapso platform: invalid customer id {cid:?}"
+            )));
+        }
+        let path = format!("customers/{cid}/setup_links");
+        let v = self.exec_json(self.http.get(self.url(&path))).await?;
+        let arr = v
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(arr.iter().filter_map(parse_kapso_setup_link).collect())
+    }
+
+    /// `GET /whatsapp/phone_numbers?customer_id={customer_id}` — the numbers
+    /// provisioned for a customer (used after the onboarding callback to resolve
+    /// `internal_id` + display fields).
+    pub async fn list_customer_phone_numbers(
+        &self,
+        customer_id: &str,
+    ) -> Result<Vec<KapsoPhoneNumber>> {
+        let cid = customer_id.trim();
+        if !is_kapso_id(cid) {
+            return Err(Error::BadRequest(format!(
+                "kapso platform: invalid customer id {cid:?}"
+            )));
+        }
+        let v = self
+            .exec_json(
+                self.http
+                    .get(self.url(KAPSO_PHONE_NUMBERS_PATH))
+                    .query(&[("customer_id", cid)]),
+            )
+            .await?;
+        let arr = v
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(arr.iter().filter_map(parse_kapso_phone_number).collect())
+    }
+
+    /// `POST /whatsapp/webhooks` with `phone_number_id` in the body — register a
+    /// number-scoped `kind: "kapso"` webhook (message + conversation events).
+    /// Keyed by the Meta `phone_number_id` (not the Kapso `internal_id`).
+    /// Returns the webhook id. `events` defaults to the message-lifecycle list.
+    pub async fn register_number_webhook(
+        &self,
+        phone_number_id: &str,
+        url: &str,
+        secret: &str,
+        events: Option<&[&str]>,
+    ) -> Result<String> {
+        let pnid = phone_number_id.trim();
+        if !is_kapso_id(pnid) {
+            return Err(Error::BadRequest(format!(
+                "kapso platform: invalid phone_number_id {pnid:?}"
+            )));
+        }
+        let events: &[&str] = events.unwrap_or(&KAPSO_NUMBER_WEBHOOK_EVENTS);
+        let body = json!({
+            "whatsapp_webhook": {
+                "url": url,
+                "kind": "kapso",
+                "phone_number_id": pnid,
+                "secret_key": secret,
+                "active": true,
+                "events": events,
+            }
+        });
+        let v = self
+            .exec_json(self.http.post(self.url(KAPSO_WEBHOOKS_PATH)).json(&body))
+            .await?;
+        let d = v.get("data").unwrap_or(&v);
+        str_of(d, "id").ok_or_else(|| {
+            Error::Internal(anyhow!("kapso platform: webhook response without data.id"))
+        })
+    }
+
+    /// `POST /whatsapp/webhooks` with no `phone_number_id` — register a
+    /// project-scoped `kind: "kapso"` webhook (number-lifecycle events only).
+    /// Returns the webhook id. `events` defaults to the phone-number-lifecycle list.
+    pub async fn register_project_webhook(
+        &self,
+        url: &str,
+        secret: &str,
+        events: Option<&[&str]>,
+    ) -> Result<String> {
+        let events: &[&str] = events.unwrap_or(&KAPSO_PROJECT_WEBHOOK_EVENTS);
+        let body = json!({
+            "whatsapp_webhook": {
+                "url": url,
+                "kind": "kapso",
+                "secret_key": secret,
+                "active": true,
+                "events": events,
+            }
+        });
+        let v = self
+            .exec_json(self.http.post(self.url(KAPSO_WEBHOOKS_PATH)).json(&body))
+            .await?;
+        let d = v.get("data").unwrap_or(&v);
+        str_of(d, "id").ok_or_else(|| {
+            Error::Internal(anyhow!("kapso platform: webhook response without data.id"))
+        })
+    }
+
+    /// `DELETE /whatsapp/phone_numbers/{phone_number_id}` — offboard a connected
+    /// number (also drops its number-scoped webhooks on the Kapso side). Keyed by
+    /// the Meta `phone_number_id`. A 404 (already gone) is treated as success.
+    pub async fn delete_phone_number(&self, phone_number_id: &str) -> Result<()> {
+        let pnid = phone_number_id.trim();
+        if !is_kapso_id(pnid) {
+            return Err(Error::BadRequest(format!(
+                "kapso platform: invalid phone_number_id {pnid:?}"
+            )));
+        }
+        let path = format!("{KAPSO_PHONE_NUMBERS_PATH}/{pnid}");
+        match self.exec_json(self.http.delete(self.url(&path))).await {
+            Ok(_) | Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `DELETE /customers/{customer_id}` — remove the customer record ruwa
+    /// created for this session (cascades its numbers/setup-links on Kapso).
+    /// A 404 (already gone) is treated as success.
+    pub async fn delete_customer(&self, customer_id: &str) -> Result<()> {
+        let cid = customer_id.trim();
+        if !is_kapso_id(cid) {
+            return Err(Error::BadRequest(format!(
+                "kapso platform: invalid customer id {cid:?}"
+            )));
+        }
+        let path = format!("customers/{cid}");
+        match self.exec_json(self.http.delete(self.url(&path))).await {
+            Ok(_) | Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    // ---- Broadcasts (bulk-template campaigns) ---------------------------------
+
+    /// `POST /whatsapp/broadcasts` — create a draft broadcast for `phone_number_id`
+    /// off the approved template `template_id` (a Meta template id).
+    pub async fn create_broadcast(
+        &self,
+        phone_number_id: &str,
+        name: &str,
+        template_id: &str,
+    ) -> Result<BroadcastView> {
+        let pnid = phone_number_id.trim();
+        if !is_graph_id(pnid) {
+            return Err(Error::BadRequest(format!(
+                "kapso platform: invalid phone_number_id {pnid:?}"
+            )));
+        }
+        let name = name.trim();
+        let template_id = template_id.trim();
+        if name.is_empty() {
+            return Err(Error::BadRequest("broadcast name is required".into()));
+        }
+        if template_id.is_empty() {
+            return Err(Error::BadRequest("broadcast template_id is required".into()));
+        }
+        let body = json!({
+            "whatsapp_broadcast": {
+                "name": name,
+                "phone_number_id": pnid,
+                "whatsapp_template_id": template_id,
+            }
+        });
+        let v = self
+            .exec_json(self.http.post(self.url(KAPSO_BROADCASTS_PATH)).json(&body))
+            .await?;
+        Ok(parse_broadcast(&v))
+    }
+
+    /// `GET /whatsapp/broadcasts` — list broadcasts for `phone_number_id`,
+    /// optionally filtered by `status` and paginated.
+    pub async fn list_broadcasts(
+        &self,
+        phone_number_id: &str,
+        status: Option<&str>,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<BroadcastList> {
+        let pnid = phone_number_id.trim();
+        if !is_graph_id(pnid) {
+            return Err(Error::BadRequest(format!(
+                "kapso platform: invalid phone_number_id {pnid:?}"
+            )));
+        }
+        let mut q: Vec<(&str, String)> = vec![("phone_number_id", pnid.to_string())];
+        if let Some(s) = status.map(str::trim).filter(|s| !s.is_empty()) {
+            q.push(("status", s.to_string()));
+        }
+        if let Some(p) = page {
+            q.push(("page", p.to_string()));
+        }
+        if let Some(pp) = per_page {
+            q.push(("per_page", pp.to_string()));
+        }
+        let v = self
+            .exec_json(self.http.get(self.url(KAPSO_BROADCASTS_PATH)).query(&q))
+            .await?;
+        let items = v
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(parse_broadcast).collect())
+            .unwrap_or_default();
+        let (page, per_page, total_pages, total_count) = parse_broadcast_meta(&v);
+        Ok(BroadcastList {
+            items,
+            page,
+            per_page,
+            total_pages,
+            total_count,
+        })
+    }
+
+    /// `GET /whatsapp/broadcasts/{bid}`.
+    pub async fn get_broadcast(&self, bid: &str) -> Result<BroadcastView> {
+        let bid = self.broadcast_id(bid)?;
+        let v = self
+            .exec_json(
+                self.http
+                    .get(self.url(&format!("{KAPSO_BROADCASTS_PATH}/{bid}"))),
+            )
+            .await?;
+        Ok(parse_broadcast(&v))
+    }
+
+    /// `POST /whatsapp/broadcasts/{bid}/recipients` — `recipients` is the caller's
+    /// already-validated JSON array of `{phone_number|whatsapp_contact_id,
+    /// components:[…]}` objects (≤1000), enveloped here as
+    /// `{whatsapp_broadcast:{recipients:[…]}}`.
+    pub async fn add_broadcast_recipients(
+        &self,
+        bid: &str,
+        recipients: Value,
+    ) -> Result<AddRecipientsResult> {
+        let bid = self.broadcast_id(bid)?;
+        let body = json!({ "whatsapp_broadcast": { "recipients": recipients } });
+        let v = self
+            .exec_json(
+                self.http
+                    .post(self.url(&format!("{KAPSO_BROADCASTS_PATH}/{bid}/recipients")))
+                    .json(&body),
+            )
+            .await?;
+        let d = v.get("data").unwrap_or(&v);
+        Ok(AddRecipientsResult {
+            added: d.get("added").and_then(u64_of).unwrap_or(0),
+            duplicates: d.get("duplicates").and_then(u64_of).unwrap_or(0),
+            errors: d
+                .get("errors")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|e| e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
+
+    /// `DELETE /whatsapp/broadcasts/{bid}/recipients` — clear the recipient list
+    /// (a scheduled broadcast returns to `draft`).
+    pub async fn clear_broadcast_recipients(&self, bid: &str) -> Result<BroadcastView> {
+        let bid = self.broadcast_id(bid)?;
+        let v = self
+            .exec_json(
+                self.http
+                    .delete(self.url(&format!("{KAPSO_BROADCASTS_PATH}/{bid}/recipients"))),
+            )
+            .await?;
+        Ok(parse_broadcast(&v))
+    }
+
+    /// `GET /whatsapp/broadcasts/{bid}/recipients` — per-recipient status, paginated.
+    pub async fn list_broadcast_recipients(
+        &self,
+        bid: &str,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<BroadcastRecipientList> {
+        let bid = self.broadcast_id(bid)?;
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(p) = page {
+            q.push(("page", p.to_string()));
+        }
+        if let Some(pp) = per_page {
+            q.push(("per_page", pp.to_string()));
+        }
+        let v = self
+            .exec_json(
+                self.http
+                    .get(self.url(&format!("{KAPSO_BROADCASTS_PATH}/{bid}/recipients")))
+                    .query(&q),
+            )
+            .await?;
+        let items = v
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(parse_broadcast_recipient).collect())
+            .unwrap_or_default();
+        let (page, per_page, total_pages, total_count) = parse_broadcast_meta(&v);
+        Ok(BroadcastRecipientList {
+            items,
+            page,
+            per_page,
+            total_pages,
+            total_count,
+        })
+    }
+
+    /// `POST /whatsapp/broadcasts/{bid}/send` — start sending now (Kapso 202).
+    pub async fn send_broadcast(&self, bid: &str) -> Result<BroadcastView> {
+        let bid = self.broadcast_id(bid)?;
+        let v = self
+            .exec_json(
+                self.http
+                    .post(self.url(&format!("{KAPSO_BROADCASTS_PATH}/{bid}/send"))),
+            )
+            .await?;
+        Ok(parse_broadcast(&v))
+    }
+
+    /// `POST /whatsapp/broadcasts/{bid}/schedule` — schedule for a future
+    /// ISO-8601 `scheduled_at` (Kapso 202).
+    pub async fn schedule_broadcast(
+        &self,
+        bid: &str,
+        scheduled_at: &str,
+    ) -> Result<BroadcastView> {
+        let bid = self.broadcast_id(bid)?;
+        let scheduled_at = scheduled_at.trim();
+        if scheduled_at.is_empty() {
+            return Err(Error::BadRequest("scheduled_at is required".into()));
+        }
+        let body = json!({ "scheduled_at": scheduled_at });
+        let v = self
+            .exec_json(
+                self.http
+                    .post(self.url(&format!("{KAPSO_BROADCASTS_PATH}/{bid}/schedule")))
+                    .json(&body),
+            )
+            .await?;
+        Ok(parse_broadcast(&v))
+    }
+
+    /// `POST /whatsapp/broadcasts/{bid}/cancel` — cancel a schedule (→ `draft`).
+    pub async fn cancel_broadcast(&self, bid: &str) -> Result<BroadcastView> {
+        let bid = self.broadcast_id(bid)?;
+        let v = self
+            .exec_json(
+                self.http
+                    .post(self.url(&format!("{KAPSO_BROADCASTS_PATH}/{bid}/cancel"))),
+            )
+            .await?;
+        Ok(parse_broadcast(&v))
+    }
+
+    /// `PATCH /whatsapp/broadcasts/{bid}` `{whatsapp_broadcast:{status:"stopped"}}`
+    /// — halt a sending broadcast.
+    pub async fn stop_broadcast(&self, bid: &str) -> Result<BroadcastView> {
+        let bid = self.broadcast_id(bid)?;
+        let body = json!({ "whatsapp_broadcast": { "status": "stopped" } });
+        let v = self
+            .exec_json(
+                self.http
+                    .patch(self.url(&format!("{KAPSO_BROADCASTS_PATH}/{bid}")))
+                    .json(&body),
+            )
+            .await?;
+        Ok(parse_broadcast(&v))
+    }
+
+    /// Validate a broadcast id for path interpolation.
+    fn broadcast_id<'a>(&self, bid: &'a str) -> Result<&'a str> {
+        let bid = bid.trim();
+        if !is_kapso_id(bid) {
+            return Err(Error::BadRequest(format!(
+                "kapso platform: invalid broadcast id {bid:?}"
+            )));
+        }
+        Ok(bid)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1726,12 +3026,29 @@ mod tests {
 
     fn creds() -> CloudCreds {
         CloudCreds {
+            provider: CloudProvider::Meta,
             phone_number_id: "106540352242922".into(),
             waba_id: Some("102290129340398".into()),
             access_token: "EAAG-fake-token".into(),
+            api_key: None,
+            base_url: None,
             app_secret: Some("fake-app-secret".into()),
             verify_token: Some("my-verify".into()),
             graph_version: DEFAULT_GRAPH_VERSION.into(),
+        }
+    }
+
+    fn kapso_creds() -> CloudCreds {
+        CloudCreds {
+            provider: CloudProvider::Kapso,
+            phone_number_id: "106540352242922".into(),
+            waba_id: None,
+            access_token: String::new(),
+            api_key: Some("kapso-platform-key".into()),
+            base_url: None,
+            app_secret: None,
+            verify_token: None,
+            graph_version: "v24.0".into(),
         }
     }
 
@@ -1784,6 +3101,272 @@ mod tests {
         assert!(!is_graph_version("v25"));
         assert!(!is_graph_version("v25.0/../x"));
         assert!(!is_graph_version(""));
+    }
+
+    #[test]
+    fn provider_api_base_and_graph_url() {
+        // Meta: unchanged — Graph host, pinned version.
+        let m = CloudClient::new(creds(), None).unwrap();
+        assert_eq!(m.api_base(), GRAPH_BASE);
+        assert_eq!(
+            m.graph_url("106540352242922/messages"),
+            "https://graph.facebook.com/v25.0/106540352242922/messages"
+        );
+        // Kapso: proxy host, its own version, identical path structure.
+        let k = CloudClient::new(kapso_creds(), None).unwrap();
+        assert_eq!(k.api_base(), KAPSO_WA_BASE);
+        assert_eq!(
+            k.graph_url("106540352242922/messages"),
+            "https://api.kapso.ai/meta/whatsapp/v24.0/106540352242922/messages"
+        );
+        // Per-session base_url override wins for either provider (trailing slash trimmed).
+        let mut c = kapso_creds();
+        c.base_url = Some("https://proxy.example.test/wa/".into());
+        let o = CloudClient::new(c, None).unwrap();
+        assert_eq!(o.api_base(), "https://proxy.example.test/wa");
+        assert_eq!(
+            o.graph_url("1/messages"),
+            "https://proxy.example.test/wa/v24.0/1/messages"
+        );
+    }
+
+    #[test]
+    fn kapso_signed_media_url_is_detected_without_matching_lookalikes() {
+        assert!(is_kapso_signed_media_url(
+            "https://api.kapso.ai/meta/whatsapp/media_download?token=short-lived"
+        ));
+        assert!(!is_kapso_signed_media_url(
+            "https://api.kapso.ai/meta/whatsapp/media_download?other=short-lived"
+        ));
+        assert!(!is_kapso_signed_media_url(
+            "https://kapso.ai.evil.example/media_download?token=short-lived"
+        ));
+    }
+
+    #[test]
+    fn provider_parse_roundtrip() {
+        assert_eq!(CloudProvider::parse("kapso"), CloudProvider::Kapso);
+        assert_eq!(CloudProvider::parse("  KAPSO "), CloudProvider::Kapso);
+        assert_eq!(CloudProvider::parse("meta"), CloudProvider::Meta);
+        assert_eq!(CloudProvider::parse(""), CloudProvider::Meta);
+        assert_eq!(CloudProvider::parse("nonsense"), CloudProvider::Meta);
+        assert_eq!(CloudProvider::Kapso.as_str(), "kapso");
+        assert_eq!(CloudProvider::Meta.as_str(), "meta");
+    }
+
+    #[test]
+    fn kapso_media_url_allow_list() {
+        let k = CloudClient::new(kapso_creds(), None).unwrap();
+        // Kapso-hosted media + the API host itself are allowed for a Kapso session…
+        assert!(k.media_url_allowed("https://api.kapso.ai/meta/whatsapp/media/abc"));
+        assert!(k.media_url_allowed("https://cdn.kapso.ai/m/xyz.jpg"));
+        // …Meta hosts stay allowed (passthrough-ish deliveries)…
+        assert!(k.media_url_allowed("https://lookaside.fbsbx.com/whatsapp_business/attachments/?mid=1"));
+        // …but look-alikes, plain http, and unrelated hosts are refused.
+        assert!(!k.media_url_allowed("https://kapso.ai.evil.example/x"));
+        assert!(!k.media_url_allowed("http://cdn.kapso.ai/x"));
+        assert!(!k.media_url_allowed("https://example.com/x"));
+        // A Meta session must NOT trust Kapso hosts.
+        let m = CloudClient::new(creds(), None).unwrap();
+        assert!(!m.media_url_allowed("https://cdn.kapso.ai/m/xyz.jpg"));
+    }
+
+    #[test]
+    fn kapso_status_codes_map_to_conflict() {
+        assert!(matches!(
+            map_graph_error(402, b"{\"error\":{\"code\":100,\"message\":\"no credits\"}}"),
+            Error::Conflict(_)
+        ));
+        assert!(matches!(
+            map_graph_error(409, b"not json"),
+            Error::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn kapso_signature_roundtrip() {
+        let secret = "kapso-webhook-secret";
+        let body = br#"{"message":{"id":"wamid.1"}}"#;
+        let good = hmac_sha256_hex(secret.as_bytes(), body);
+        assert!(verify_kapso_signature(secret, body, Some(&good)));
+        assert!(verify_kapso_signature(secret, body, Some(&format!("sha256={good}"))));
+        assert!(!verify_kapso_signature(secret, body, Some("deadbeef")));
+        assert!(!verify_kapso_signature(secret, body, None));
+        assert!(!verify_kapso_signature("wrong", body, Some(&good)));
+    }
+
+    #[test]
+    fn kapso_webhook_inbound_text() {
+        let raw = br#"{
+          "message": { "id": "wamid.123", "timestamp": "1730092800", "type": "text",
+            "from": "16315551181", "from_user_id": "US.134912",
+            "text": { "body": "Hello" },
+            "kapso": { "direction": "inbound", "has_media": false, "content": "Hello" } },
+          "conversation": { "id": "conv_1", "contact_name": "John Doe",
+            "phone_number": "16315551181", "phone_number_id": "123456789012345" },
+          "is_new_conversation": true,
+          "phone_number_id": "123456789012345"
+        }"#;
+        let batches = parse_kapso_webhook(raw).unwrap();
+        assert_eq!(batches.len(), 1);
+        let b = &batches[0];
+        assert_eq!(b.phone_number_id, "123456789012345");
+        assert_eq!(b.messages.len(), 1);
+        assert!(b.statuses.is_empty());
+        let m = &b.messages[0];
+        assert_eq!(m.wamid, "wamid.123");
+        assert_eq!(m.from, "16315551181");
+        assert_eq!(m.push_name.as_deref(), Some("John Doe"));
+        assert_eq!(m.kind, InboundKind::Text { body: "Hello".into() });
+    }
+
+    #[test]
+    fn kapso_webhook_extracts_cs_window_from_last_inbound_at() {
+        let raw = br#"{
+          "message": { "id": "wamid.9", "timestamp": "1730092800", "type": "text",
+            "from": "1", "text": { "body": "hi" },
+            "kapso": { "direction": "inbound" } },
+          "conversation": { "phone_number_id": "PN",
+            "kapso": { "last_inbound_at": "2024-10-28T05:20:00.000000Z" } },
+          "phone_number_id": "PN"
+        }"#;
+        let anchor = chrono::DateTime::parse_from_rfc3339("2024-10-28T05:20:00.000000Z")
+            .unwrap()
+            .timestamp();
+        let b = &parse_kapso_webhook(raw).unwrap()[0];
+        assert_eq!(b.window_expires_at, Some(anchor + CS_WINDOW_SECS));
+
+        // No `conversation.kapso` → parser reports nothing (caller falls back).
+        let raw2 = br#"{ "message": { "id": "w", "timestamp": "1", "type": "text",
+            "from": "1", "text": { "body": "x" }, "kapso": { "direction": "inbound" } },
+          "conversation": { "phone_number_id": "PN" }, "phone_number_id": "PN" }"#;
+        assert_eq!(parse_kapso_webhook(raw2).unwrap()[0].window_expires_at, None);
+    }
+
+    #[test]
+    fn meta_webhook_extracts_cs_window_from_status_conversation() {
+        let raw = br#"{ "entry": [ { "changes": [ { "field": "messages", "value": {
+            "metadata": { "phone_number_id": "PN" },
+            "statuses": [ { "id": "wamid.1", "status": "delivered",
+              "recipient_id": "5511999999999", "timestamp": "1730000000",
+              "conversation": { "id": "c1", "expiration_timestamp": "1730116480" } } ]
+        } } ] } ] }"#;
+        let b = &parse_webhook(raw).unwrap()[0];
+        assert_eq!(b.window_expires_at, Some(1730116480));
+    }
+
+    #[test]
+    fn kapso_webhook_inbound_image_uses_kapso_media_url() {
+        let raw = br#"{
+          "message": { "id": "wamid.789", "timestamp": "1730093000", "type": "image",
+            "from": "16315551181",
+            "image": { "caption": "Photo description", "id": "media_id_123" },
+            "kapso": { "direction": "inbound", "has_media": true,
+              "media_url": "https://api.kapso.ai/media/abc",
+              "media_data": { "url": "https://api.kapso.ai/media/abc",
+                "filename": "photo.jpg", "content_type": "image/jpeg", "byte_size": 204800 } } },
+          "conversation": { "phone_number": "16315551181", "phone_number_id": "123456789012345" },
+          "phone_number_id": "123456789012345"
+        }"#;
+        let b = &parse_kapso_webhook(raw).unwrap()[0];
+        match &b.messages[0].kind {
+            InboundKind::Media { msg_type, media_id, url, mime, filename, caption, .. } => {
+                assert_eq!(*msg_type, "image");
+                assert_eq!(media_id, "media_id_123");
+                assert_eq!(url.as_deref(), Some("https://api.kapso.ai/media/abc"));
+                assert_eq!(mime.as_deref(), Some("image/jpeg"));
+                assert_eq!(filename.as_deref(), Some("photo.jpg"));
+                assert_eq!(caption.as_deref(), Some("Photo description"));
+            }
+            other => panic!("expected media, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kapso_webhook_outbound_status_and_failure() {
+        let raw = br#"{
+          "message": { "id": "wamid.456", "type": "text", "to": "15551234567",
+            "kapso": { "direction": "outbound", "status": "delivered", "statuses": [
+              { "id": "wamid.456", "status": "sent", "timestamp": "1730092860", "recipient_id": "15551234567" },
+              { "id": "wamid.456", "status": "delivered", "timestamp": "1730092888", "recipient_id": "15551234567" },
+              { "id": "wamid.456", "status": "failed", "timestamp": "1730093200", "recipient_id": "15551234567",
+                "errors": [ { "code": 131047, "title": "Re-engagement message" } ] } ] } },
+          "conversation": { "phone_number": "15551234567", "phone_number_id": "123456789012345" },
+          "phone_number_id": "123456789012345"
+        }"#;
+        let b = &parse_kapso_webhook(raw).unwrap()[0];
+        assert!(b.messages.is_empty());
+        assert_eq!(b.statuses.len(), 3);
+        assert_eq!(b.statuses[0].status, "sent");
+        assert_eq!(b.statuses[2].status, "failed");
+        assert!(b.statuses[2].error.as_deref().unwrap().contains("131047"));
+        assert_eq!(b.outbound.len(), 1);
+        assert_eq!(b.outbound[0].wamid, "wamid.456");
+        assert_eq!(b.outbound[0].to, "15551234567");
+    }
+
+    #[test]
+    fn kapso_webhook_outbound_echo_carries_content() {
+        let raw = r#"{
+          "message": {
+            "id": "wamid.OUT99", "type": "text", "to": "5500000000001",
+            "timestamp": "1730092860",
+            "text": { "body": "Já estou a caminho" },
+            "kapso": {
+              "direction": "outbound", "status": "sent", "origin": "business_app",
+              "statuses": [
+                { "id": "wamid.OUT99", "status": "sent", "timestamp": "1730092860", "recipient_id": "5500000000001" }
+              ]
+            }
+          },
+          "conversation": { "phone_number": "5500000000001", "phone_number_id": "123456789012345" },
+          "phone_number_id": "123456789012345"
+        }"#;
+        let b = &parse_kapso_webhook(raw.as_bytes()).unwrap()[0];
+        assert!(b.messages.is_empty(), "echo is not an inbound message");
+        assert_eq!(b.statuses.len(), 1);
+        assert_eq!(b.outbound.len(), 1);
+        let e = &b.outbound[0];
+        assert_eq!(e.wamid, "wamid.OUT99");
+        assert_eq!(e.to, "5500000000001");
+        assert_eq!(e.timestamp, 1_730_092_860);
+        match &e.kind {
+            InboundKind::Text { body } => assert_eq!(body, "Já estou a caminho"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kapso_webhook_batch_envelope() {
+        let raw = br#"{
+          "type": "whatsapp.message.received", "batch": true, "batch_info": {},
+          "data": [
+            { "message": { "id": "wamid.a", "type": "text", "from": "1", "text": {"body": "one"},
+                "kapso": { "direction": "inbound" } },
+              "conversation": { "phone_number": "1", "phone_number_id": "PN" }, "phone_number_id": "PN" },
+            { "message": { "id": "wamid.b", "type": "text", "from": "2", "text": {"body": "two"},
+                "kapso": { "direction": "inbound" } },
+              "conversation": { "phone_number": "2", "phone_number_id": "PN" }, "phone_number_id": "PN" }
+          ]
+        }"#;
+        let batches = parse_kapso_webhook(raw).unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].messages[0].wamid, "wamid.a");
+        assert_eq!(batches[1].messages[0].wamid, "wamid.b");
+    }
+
+    #[test]
+    fn kapso_webhook_tolerates_odd_bodies() {
+        assert!(parse_kapso_webhook(b"not json").is_err());
+        assert_eq!(parse_kapso_webhook(b"{}").unwrap().len(), 0);
+        assert_eq!(parse_kapso_webhook(br#"{"batch":true,"data":[]}"#).unwrap().len(), 0);
+        // message without id → dropped, not a panic.
+        assert_eq!(
+            parse_kapso_webhook(br#"{"message":{"type":"text"},"phone_number_id":"PN"}"#)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -3031,11 +4614,14 @@ mod tests {
             return;
         }
         let creds = CloudCreds {
+            provider: CloudProvider::Meta,
             phone_number_id: std::env::var("RUWA_CLOUD_PHONE_NUMBER_ID")
                 .expect("RUWA_CLOUD_PHONE_NUMBER_ID"),
             waba_id: std::env::var("RUWA_CLOUD_WABA_ID").ok(),
             access_token: std::env::var("RUWA_CLOUD_ACCESS_TOKEN")
                 .expect("RUWA_CLOUD_ACCESS_TOKEN"),
+            api_key: None,
+            base_url: None,
             app_secret: None,
             verify_token: None,
             graph_version: std::env::var("RUWA_CLOUD_GRAPH_VERSION")
@@ -3051,5 +4637,252 @@ mod tests {
             .expect("send");
         eprintln!("sent: {r:?}");
         assert!(r.wamid.starts_with("wamid."));
+    }
+
+    // ---- Kapso Platform API ----------------------------------------------
+
+    #[test]
+    fn kapso_platform_accepts_proxy_and_rejects_garbage() {
+        assert!(KapsoPlatform::new("k-key", None, Some("socks5://127.0.0.1:1080")).is_ok());
+        assert!(KapsoPlatform::new("k-key", None, Some("http://user:pw@127.0.0.1:3128")).is_ok());
+        let p = KapsoPlatform::new("k-key", None, None).unwrap();
+        assert_eq!(p.url("customers"), "https://api.kapso.ai/platform/v1/customers");
+        assert_eq!(p.url("/customers"), "https://api.kapso.ai/platform/v1/customers");
+        // Kapso spells WhatsApp resources `whatsapp/…`; a hyphen 404s. Pin it.
+        assert!(!KAPSO_WEBHOOKS_PATH.contains('-'));
+        assert!(!KAPSO_PHONE_NUMBERS_PATH.contains('-'));
+        assert_eq!(
+            p.url(KAPSO_WEBHOOKS_PATH),
+            "https://api.kapso.ai/platform/v1/whatsapp/webhooks"
+        );
+        assert_eq!(
+            p.url(KAPSO_PHONE_NUMBERS_PATH),
+            "https://api.kapso.ai/platform/v1/whatsapp/phone_numbers"
+        );
+        assert_eq!(
+            p.url(&format!("{KAPSO_PHONE_NUMBERS_PATH}/106540352242922")),
+            "https://api.kapso.ai/platform/v1/whatsapp/phone_numbers/106540352242922"
+        );
+        assert_eq!(
+            p.url("customers/550e8400-e29b-41d4-a716-446655440000"),
+            "https://api.kapso.ai/platform/v1/customers/550e8400-e29b-41d4-a716-446655440000"
+        );
+        // base override, trailing slash trimmed
+        let p2 = KapsoPlatform::new("k-key", Some("https://kapso.example/platform/v2/"), None)
+            .unwrap();
+        assert_eq!(p2.url("customers"), "https://kapso.example/platform/v2/customers");
+        // Debug never leaks the key
+        assert!(!format!("{p:?}").contains("k-key"));
+        let err = KapsoPlatform::new("k-key", None, Some("::not a url::")).unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)), "{err}");
+    }
+
+    #[test]
+    fn kapso_broadcasts_path_spelling_and_url_composition() {
+        // Same `whatsapp/…` caveat as the other Kapso resources — a hyphen 404s.
+        assert!(!KAPSO_BROADCASTS_PATH.contains('-'));
+        let p = KapsoPlatform::new("k-key", None, None).unwrap();
+        assert_eq!(
+            p.url(KAPSO_BROADCASTS_PATH),
+            "https://api.kapso.ai/platform/v1/whatsapp/broadcasts"
+        );
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            p.url(&format!("{KAPSO_BROADCASTS_PATH}/{uuid}/send")),
+            "https://api.kapso.ai/platform/v1/whatsapp/broadcasts/\
+             550e8400-e29b-41d4-a716-446655440000/send"
+        );
+    }
+
+    #[test]
+    fn parse_broadcast_unwraps_data_and_defaults_counts() {
+        // Bare object, sparse: every count defaults to 0, template is None.
+        let bare = parse_broadcast(&serde_json::json!({ "id": "b1", "status": "draft" }));
+        assert_eq!(bare.id.as_deref(), Some("b1"));
+        assert_eq!(bare.status.as_deref(), Some("draft"));
+        assert_eq!(bare.sent_count, 0);
+        assert_eq!(bare.total_recipients, 0);
+        assert!(bare.template.is_none());
+        assert!(bare.response_rate.is_none());
+
+        // `{data:{…}}` envelope with a template + counts.
+        let wrapped = parse_broadcast(&serde_json::json!({
+            "data": {
+                "id": "b2",
+                "name": "Promo",
+                "status": "sending",
+                "sent_count": 3,
+                "delivered_count": "2",
+                "response_rate": 0.5,
+                "scheduled_at": "2026-09-01T12:00:00Z",
+                "whatsapp_template": {
+                    "id": "tpl-1",
+                    "name": "promo",
+                    "language_code": "en_US",
+                    "category": "MARKETING",
+                    "status": "APPROVED",
+                    "meta_template_id": "998877"
+                }
+            }
+        }));
+        assert_eq!(wrapped.id.as_deref(), Some("b2"));
+        assert_eq!(wrapped.sent_count, 3);
+        assert_eq!(wrapped.delivered_count, 2);
+        assert_eq!(wrapped.response_rate, Some(0.5));
+        assert_eq!(wrapped.scheduled_at.as_deref(), Some("2026-09-01T12:00:00Z"));
+        let tpl = wrapped.template.expect("template");
+        assert_eq!(tpl.name.as_deref(), Some("promo"));
+        assert_eq!(tpl.meta_template_id.as_deref(), Some("998877"));
+    }
+
+    #[test]
+    fn parse_broadcast_meta_reads_pagination() {
+        let v = serde_json::json!({
+            "data": [],
+            "meta": { "page": 2, "per_page": 50, "total_pages": 4, "total_count": 175 }
+        });
+        assert_eq!(parse_broadcast_meta(&v), (2, 50, 4, 175));
+        // Absent meta → all zeros.
+        assert_eq!(parse_broadcast_meta(&serde_json::json!({ "data": [] })), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn add_recipients_result_reads_errors_array() {
+        // Exercise the `data.{added,duplicates,errors}` extraction directly.
+        let d = serde_json::json!({
+            "data": { "added": 8, "duplicates": 2, "errors": ["bad number +1", "no components"] }
+        });
+        let d = d.get("data").unwrap();
+        let errors: Vec<String> = d
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.iter().map(|e| e.as_str().unwrap().to_string()).collect())
+            .unwrap();
+        assert_eq!(errors, vec!["bad number +1".to_string(), "no components".to_string()]);
+        assert_eq!(d.get("added").and_then(u64_of), Some(8));
+        assert_eq!(d.get("duplicates").and_then(u64_of), Some(2));
+    }
+
+    #[test]
+    fn broadcast_methods_reject_bad_ids_before_network() {
+        let p = KapsoPlatform::new("k-key", None, None).unwrap();
+        let bad = p.broadcast_id("../etc/passwd");
+        assert!(matches!(bad, Err(Error::BadRequest(_))));
+        assert_eq!(p.broadcast_id("  b-1  ").unwrap(), "b-1");
+    }
+
+    #[test]
+    fn is_kapso_id_accepts_uuids_and_digits_only() {
+        assert!(is_kapso_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_kapso_id("106540352242922"));
+        assert!(is_kapso_id("cust_abc-123"));
+        assert!(!is_kapso_id(""));
+        assert!(!is_kapso_id("../../me"));
+        assert!(!is_kapso_id("a b"));
+        assert!(!is_kapso_id("id?x=1"));
+    }
+
+    #[test]
+    fn kapso_phone_number_parses_waba_id() {
+        let d = serde_json::json!({
+            "id": "row-1",
+            "internal_id": "550e8400-e29b-41d4-a716-446655440000",
+            "phone_number_id": "1332248166628278",
+            "business_account_id": "98765432109",
+            "display_phone_number": "+55 11 96447-5055",
+            "verified_name": "Acme",
+        });
+        let n = parse_kapso_phone_number(&d).unwrap();
+        assert_eq!(n.business_account_id.as_deref(), Some("98765432109"));
+        // Alternate key spelling is also accepted.
+        let d2 = serde_json::json!({
+            "internal_id": "550e8400-e29b-41d4-a716-446655440000",
+            "phone_number_id": "1",
+            "whatsapp_business_account_id": "111",
+        });
+        assert_eq!(
+            parse_kapso_phone_number(&d2).unwrap().business_account_id.as_deref(),
+            Some("111")
+        );
+    }
+
+    #[test]
+    fn kapso_project_event_created_from_header() {
+        let raw = br#"{
+          "phone_number_id": "123456789012345",
+          "project": { "id": "proj_abc" },
+          "customer": { "id": "cust_xyz" },
+          "source": { "business_account_id": "998877" },
+          "occurred_at": "2026-08-27T12:00:00Z"
+        }"#;
+        let ev = parse_kapso_project_event(raw, Some("whatsapp.phone_number.created")).unwrap();
+        assert_eq!(ev.event, "whatsapp.phone_number.created");
+        assert_eq!(ev.phone_number_id.as_deref(), Some("123456789012345"));
+        assert_eq!(ev.customer_id.as_deref(), Some("cust_xyz"));
+        assert_eq!(ev.project_id.as_deref(), Some("proj_abc"));
+        assert_eq!(ev.business_account_id.as_deref(), Some("998877"));
+        assert_eq!(ev.occurred_at.as_deref(), Some("2026-08-27T12:00:00Z"));
+    }
+
+    #[test]
+    fn kapso_project_event_name_falls_back_to_body_and_rejects_non_json() {
+        // Minimal payload: name only in the body, no header.
+        let raw = br#"{ "event": "whatsapp.phone_number.disconnected", "phone_number_id": "1" }"#;
+        let ev = parse_kapso_project_event(raw, None).unwrap();
+        assert_eq!(ev.event, "whatsapp.phone_number.disconnected");
+        assert_eq!(ev.phone_number_id.as_deref(), Some("1"));
+        assert!(ev.customer_id.is_none());
+        assert!(ev.project_id.is_none());
+        // Non-JSON body → BadRequest.
+        assert!(matches!(
+            parse_kapso_project_event(b"not json at all", None),
+            Err(Error::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn setup_link_body_omits_nulls_and_defaults_billing() {
+        // Minimal: only the required bool + the default billing mode.
+        let b = setup_link_body(&SetupLinkOpts::default());
+        let sl = b.get("setup_link").unwrap();
+        assert_eq!(sl.get("provision_phone_number").unwrap(), &json!(false));
+        assert_eq!(sl.get("meta_billing_mode").unwrap(), &json!("partner_managed"));
+        assert!(sl.get("allowed_connection_types").is_none());
+        assert!(sl.get("success_redirect_url").is_none());
+        assert!(sl.get("failure_redirect_url").is_none());
+        assert!(sl.get("phone_number_country_isos").is_none());
+        assert!(sl.get("language").is_none());
+
+        // Fully populated; blank optionals are dropped, blank ISOs filtered.
+        let opts = SetupLinkOpts {
+            provision_phone_number: true,
+            connection_type: Some("coexistence".into()),
+            meta_billing_mode: Some("customer_managed".into()),
+            success_redirect_url: Some("https://ok.example".into()),
+            failure_redirect_url: Some("  ".into()),
+            country_isos: vec!["US".into(), "  ".into(), "BR".into()],
+            language: Some("pt".into()),
+        };
+        let full = setup_link_body(&opts);
+        let sl = full.get("setup_link").unwrap();
+        assert_eq!(sl.get("provision_phone_number").unwrap(), &json!(true));
+        assert_eq!(
+            sl.get("allowed_connection_types").unwrap(),
+            &json!(["coexistence"])
+        );
+        assert_eq!(
+            sl.get("meta_billing_mode").unwrap(),
+            &json!("customer_managed")
+        );
+        assert_eq!(
+            sl.get("success_redirect_url").unwrap(),
+            &json!("https://ok.example")
+        );
+        assert!(sl.get("failure_redirect_url").is_none());
+        assert_eq!(
+            sl.get("phone_number_country_isos").unwrap(),
+            &json!(["US", "BR"])
+        );
+        assert_eq!(sl.get("language").unwrap(), &json!("pt"));
     }
 }

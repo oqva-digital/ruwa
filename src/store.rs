@@ -170,8 +170,11 @@ store_delegate! {
     session_set_jid_and_push_name(id: &str, jid: Option<&str>, push_name: Option<&str>, updated_at: i64) -> rusqlite::Result<()>;
     session_cloud_creds(id: &str) -> rusqlite::Result<Option<CloudCredsRow>>;
     create_cloud_session(s: &NewCloudSession) -> rusqlite::Result<()>;
+    create_kapso_session(s: &NewKapsoSession) -> rusqlite::Result<()>;
     session_set_cloud_creds(id: &str, c: &CloudCredsRow, updated_at: i64) -> rusqlite::Result<()>;
+    session_set_cloud_phone_number(id: &str, phone_number_id: &str, internal_id: Option<&str>, waba_id: Option<&str>, updated_at: i64) -> rusqlite::Result<()>;
     cloud_session_id_by_phone_number_id(pnid: &str) -> rusqlite::Result<Option<String>>;
+    kapso_session_id_by_customer_id(customer_id: &str) -> rusqlite::Result<Option<String>>;
     cloud_verify_token_matches(token: &str) -> rusqlite::Result<bool>;
     message_exists(session_id: &str, chat_jid: &str, message_id: &str) -> rusqlite::Result<bool>;
     latest_inbound_message_id(session_id: &str, chat_jid: &str) -> rusqlite::Result<Option<String>>;
@@ -193,9 +196,11 @@ store_delegate! {
     chat_set_name(session_id: &str, jid: &str, name: Option<&str>, is_group: bool, last_msg_ts: Option<i64>) -> rusqlite::Result<()>;
     chat_set_archived(session_id: &str, jid: &str, archived: bool) -> rusqlite::Result<()>;
     chat_set_muted(session_id: &str, jid: &str, until: Option<i64>) -> rusqlite::Result<()>;
+    chat_set_cloud_window(session_id: &str, jid: &str, expires_at: i64) -> rusqlite::Result<()>;
     group_persist(session_id: &str, jid: &str, subject: Option<&str>, creator: Option<&str>, creation_ts: Option<i64>, participants: &[(&str, bool, bool)]) -> rusqlite::Result<()>;
     message_insert_media(session_id: &str, chat_jid: &str, message_id: &str, sender_jid: &str, timestamp: i64, msg_type: &str, body_text: Option<&str>, payload_json: &str, media_path: Option<&str>) -> rusqlite::Result<()>;
     message_set_media_path(session_id: &str, chat_jid: &str, message_id: &str, media_path: &str) -> rusqlite::Result<()>;
+    message_merge_payload(session_id: &str, chat_jid: &str, message_id: &str, extra: &serde_json::Value) -> rusqlite::Result<()>;
     message_media_lookup(session_id: &str, chat_jid: &str, message_id: &str) -> rusqlite::Result<Option<(Option<String>, String, String)>>;
     messages_list(session_id: &str, chat: Option<&str>, needle: Option<&str>, before: i64, limit: u32) -> rusqlite::Result<Vec<MessageListRow>>;
     message_context(session_id: &str, chat: &str, msg_id: &str, before: u32, after: u32) -> rusqlite::Result<Vec<MessageListRow>>;
@@ -224,6 +229,21 @@ store_delegate! {
 // (webhook/queue routes + delivery worker, items A3/A4), same forward-declared
 // pattern as `SessionEvent`. Drop the allows once A3 wires them.
 impl Store {
+    /// Kept out of `store_delegate!` so it can carry `#[allow(dead_code)]`: the
+    /// confirmed Kapso contract correlates the onboarding callback by
+    /// `customer.id` (see `kapso_session_id_by_customer_id`), so setup-ref
+    /// resolution is provided but not yet wired.
+    #[allow(dead_code)]
+    pub fn kapso_session_id_by_setup_ref(
+        &self,
+        setup_ref: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        match self {
+            Store::Sqlite(s) => s.kapso_session_id_by_setup_ref(setup_ref),
+            Store::Postgres(p) => pg_offload(|| p.kapso_session_id_by_setup_ref(setup_ref)),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn egress_set(&self, t: &EgressTarget) -> rusqlite::Result<()> {
         match self {
@@ -1043,45 +1063,48 @@ impl SqliteStore {
     pub fn consolidate_lid_chats(&self, session_id: &str) -> rusqlite::Result<usize> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
-            let n = tx.execute(
-                "UPDATE messages SET chat_jid = ( \
-                     SELECT m.pn_user || '@s.whatsapp.net' FROM lid_pn_map m \
-                      WHERE m.session_id = ?1 AND m.lid_user = replace(messages.chat_jid, '@lid', '')) \
-                  WHERE session_id = ?1 AND chat_jid LIKE '%@lid' \
-                    AND EXISTS (SELECT 1 FROM lid_pn_map m WHERE m.session_id = ?1 \
-                                AND m.lid_user = replace(messages.chat_jid, '@lid', '')) \
-                    AND NOT EXISTS (SELECT 1 FROM messages p JOIN lid_pn_map m \
-                                      ON m.session_id = ?1 AND m.lid_user = replace(messages.chat_jid, '@lid', '') \
-                                    WHERE p.session_id = ?1 \
-                                      AND p.chat_jid = m.pn_user || '@s.whatsapp.net' \
-                                      AND p.message_id = messages.message_id)",
-                rusqlite::params![session_id],
-            )?;
-            // Any @lid row still carrying a mapping is a true duplicate of a PN row.
-            tx.execute(
-                "DELETE FROM messages WHERE session_id = ?1 AND chat_jid LIKE '%@lid' \
-                   AND EXISTS (SELECT 1 FROM lid_pn_map m WHERE m.session_id = ?1 \
-                               AND m.lid_user = replace(messages.chat_jid, '@lid', ''))",
-                rusqlite::params![session_id],
-            )?;
-            // Mirror the re-key onto the metadata `chats` table (pinned/archived).
-            tx.execute(
-                "UPDATE OR IGNORE chats SET jid = ( \
-                     SELECT m.pn_user || '@s.whatsapp.net' FROM lid_pn_map m \
-                      WHERE m.session_id = ?1 AND m.lid_user = replace(chats.jid, '@lid', '')) \
-                  WHERE session_id = ?1 AND jid LIKE '%@lid' \
-                    AND EXISTS (SELECT 1 FROM lid_pn_map m WHERE m.session_id = ?1 \
-                                AND m.lid_user = replace(chats.jid, '@lid', ''))",
-                rusqlite::params![session_id],
-            )?;
-            // Drop any leftover @lid `chats` row (re-keyed → gone; a dup of an
-            // existing PN row → removed) so the merged contact shows once.
-            tx.execute(
-                "DELETE FROM chats WHERE session_id = ?1 AND jid LIKE '%@lid' \
-                   AND EXISTS (SELECT 1 FROM lid_pn_map m WHERE m.session_id = ?1 \
-                               AND m.lid_user = replace(chats.jid, '@lid', ''))",
-                rusqlite::params![session_id],
-            )?;
+            // Only the mappings whose LID still has a chat to fold, found by exact
+            // primary-key probes (a `replace(chat_jid, ..)` join defeats every index).
+            let pairs: Vec<(String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT m.lid_user, m.pn_user FROM lid_pn_map m WHERE m.session_id = ?1 \
+                       AND (EXISTS (SELECT 1 FROM messages x WHERE x.session_id = ?1 \
+                                    AND x.chat_jid = m.lid_user || '@lid') \
+                            OR EXISTS (SELECT 1 FROM chats c WHERE c.session_id = ?1 \
+                                       AND c.jid = m.lid_user || '@lid'))",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![session_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut n = 0;
+            for (lid_user, pn_user) in &pairs {
+                let lid = format!("{lid_user}@lid");
+                let pn = format!("{pn_user}@s.whatsapp.net");
+                n += tx.execute(
+                    "UPDATE messages SET chat_jid = ?3 WHERE session_id = ?1 AND chat_jid = ?2 \
+                       AND NOT EXISTS (SELECT 1 FROM messages p WHERE p.session_id = ?1 \
+                                       AND p.chat_jid = ?3 AND p.message_id = messages.message_id)",
+                    rusqlite::params![session_id, lid, pn],
+                )?;
+                // Any @lid row left is a true duplicate of a PN row.
+                tx.execute(
+                    "DELETE FROM messages WHERE session_id = ?1 AND chat_jid = ?2",
+                    rusqlite::params![session_id, lid],
+                )?;
+                // Mirror the re-key onto the metadata `chats` table (pinned/archived).
+                tx.execute(
+                    "UPDATE OR IGNORE chats SET jid = ?3 WHERE session_id = ?1 AND jid = ?2",
+                    rusqlite::params![session_id, lid, pn],
+                )?;
+                // Drop any leftover @lid `chats` row (re-keyed → gone; a dup of an
+                // existing PN row → removed) so the merged contact shows once.
+                tx.execute(
+                    "DELETE FROM chats WHERE session_id = ?1 AND jid = ?2",
+                    rusqlite::params![session_id, lid],
+                )?;
+            }
             tx.commit()?;
             Ok(n)
         })
@@ -1278,7 +1301,9 @@ impl SqliteStore {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, label, status, jid, push_name, created_at, updated_at, proxy_url, mark_online, \
-                        kind, cloud_phone_number_id, cloud_waba_id, cloud_graph_version \
+                        kind, cloud_phone_number_id, cloud_waba_id, cloud_graph_version, \
+                        cloud_provider, cloud_internal_id, cloud_customer_id, cloud_base_url, \
+                        cloud_setup_ref, cloud_setup_link \
                    FROM sessions",
             )?;
             let rows = stmt
@@ -1297,6 +1322,12 @@ impl SqliteStore {
                         cloud_phone_number_id: r.get(10)?,
                         cloud_waba_id: r.get(11)?,
                         cloud_graph_version: r.get(12)?,
+                        cloud_provider: r.get::<_, Option<String>>(13)?.unwrap_or_else(|| "meta".into()),
+                        cloud_internal_id: r.get(14)?,
+                        cloud_customer_id: r.get(15)?,
+                        cloud_base_url: r.get(16)?,
+                        cloud_setup_ref: r.get(17)?,
+                        cloud_setup_link: r.get(18)?,
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -1311,7 +1342,9 @@ impl SqliteStore {
         self.with_conn(|conn| {
             conn.query_row(
                 "SELECT id, label, status, jid, push_name, created_at, updated_at, proxy_url, mark_online, \
-                        kind, cloud_phone_number_id, cloud_waba_id, cloud_graph_version \
+                        kind, cloud_phone_number_id, cloud_waba_id, cloud_graph_version, \
+                        cloud_provider, cloud_internal_id, cloud_customer_id, cloud_base_url, \
+                        cloud_setup_ref, cloud_setup_link \
                    FROM sessions WHERE id = ?",
                 rusqlite::params![id],
                 |r| {
@@ -1329,6 +1362,12 @@ impl SqliteStore {
                         cloud_phone_number_id: r.get(10)?,
                         cloud_waba_id: r.get(11)?,
                         cloud_graph_version: r.get(12)?,
+                        cloud_provider: r.get::<_, Option<String>>(13)?.unwrap_or_else(|| "meta".into()),
+                        cloud_internal_id: r.get(14)?,
+                        cloud_customer_id: r.get(15)?,
+                        cloud_base_url: r.get(16)?,
+                        cloud_setup_ref: r.get(17)?,
+                        cloud_setup_link: r.get(18)?,
                     })
                 },
             )
@@ -1645,7 +1684,9 @@ impl SqliteStore {
         let row = self.with_conn(|conn| {
             conn.query_row(
                 "SELECT cloud_phone_number_id, cloud_waba_id, cloud_access_token, \
-                        cloud_app_secret, cloud_verify_token, cloud_graph_version \
+                        cloud_app_secret, cloud_verify_token, cloud_graph_version, \
+                        cloud_provider, cloud_base_url, cloud_internal_id, cloud_customer_id, \
+                        cloud_webhook_secret \
                    FROM sessions WHERE id = ? AND kind = 'cloud'",
                 rusqlite::params![id],
                 |r| {
@@ -1656,6 +1697,11 @@ impl SqliteStore {
                         r.get::<_, Option<Vec<u8>>>(3)?,
                         r.get::<_, Option<String>>(4)?,
                         r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, Option<String>>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                        r.get::<_, Option<Vec<u8>>>(10)?,
                     ))
                 },
             )
@@ -1678,12 +1724,18 @@ impl SqliteStore {
     ) -> rusqlite::Result<()> {
         let token = vault::seal(c.access_token.as_bytes());
         let secret = c.app_secret.as_deref().map(|v| vault::seal(v.as_bytes()));
+        let hook_secret = c
+            .webhook_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|v| vault::seal(v.as_bytes()));
         self.with_conn(|conn| {
             conn.execute(
                 "UPDATE sessions SET \
                     cloud_phone_number_id = ?, cloud_waba_id = ?, cloud_access_token = ?, \
                     cloud_app_secret = ?, cloud_verify_token = ?, cloud_graph_version = ?, \
-                    updated_at = ? \
+                    cloud_provider = ?, cloud_base_url = ?, cloud_internal_id = ?, \
+                    cloud_customer_id = ?, cloud_webhook_secret = ?, updated_at = ? \
                  WHERE id = ? AND kind = 'cloud'",
                 rusqlite::params![
                     c.phone_number_id,
@@ -1692,11 +1744,104 @@ impl SqliteStore {
                     secret,
                     c.verify_token,
                     c.graph_version,
+                    c.provider,
+                    c.base_url,
+                    c.internal_id,
+                    c.customer_id,
+                    hook_secret,
                     updated_at,
                     id,
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// Create a `kind='cloud'`, `cloud_provider='kapso'` session in the
+    /// pending-onboarding state (no Meta creds yet). `webhook_secret` is sealed.
+    pub fn create_kapso_session(&self, s: &NewKapsoSession) -> rusqlite::Result<()> {
+        let hook_secret = vault::seal(s.webhook_secret.as_bytes());
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO sessions (\
+                    id, label, status, api_key, proxy_url, created_at, updated_at, \
+                    kind, cloud_provider, cloud_customer_id, cloud_setup_ref, \
+                    cloud_setup_link, cloud_base_url, cloud_graph_version, cloud_webhook_secret\
+                 ) VALUES (?,?,?,?,?,?,?, 'cloud','kapso',?,?,?,?,?,?)",
+                rusqlite::params![
+                    s.id,
+                    s.label,
+                    s.status,
+                    s.api_key,
+                    s.proxy_url,
+                    s.created_at,
+                    s.updated_at,
+                    s.customer_id,
+                    s.setup_ref,
+                    s.setup_link,
+                    s.base_url,
+                    s.graph_version,
+                    hook_secret,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Fill in the Meta `phone_number_id` + Kapso `internal_id` on a kapso
+    /// session once its onboarding callback lands, and stamp `updated_at`.
+    pub fn session_set_cloud_phone_number(
+        &self,
+        id: &str,
+        phone_number_id: &str,
+        internal_id: Option<&str>,
+        waba_id: Option<&str>,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            // `waba_id = NULL` keeps whatever is already stored (COALESCE).
+            conn.execute(
+                "UPDATE sessions SET cloud_phone_number_id = ?, cloud_internal_id = ?, \
+                    cloud_waba_id = COALESCE(?, cloud_waba_id), \
+                    updated_at = ? WHERE id = ? AND kind = 'cloud'",
+                rusqlite::params![phone_number_id, internal_id, waba_id, updated_at, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Resolve the kapso session that issued a given onboarding correlation ref.
+    #[allow(dead_code)] // see `Store::kapso_session_id_by_setup_ref`
+    pub fn kapso_session_id_by_setup_ref(&self, setup_ref: &str) -> rusqlite::Result<Option<String>> {
+        self.opt_string(
+            "SELECT id FROM sessions WHERE kind = 'cloud' AND cloud_provider = 'kapso' \
+                AND cloud_setup_ref = ? ORDER BY created_at ASC LIMIT 1",
+            setup_ref,
+        )
+    }
+
+    /// Resolve the kapso session for a Kapso `customer_id` (the onboarding
+    /// callback carries `customer.id`).
+    pub fn kapso_session_id_by_customer_id(
+        &self,
+        customer_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        self.opt_string(
+            "SELECT id FROM sessions WHERE kind = 'cloud' AND cloud_provider = 'kapso' \
+                AND cloud_customer_id = ? ORDER BY created_at ASC LIMIT 1",
+            customer_id,
+        )
+    }
+
+    /// Run a `SELECT <one text column> … WHERE <col> = ?` returning at most one row.
+    fn opt_string(&self, sql: &str, param: &str) -> rusqlite::Result<Option<String>> {
+        self.with_conn(|conn| {
+            conn.query_row(sql, rusqlite::params![param], |r| r.get::<_, String>(0))
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    _ => Err(e),
+                })
         })
     }
 
@@ -2170,6 +2315,27 @@ impl SqliteStore {
         })
     }
 
+    /// Record when this chat's cloud customer-service window closes (unix
+    /// seconds). Refreshed on every inbound cloud message. Never moves the
+    /// stored value backwards.
+    pub fn chat_set_cloud_window(
+        &self,
+        session_id: &str,
+        jid: &str,
+        expires_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO chats (session_id, jid, cloud_window_expires_at) VALUES (?, ?, ?) \
+                 ON CONFLICT(session_id, jid) DO UPDATE SET \
+                   cloud_window_expires_at = MAX(excluded.cloud_window_expires_at, \
+                                                 COALESCE(chats.cloud_window_expires_at, 0))",
+                rusqlite::params![session_id, jid, expires_at],
+            )?;
+            Ok(())
+        })
+    }
+
     // ---- groups -------------------------------------------------------------
 
     /// Replace a group's metadata + full participant set in one transaction.
@@ -2259,6 +2425,44 @@ impl SqliteStore {
                 "UPDATE messages SET media_path = ? \
                   WHERE session_id = ? AND chat_jid = ? AND message_id = ?",
                 rusqlite::params![media_path, session_id, chat_jid, message_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Merge `extra` (a JSON object) into a message's `payload_json`
+    /// (read-modify-write; existing keys are overwritten). Used to attach the
+    /// WhatsApp upload descriptor (`url`, `direct_path`, `media_key_b64`) to an
+    /// OUTBOUND media row once the upload completes, so `GET …/media` can
+    /// re-download the bytes after the local spool file is gone.
+    pub fn message_merge_payload(
+        &self,
+        session_id: &str,
+        chat_jid: &str,
+        message_id: &str,
+        extra: &serde_json::Value,
+    ) -> rusqlite::Result<()> {
+        self.with_conn(|conn| {
+            let current: Option<String> = conn
+                .query_row(
+                    "SELECT payload_json FROM messages \
+                      WHERE session_id = ? AND chat_jid = ? AND message_id = ?",
+                    rusqlite::params![session_id, chat_jid, message_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            let Some(current) = current else { return Ok(()) };
+            let mut obj: serde_json::Value =
+                serde_json::from_str(&current).unwrap_or(serde_json::Value::Object(Default::default()));
+            if let (Some(dst), Some(src)) = (obj.as_object_mut(), extra.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+            conn.execute(
+                "UPDATE messages SET payload_json = ? \
+                  WHERE session_id = ? AND chat_jid = ? AND message_id = ?",
+                rusqlite::params![obj.to_string(), session_id, chat_jid, message_id],
             )?;
             Ok(())
         })
@@ -2490,7 +2694,8 @@ impl SqliteStore {
                         conv.last_msg_ts, \
                         COALESCE(c.archived, 0) AS archived, \
                         COALESCE(c.pinned, 0) AS pinned, \
-                        c.muted_until \
+                        c.muted_until, \
+                        c.cloud_window_expires_at \
                    FROM convu conv \
                    LEFT JOIN chats c     ON c.session_id = ?1  AND c.jid = conv.jid \
                    LEFT JOIN contacts ct ON ct.session_id = ?1 AND ct.jid = conv.jid \
@@ -2510,6 +2715,7 @@ impl SqliteStore {
                         archived: r.get::<_, i64>(4)? != 0,
                         pinned: r.get::<_, i64>(5)? != 0,
                         muted_until: r.get(6)?,
+                        cloud_window_expires_at: r.get(7)?,
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -2896,12 +3102,12 @@ impl SqliteStore {
 /// msg_type, body_text).
 fn row_to_msg_list(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageListRow> {
     // Column 7 is `payload_json`; pull the reply quote out of it (if present).
-    let quoted = r
-        .get::<_, String>(7)
-        .ok()
-        .as_deref()
-        .and_then(parse_quoted);
+    let payload = r.get::<_, String>(7).ok();
+    let quoted = payload.as_deref().and_then(parse_quoted);
+    let (poll, poll_vote) = payload.as_deref().map(parse_poll).unwrap_or_default();
     Ok(MessageListRow {
+        poll,
+        poll_vote,
         chat_jid: r.get(0)?,
         message_id: r.get(1)?,
         sender_jid: r.get(2)?,
@@ -2974,6 +3180,33 @@ fn parse_quoted(payload_json: &str) -> Option<QuotedInfo> {
         .and_then(|q| serde_json::from_value::<QuotedInfo>(q).ok())
 }
 
+/// The poll fields of a stored payload, for the list API: `poll` (`name`,
+/// `options`, `selectable_count`, `votes`: voter JID → option names) on poll
+/// rows, and `poll_vote` (`poll_id`, `selected_options`) on vote rows.
+fn parse_poll(payload_json: &str) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(payload_json) else {
+        return (None, None);
+    };
+    let poll = match v.get("poll") {
+        Some(p) => Some(p.clone()),
+        // Outbound polls stored before `poll` existed kept these at the top level.
+        None if v.get("type").and_then(|t| t.as_str()) == Some("poll") => Some(serde_json::json!({
+            "name": v.get("name"),
+            "options": v.get("options"),
+            "selectable_count": v.get("selectable_count"),
+        })),
+        None => None,
+    }
+    .map(|mut p| {
+        if let Some(obj) = p.as_object_mut() {
+            let votes = v.get("poll_votes").cloned().unwrap_or_else(|| serde_json::json!({}));
+            obj.insert("votes".into(), votes);
+        }
+        p
+    });
+    (poll, v.get("poll_vote").cloned())
+}
+
 /// A stored message row for the list API (field names are the JSON shape).
 #[derive(Serialize)]
 pub struct MessageListRow {
@@ -2995,6 +3228,12 @@ pub struct MessageListRow {
     /// The quoted message this is a reply to, if any (`null` for non-replies).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted: Option<QuotedInfo>,
+    /// Poll rows: question, options and current votes (see `parse_poll`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll: Option<serde_json::Value>,
+    /// Vote rows: which poll and the chosen option names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_vote: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -3014,6 +3253,11 @@ pub struct ChatRow {
     pub archived: bool,
     pub pinned: bool,
     pub muted_until: Option<i64>,
+    /// Cloud sessions only: unix seconds when the 24 h customer-service window
+    /// for this chat closes. `None` on web, or when never opened. Serialized as
+    /// `window_expires_at`.
+    #[serde(rename = "window_expires_at")]
+    pub cloud_window_expires_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -3096,6 +3340,34 @@ fn pg_err(e: impl std::fmt::Display) -> rusqlite::Error {
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
         Some(format!("postgres: {e}")),
     )
+}
+
+/// Map a `sessions` row (the 19-column projection used by `sessions_all` /
+/// `session_row`) to a [`SessionRow`]. Column order must match those queries.
+fn pg_session_row(r: &postgres::Row) -> SessionRow {
+    SessionRow {
+        id: r.get(0),
+        label: r.get(1),
+        status: r.get(2),
+        jid: r.get(3),
+        push_name: r.get(4),
+        created_at: r.get(5),
+        updated_at: r.get(6),
+        proxy_url: r.get(7),
+        mark_online: r.get::<_, i32>(8) != 0,
+        kind: r.get(9),
+        cloud_phone_number_id: r.get(10),
+        cloud_waba_id: r.get(11),
+        cloud_graph_version: r.get(12),
+        cloud_provider: r
+            .get::<_, Option<String>>(13)
+            .unwrap_or_else(|| "meta".into()),
+        cloud_internal_id: r.get(14),
+        cloud_customer_id: r.get(15),
+        cloud_base_url: r.get(16),
+        cloud_setup_ref: r.get(17),
+        cloud_setup_link: r.get(18),
+    }
 }
 
 /// Postgres storage backend (sync `postgres` client via an r2d2 pool). Mirrors
@@ -3721,50 +3993,56 @@ impl PgStore {
     /// `@lid` 1:1 chat into their PN chat via `lid_pn_map`, conflict-guarded.
     pub fn consolidate_lid_chats(&self, session_id: &str) -> rusqlite::Result<usize> {
         let mut conn = self.conn()?;
-        let n = conn
-            .execute(
-                "UPDATE messages SET chat_jid = ( \
-                     SELECT m.pn_user || '@s.whatsapp.net' FROM lid_pn_map m \
-                      WHERE m.session_id = $1 AND m.lid_user = replace(messages.chat_jid, '@lid', '')) \
-                  WHERE session_id = $1 AND chat_jid LIKE '%@lid' \
-                    AND EXISTS (SELECT 1 FROM lid_pn_map m WHERE m.session_id = $1 \
-                                AND m.lid_user = replace(messages.chat_jid, '@lid', '')) \
-                    AND NOT EXISTS (SELECT 1 FROM messages p JOIN lid_pn_map m \
-                                      ON m.session_id = $1 AND m.lid_user = replace(messages.chat_jid, '@lid', '') \
-                                    WHERE p.session_id = $1 \
-                                      AND p.chat_jid = m.pn_user || '@s.whatsapp.net' \
-                                      AND p.message_id = messages.message_id)",
+        let mut tx = conn.transaction().map_err(pg_err)?;
+        // Only the mappings whose LID still has a chat to fold, found by exact
+        // primary-key probes. The old set-based `replace(chat_jid, '@lid', '')`
+        // joins defeated every index: minutes per session on a large `messages`,
+        // even with nothing to merge.
+        let pairs: Vec<(String, String)> = tx
+            .query(
+                "SELECT m.lid_user, m.pn_user FROM lid_pn_map m WHERE m.session_id = $1 \
+                   AND (EXISTS (SELECT 1 FROM messages x WHERE x.session_id = $1 \
+                                AND x.chat_jid = m.lid_user || '@lid') \
+                        OR EXISTS (SELECT 1 FROM chats c WHERE c.session_id = $1 \
+                                   AND c.jid = m.lid_user || '@lid'))",
                 &[&session_id],
             )
+            .map_err(pg_err)?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        let mut n = 0u64;
+        for (lid_user, pn_user) in &pairs {
+            let lid = format!("{lid_user}@lid");
+            let pn = format!("{pn_user}@s.whatsapp.net");
+            n += tx
+                .execute(
+                    "UPDATE messages SET chat_jid = $3 WHERE session_id = $1 AND chat_jid = $2 \
+                       AND NOT EXISTS (SELECT 1 FROM messages p WHERE p.session_id = $1 \
+                                       AND p.chat_jid = $3 AND p.message_id = messages.message_id)",
+                    &[&session_id, &lid, &pn],
+                )
+                .map_err(pg_err)?;
+            // Any @lid row left is a true duplicate of a PN row.
+            tx.execute(
+                "DELETE FROM messages WHERE session_id = $1 AND chat_jid = $2",
+                &[&session_id, &lid],
+            )
             .map_err(pg_err)?;
-        conn.execute(
-            "DELETE FROM messages WHERE session_id = $1 AND chat_jid LIKE '%@lid' \
-               AND EXISTS (SELECT 1 FROM lid_pn_map m WHERE m.session_id = $1 \
-                           AND m.lid_user = replace(messages.chat_jid, '@lid', ''))",
-            &[&session_id],
-        )
-        .map_err(pg_err)?;
-        conn.execute(
-            "UPDATE chats SET jid = ( \
-                 SELECT m.pn_user || '@s.whatsapp.net' FROM lid_pn_map m \
-                  WHERE m.session_id = $1 AND m.lid_user = replace(chats.jid, '@lid', '')) \
-              WHERE session_id = $1 AND jid LIKE '%@lid' \
-                AND EXISTS (SELECT 1 FROM lid_pn_map m WHERE m.session_id = $1 \
-                            AND m.lid_user = replace(chats.jid, '@lid', '')) \
-                AND NOT EXISTS (SELECT 1 FROM chats c2 JOIN lid_pn_map m \
-                                  ON m.session_id = $1 AND m.lid_user = replace(chats.jid, '@lid', '') \
-                                WHERE c2.session_id = $1 AND c2.jid = m.pn_user || '@s.whatsapp.net')",
-            &[&session_id],
-        )
-        .map_err(pg_err)?;
-        // Drop any leftover @lid `chats` row so the merged contact shows once.
-        conn.execute(
-            "DELETE FROM chats WHERE session_id = $1 AND jid LIKE '%@lid' \
-               AND EXISTS (SELECT 1 FROM lid_pn_map m WHERE m.session_id = $1 \
-                           AND m.lid_user = replace(chats.jid, '@lid', ''))",
-            &[&session_id],
-        )
-        .map_err(pg_err)?;
+            tx.execute(
+                "UPDATE chats SET jid = $3 WHERE session_id = $1 AND jid = $2 \
+                   AND NOT EXISTS (SELECT 1 FROM chats c2 WHERE c2.session_id = $1 AND c2.jid = $3)",
+                &[&session_id, &lid, &pn],
+            )
+            .map_err(pg_err)?;
+            // Drop any leftover @lid `chats` row so the merged contact shows once.
+            tx.execute(
+                "DELETE FROM chats WHERE session_id = $1 AND jid = $2",
+                &[&session_id, &lid],
+            )
+            .map_err(pg_err)?;
+        }
+        tx.commit().map_err(pg_err)?;
         Ok(n as usize)
     }
 
@@ -3925,28 +4203,13 @@ impl PgStore {
             .conn()?
             .query(
                 "SELECT id,label,status,jid,push_name,created_at,updated_at,proxy_url,mark_online, \
-                        kind,cloud_phone_number_id,cloud_waba_id,cloud_graph_version FROM sessions",
+                        kind,cloud_phone_number_id,cloud_waba_id,cloud_graph_version, \
+                        cloud_provider,cloud_internal_id,cloud_customer_id,cloud_base_url, \
+                        cloud_setup_ref,cloud_setup_link FROM sessions",
                 &[],
             )
             .map_err(pg_err)?;
-        Ok(rows
-            .iter()
-            .map(|r| SessionRow {
-                id: r.get(0),
-                label: r.get(1),
-                status: r.get(2),
-                jid: r.get(3),
-                push_name: r.get(4),
-                created_at: r.get(5),
-                updated_at: r.get(6),
-                proxy_url: r.get(7),
-                mark_online: r.get::<_, i32>(8) != 0,
-                kind: r.get(9),
-                cloud_phone_number_id: r.get(10),
-                cloud_waba_id: r.get(11),
-                cloud_graph_version: r.get(12),
-            })
-            .collect())
+        Ok(rows.iter().map(pg_session_row).collect())
     }
 
     pub fn session_row(&self, id: &str) -> rusqlite::Result<Option<SessionRow>> {
@@ -3954,26 +4217,14 @@ impl PgStore {
             .conn()?
             .query_opt(
                 "SELECT id,label,status,jid,push_name,created_at,updated_at,proxy_url,mark_online, \
-                        kind,cloud_phone_number_id,cloud_waba_id,cloud_graph_version \
+                        kind,cloud_phone_number_id,cloud_waba_id,cloud_graph_version, \
+                        cloud_provider,cloud_internal_id,cloud_customer_id,cloud_base_url, \
+                        cloud_setup_ref,cloud_setup_link \
                    FROM sessions WHERE id=$1",
                 &[&id],
             )
             .map_err(pg_err)?;
-        Ok(row.map(|r| SessionRow {
-            id: r.get(0),
-            label: r.get(1),
-            status: r.get(2),
-            jid: r.get(3),
-            push_name: r.get(4),
-            created_at: r.get(5),
-            updated_at: r.get(6),
-            proxy_url: r.get(7),
-            mark_online: r.get::<_, i32>(8) != 0,
-            kind: r.get(9),
-            cloud_phone_number_id: r.get(10),
-            cloud_waba_id: r.get(11),
-            cloud_graph_version: r.get(12),
-        }))
+        Ok(row.as_ref().map(pg_session_row))
     }
 
     pub fn session_mark_online(&self, id: &str) -> rusqlite::Result<bool> {
@@ -4206,7 +4457,9 @@ impl PgStore {
             .conn()?
             .query_opt(
                 "SELECT cloud_phone_number_id,cloud_waba_id,cloud_access_token, \
-                        cloud_app_secret,cloud_verify_token,cloud_graph_version \
+                        cloud_app_secret,cloud_verify_token,cloud_graph_version, \
+                        cloud_provider,cloud_base_url,cloud_internal_id,cloud_customer_id, \
+                        cloud_webhook_secret \
                    FROM sessions WHERE id=$1 AND kind='cloud'",
                 &[&id],
             )
@@ -4219,6 +4472,11 @@ impl PgStore {
                 r.get::<_, Option<Vec<u8>>>(3),
                 r.get::<_, Option<String>>(4),
                 r.get::<_, Option<String>>(5),
+                r.get::<_, Option<String>>(6),
+                r.get::<_, Option<String>>(7),
+                r.get::<_, Option<String>>(8),
+                r.get::<_, Option<String>>(9),
+                r.get::<_, Option<Vec<u8>>>(10),
             ))
         })
         .transpose()
@@ -4232,13 +4490,19 @@ impl PgStore {
     ) -> rusqlite::Result<()> {
         let token = vault::seal(c.access_token.as_bytes());
         let secret = c.app_secret.as_deref().map(|v| vault::seal(v.as_bytes()));
+        let hook_secret = c
+            .webhook_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|v| vault::seal(v.as_bytes()));
         self.conn()?
             .execute(
                 "UPDATE sessions SET \
                     cloud_phone_number_id=$1, cloud_waba_id=$2, cloud_access_token=$3, \
                     cloud_app_secret=$4, cloud_verify_token=$5, cloud_graph_version=$6, \
-                    updated_at=$7 \
-                 WHERE id=$8 AND kind='cloud'",
+                    cloud_provider=$7, cloud_base_url=$8, cloud_internal_id=$9, \
+                    cloud_customer_id=$10, cloud_webhook_secret=$11, updated_at=$12 \
+                 WHERE id=$13 AND kind='cloud'",
                 &[
                     &c.phone_number_id,
                     &c.waba_id,
@@ -4246,12 +4510,94 @@ impl PgStore {
                     &secret,
                     &c.verify_token,
                     &c.graph_version,
+                    &c.provider,
+                    &c.base_url,
+                    &c.internal_id,
+                    &c.customer_id,
+                    &hook_secret,
                     &updated_at,
                     &id,
                 ],
             )
             .map_err(pg_err)?;
         Ok(())
+    }
+
+    pub fn create_kapso_session(&self, s: &NewKapsoSession) -> rusqlite::Result<()> {
+        let hook_secret = vault::seal(s.webhook_secret.as_bytes());
+        self.conn()?
+            .execute(
+                "INSERT INTO sessions (\
+                    id,label,status,api_key,proxy_url,created_at,updated_at, \
+                    kind,cloud_provider,cloud_customer_id,cloud_setup_ref, \
+                    cloud_setup_link,cloud_base_url,cloud_graph_version,cloud_webhook_secret) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,'cloud','kapso',$8,$9,$10,$11,$12,$13)",
+                &[
+                    &s.id,
+                    &s.label,
+                    &s.status,
+                    &s.api_key,
+                    &s.proxy_url,
+                    &s.created_at,
+                    &s.updated_at,
+                    &s.customer_id,
+                    &s.setup_ref,
+                    &s.setup_link,
+                    &s.base_url,
+                    &s.graph_version,
+                    &hook_secret,
+                ],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    pub fn session_set_cloud_phone_number(
+        &self,
+        id: &str,
+        phone_number_id: &str,
+        internal_id: Option<&str>,
+        waba_id: Option<&str>,
+        updated_at: i64,
+    ) -> rusqlite::Result<()> {
+        // `waba_id = NULL` keeps whatever is already stored (COALESCE).
+        self.conn()?
+            .execute(
+                "UPDATE sessions SET cloud_phone_number_id=$1, cloud_internal_id=$2, \
+                    cloud_waba_id=COALESCE($3, cloud_waba_id), \
+                    updated_at=$4 WHERE id=$5 AND kind='cloud'",
+                &[&phone_number_id, &internal_id, &waba_id, &updated_at, &id],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // see `Store::kapso_session_id_by_setup_ref`
+    pub fn kapso_session_id_by_setup_ref(&self, setup_ref: &str) -> rusqlite::Result<Option<String>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT id FROM sessions WHERE kind='cloud' AND cloud_provider='kapso' \
+                    AND cloud_setup_ref=$1 ORDER BY created_at ASC LIMIT 1",
+                &[&setup_ref],
+            )
+            .map_err(pg_err)?;
+        Ok(row.map(|r| r.get::<_, String>(0)))
+    }
+
+    pub fn kapso_session_id_by_customer_id(
+        &self,
+        customer_id: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        let row = self
+            .conn()?
+            .query_opt(
+                "SELECT id FROM sessions WHERE kind='cloud' AND cloud_provider='kapso' \
+                    AND cloud_customer_id=$1 ORDER BY created_at ASC LIMIT 1",
+                &[&customer_id],
+            )
+            .map_err(pg_err)?;
+        Ok(row.map(|r| r.get::<_, String>(0)))
     }
 
     pub fn cloud_session_id_by_phone_number_id(
@@ -4644,6 +4990,25 @@ impl PgStore {
         Ok(())
     }
 
+    /// See the SQLite impl. Never moves the stored value backwards.
+    pub fn chat_set_cloud_window(
+        &self,
+        session_id: &str,
+        jid: &str,
+        expires_at: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn()?
+            .execute(
+                "INSERT INTO chats (session_id,jid,cloud_window_expires_at) VALUES ($1,$2,$3) \
+                 ON CONFLICT (session_id,jid) DO UPDATE SET \
+                   cloud_window_expires_at = GREATEST(excluded.cloud_window_expires_at, \
+                                                      COALESCE(chats.cloud_window_expires_at, 0))",
+                &[&session_id, &jid, &expires_at],
+            )
+            .map_err(pg_err)?;
+        Ok(())
+    }
+
     pub fn group_persist(
         &self,
         session_id: &str,
@@ -4721,6 +5086,41 @@ impl PgStore {
                 &[&media_path, &session_id, &chat_jid, &message_id],
             )
             .map_err(pg_err)?;
+        Ok(())
+    }
+
+    /// Postgres twin of `SqliteStore::message_merge_payload`.
+    pub fn message_merge_payload(
+        &self,
+        session_id: &str,
+        chat_jid: &str,
+        message_id: &str,
+        extra: &serde_json::Value,
+    ) -> rusqlite::Result<()> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT payload_json FROM messages \
+                 WHERE session_id=$1 AND chat_jid=$2 AND message_id=$3",
+                &[&session_id, &chat_jid, &message_id],
+            )
+            .map_err(pg_err)?;
+        let Some(row) = row else { return Ok(()) };
+        let current: String = row.get(0);
+        let mut obj: serde_json::Value =
+            serde_json::from_str(&current).unwrap_or(serde_json::Value::Object(Default::default()));
+        if let (Some(dst), Some(src)) = (obj.as_object_mut(), extra.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        let merged = obj.to_string();
+        conn.execute(
+            "UPDATE messages SET payload_json=$1 \
+             WHERE session_id=$2 AND chat_jid=$3 AND message_id=$4",
+            &[&merged, &session_id, &chat_jid, &message_id],
+        )
+        .map_err(pg_err)?;
         Ok(())
     }
 
@@ -4892,7 +5292,8 @@ impl PgStore {
                         conv.last_msg_ts, \
                         COALESCE(c.archived, 0) AS archived, \
                         COALESCE(c.pinned, 0) AS pinned, \
-                        c.muted_until \
+                        c.muted_until, \
+                        c.cloud_window_expires_at \
                    FROM ( \
                      SELECT chat_jid AS jid, MAX(timestamp) AS last_msg_ts \
                        FROM messages WHERE session_id=$1 GROUP BY chat_jid \
@@ -4921,6 +5322,7 @@ impl PgStore {
                 archived: r.get::<_, i64>(4) != 0,
                 pinned: r.get::<_, i64>(5) != 0,
                 muted_until: r.get(6),
+                cloud_window_expires_at: r.get(7),
             })
             .collect())
     }
@@ -5258,7 +5660,10 @@ impl PgStore {
 
 /// Map a Postgres `messages` row (canonical column order) to `MessageListRow`.
 fn pg_row_to_msg_list(r: &postgres::Row) -> MessageListRow {
+    let (poll, poll_vote) = parse_poll(&r.get::<_, String>(7));
     MessageListRow {
+        poll,
+        poll_vote,
         chat_jid: r.get(0),
         message_id: r.get(1),
         sender_jid: r.get(2),
@@ -5314,6 +5719,29 @@ pub struct SessionRow {
     pub cloud_phone_number_id: Option<String>,
     pub cloud_waba_id: Option<String>,
     pub cloud_graph_version: Option<String>,
+    /// Cloud upstream: `"meta"` (Graph direct, default) or `"kapso"` (Kapso
+    /// Business Platform proxy). Pre-0025 cloud rows read back as `"meta"`.
+    /// Consumed by WP-E (`meta_from_row` → `CloudPublic.provider`).
+    pub cloud_provider: String,
+    /// Kapso phone-number config UUID (`internal_id`); None until onboarding.
+    /// WP-E reads this via `CloudCredsRow` (`session_cloud_creds`), not here.
+    #[allow(dead_code)]
+    pub cloud_internal_id: Option<String>,
+    /// Kapso customer UUID this session's number belongs to. WP-E reads this
+    /// via `CloudCredsRow` (`session_cloud_creds`), not here.
+    #[allow(dead_code)]
+    pub cloud_customer_id: Option<String>,
+    /// Per-session upstream host override (None → provider default). WP-E reads
+    /// this via `CloudCredsRow` (`session_cloud_creds`), not here.
+    #[allow(dead_code)]
+    pub cloud_base_url: Option<String>,
+    /// Correlation id passed to Kapso, matched by the onboarding callback.
+    /// Resolution goes through `customer_id`, so this stays unread for now.
+    #[allow(dead_code)]
+    pub cloud_setup_ref: Option<String>,
+    /// Last-issued hosted setup-link URL (non-secret; shown in the API).
+    /// Consumed by WP-E (`meta_from_row` → `CloudPublic.setup_link`).
+    pub cloud_setup_link: Option<String>,
 }
 
 /// Columns for a fresh `kind='cloud'` session row (no device keys). Secrets are
@@ -5338,7 +5766,7 @@ pub struct NewCloudSession<'a> {
 /// A cloud session's credentials as read from the store (secrets UNSEALED).
 /// Never serialized to the API — `session.rs` maps the non-secret part into
 /// `CloudPublic`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloudCredsRow {
     pub phone_number_id: String,
     pub waba_id: Option<String>,
@@ -5346,19 +5774,34 @@ pub struct CloudCredsRow {
     pub app_secret: Option<String>,
     pub verify_token: Option<String>,
     pub graph_version: String,
+    /// `"meta"` (default) | `"kapso"`.
+    pub provider: String,
+    /// Per-session upstream host override (None → provider default).
+    pub base_url: Option<String>,
+    /// Kapso phone-number config UUID (None for meta / not-yet-onboarded kapso).
+    pub internal_id: Option<String>,
+    /// Kapso customer UUID.
+    pub customer_id: Option<String>,
+    /// Kapso per-number `X-Webhook-Signature` key, UNSEALED (None for meta).
+    pub webhook_secret: Option<String>,
 }
 
 /// Shared column→row mapping for `session_cloud_creds` (both backends):
-/// unseals the two secret blobs, defaults a missing graph version.
+/// unseals the sealed blobs, defaults a missing graph version / provider.
 #[allow(clippy::type_complexity)]
 fn cloud_creds_from_cols(
-    (pnid, waba_id, token, secret, verify_token, graph_version): (
+    (pnid, waba_id, token, secret, verify_token, graph_version, provider, base_url, internal_id, customer_id, webhook_secret): (
         Option<String>,
         Option<String>,
         Option<Vec<u8>>,
         Option<Vec<u8>>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
     ),
 ) -> rusqlite::Result<CloudCredsRow> {
     let access_token = match token {
@@ -5366,6 +5809,10 @@ fn cloud_creds_from_cols(
         None => String::new(),
     };
     let app_secret = match secret {
+        Some(b) => Some(String::from_utf8(unseal(b)?).unwrap_or_default()).filter(|s| !s.is_empty()),
+        None => None,
+    };
+    let webhook_secret = match webhook_secret {
         Some(b) => Some(String::from_utf8(unseal(b)?).unwrap_or_default()).filter(|s| !s.is_empty()),
         None => None,
     };
@@ -5378,7 +5825,33 @@ fn cloud_creds_from_cols(
         graph_version: graph_version
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| crate::cloud::DEFAULT_GRAPH_VERSION.to_string()),
+        provider: provider.filter(|s| !s.is_empty()).unwrap_or_else(|| "meta".into()),
+        base_url: base_url.filter(|s| !s.is_empty()),
+        internal_id: internal_id.filter(|s| !s.is_empty()),
+        customer_id: customer_id.filter(|s| !s.is_empty()),
+        webhook_secret,
     })
+}
+
+/// Columns for a fresh `kind='cloud'`, `cloud_provider='kapso'` session created
+/// in the pending-onboarding state: no Meta credentials yet (the customer gets
+/// the phone number through a Kapso setup link), just the correlation ref, the
+/// per-number webhook secret (sealed here) and the customer id.
+pub struct NewKapsoSession<'a> {
+    pub id: &'a str,
+    pub label: Option<&'a str>,
+    pub status: &'a str,
+    pub api_key: &'a str,
+    pub proxy_url: Option<&'a str>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub customer_id: &'a str,
+    pub setup_ref: &'a str,
+    pub setup_link: Option<&'a str>,
+    pub base_url: Option<&'a str>,
+    pub graph_version: &'a str,
+    /// PLAINTEXT; sealed inside `create_kapso_session`.
+    pub webhook_secret: &'a str,
 }
 
 /// All columns needed to insert a fresh session row (borrowed; the byte slices
@@ -5478,6 +5951,8 @@ fn migrations() -> Migrations<'static> {
         M::up(include_str!("../migrations/0022_cloud_pnid_unique.sql")),
         M::up(include_str!("../migrations/0023_app_settings.sql")),
         M::up(include_str!("../migrations/0024_history_synced.sql")),
+        M::up(include_str!("../migrations/0025_cloud_provider.sql")),
+        M::up(include_str!("../migrations/0026_chat_cloud_window.sql")),
     ])
 }
 
@@ -5757,6 +6232,31 @@ mod tests {
     }
 
     #[test]
+    fn chat_set_cloud_window_surfaces_and_never_regresses() {
+        let store = Store::open(":memory:").unwrap();
+        seed_session(&store, "s1");
+        let jid = "5511999999999@s.whatsapp.net";
+
+        store.chat_set_cloud_window("s1", jid, 2_000).unwrap();
+        let win = |s: &Store| {
+            s.chats_list("s1")
+                .unwrap()
+                .into_iter()
+                .find(|c| c.jid == jid)
+                .and_then(|c| c.cloud_window_expires_at)
+        };
+        assert_eq!(win(&store), Some(2_000));
+
+        // Later inbound extends it.
+        store.chat_set_cloud_window("s1", jid, 3_500).unwrap();
+        assert_eq!(win(&store), Some(3_500));
+
+        // A stale/out-of-order webhook must not pull it back.
+        store.chat_set_cloud_window("s1", jid, 1_000).unwrap();
+        assert_eq!(win(&store), Some(3_500));
+    }
+
+    #[test]
     fn consolidate_lid_chats_merges_lid_into_pn() {
         let store = Store::open(":memory:").unwrap();
         seed_session(&store, "s1");
@@ -5794,6 +6294,61 @@ mod tests {
         assert_eq!(chats[0].jid, "5511990000001@s.whatsapp.net");
         // Idempotent — nothing left to re-key.
         assert_eq!(store.consolidate_lid_chats("s1").unwrap(), 0);
+    }
+
+    #[test]
+    fn consolidate_lid_chats_drops_duplicates_and_lid_chat_rows() {
+        let store = Store::open(":memory:").unwrap();
+        seed_session(&store, "s1");
+        let msg = |chat: &str, id: &str| {
+            store
+                .message_insert(
+                    &NewMessage {
+                        session_id: "s1",
+                        chat_jid: chat,
+                        message_id: id,
+                        sender_jid: chat,
+                        from_me: false,
+                        timestamp: 100,
+                        msg_type: "text",
+                        body_text: Some("hi"),
+                        payload_json: "{}",
+                        status: None,
+                    },
+                    true,
+                )
+                .unwrap();
+        };
+        // The same message stored under both addressings, plus a LID-only one.
+        msg("64000000000001@lid", "DUP");
+        msg("5511990000001@s.whatsapp.net", "DUP");
+        msg("64000000000001@lid", "L1");
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT OR REPLACE INTO chats (session_id, jid, pinned) \
+                     VALUES ('s1', '64000000000001@lid', 1)",
+                    [],
+                )
+            })
+            .unwrap();
+        // A mapping with nothing to fold is a harmless no-op.
+        store.lid_pn_put("s1", "64000000000009", "5511990000009", 1).unwrap();
+        store.lid_pn_put("s1", "64000000000001", "5511990000001", 1).unwrap();
+
+        assert_eq!(store.consolidate_lid_chats("s1").unwrap(), 1, "only the non-duplicate is re-keyed");
+        let (lid_msgs, pn_msgs, lid_chats): (i64, i64, i64) = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM messages WHERE chat_jid LIKE '%@lid'), \
+                            (SELECT COUNT(*) FROM messages WHERE chat_jid = '5511990000001@s.whatsapp.net'), \
+                            (SELECT COUNT(*) FROM chats WHERE jid LIKE '%@lid')",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!((lid_msgs, pn_msgs, lid_chats), (0, 2, 0));
     }
 
     #[test]
@@ -6562,6 +7117,8 @@ mod tests {
                 app_secret: Some("fake-app-secret".into()),
                 verify_token: Some("my-verify".into()),
                 graph_version: "v25.0".into(),
+                provider: "meta".into(),
+                ..Default::default()
             }
         );
         // A web session has no cloud creds; unknown ids neither.
@@ -6598,6 +7155,8 @@ mod tests {
             app_secret: None,
             verify_token: Some("vt2".into()),
             graph_version: "v26.0".into(),
+            provider: "meta".into(),
+            ..Default::default()
         };
         store.session_set_cloud_creds("c1", &updated, 20).unwrap();
         assert_eq!(store.session_cloud_creds("c1").unwrap().unwrap(), updated);

@@ -4,10 +4,16 @@
 # Bundled SQLite compiles C (needs gcc, present in the rust image); native-tls
 # links system OpenSSL (needs libssl-dev + pkg-config). protoc is vendored by
 # the build (protoc-bin-vendored), so no protobuf-compiler package is needed.
+# The voice-call stack pulls `opus` → `audiopus_sys`, which builds vendored
+# libopus via CMake — hence `cmake`. OPUS_STATIC=1 forces static linking so the
+# runtime image needs no libopus (the binary stays self-contained; without it,
+# audiopus_sys links libopus *dynamically* on linux-gnu and the slim runtime
+# can't find it).
 FROM rust:1-bookworm AS builder
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev cmake \
     && rm -rf /var/lib/apt/lists/*
+ENV OPUS_STATIC=1
 WORKDIR /app
 
 # build.rs reads proto/ + migrations are include_str!'d, so copy the whole tree.

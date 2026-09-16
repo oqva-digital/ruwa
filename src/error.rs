@@ -18,8 +18,14 @@ pub enum Error {
     Forbidden(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
+    /// The upstream (WhatsApp server) didn't answer in time — 504, so
+    /// consumers can distinguish "upstream silent" from a ruwa bug (500).
+    #[error("gateway timeout: {0}")]
+    GatewayTimeout(String),
     #[error("storage: {0}")]
     Storage(#[from] rusqlite::Error),
     #[error("io: {0}")]
@@ -36,7 +42,9 @@ impl Error {
             Error::Unauthorized => StatusCode::UNAUTHORIZED,
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
             Error::Conflict(_) => StatusCode::CONFLICT,
+            Error::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            Error::GatewayTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

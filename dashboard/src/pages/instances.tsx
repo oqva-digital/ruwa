@@ -9,8 +9,12 @@ import { Textarea } from "@/components/ui/textarea"
 import { api, ApiError } from "@/lib/api"
 import type { SessionMeta, SessionHealth, SessionKind } from "@/lib/types"
 import { isCloud } from "@/lib/types"
-import { cloudWebhookUrl, validateCloudForm, cloudFormToInput, EMPTY_CLOUD, type CloudForm } from "@/lib/cloud"
-import { CloudFields } from "@/components/cloud-fields"
+import {
+  cloudWebhookUrl, validateCloudForm, cloudFormToInput, EMPTY_CLOUD, type CloudForm, type CloudFormErrors,
+  validateKapsoForm, kapsoFormToInput, EMPTY_KAPSO, type KapsoForm, type KapsoFormErrors,
+} from "@/lib/cloud"
+import type { CloudProvider } from "@/lib/types"
+import { CloudFields, KapsoFields } from "@/components/cloud-fields"
 import { cn } from "@/lib/utils"
 import { StatusBadge, LivenessChip, KindBadge } from "@/components/status"
 import { confirmDialog } from "@/components/confirm"
@@ -269,7 +273,7 @@ function InstanceRow({
       <TableCell className="font-medium">
         <span className="inline-flex items-center gap-2">
           {s.label || "(no label)"}
-          {cloud && <KindBadge kind="cloud" />}
+          {cloud && <KindBadge kind="cloud" provider={s.cloud?.provider} />}
         </span>
       </TableCell>
       <TableCell>
@@ -411,6 +415,29 @@ function KindToggle({ kind, onChange }: { kind: SessionKind; onChange: (k: Sessi
   )
 }
 
+/** Provider toggle shown inside the Cloud API section: paste Meta credentials, or
+ *  onboard the customer's own number through the Kapso Business Platform. */
+function CloudProviderToggle({ provider, onChange }: { provider: CloudProvider; onChange: (p: CloudProvider) => void }) {
+  const opt = (p: CloudProvider, label: string, sub: string) => (
+    <button
+      type="button"
+      onClick={() => onChange(p)}
+      className={`flex flex-1 flex-col items-center justify-center gap-0.5 rounded-md px-3 py-1.5 transition-colors ${
+        provider === p ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      <span className="text-[13px] font-medium">{label}</span>
+      <span className="text-[10.5px] font-normal text-muted-foreground">{sub}</span>
+    </button>
+  )
+  return (
+    <div className="flex w-full gap-1 rounded-lg bg-secondary p-1">
+      {opt("meta", "Meta credentials", "paste phone-number id + token")}
+      {opt("kapso", "Kapso Business Platform", "hosted setup link for the customer")}
+    </div>
+  )
+}
+
 function CreateDialog({
   open, onClose, onCreated,
 }: {
@@ -421,15 +448,19 @@ function CreateDialog({
   const [label, setLabel] = useState("")
   const [proxy, setProxy] = useState("")
   const [kind, setKind] = useState<SessionKind>("web")
+  const [cloudProvider, setCloudProvider] = useState<CloudProvider>("meta")
   const [cloud, setCloud] = useState<CloudForm>(EMPTY_CLOUD)
+  const [kapso, setKapso] = useState<KapsoForm>(EMPTY_KAPSO)
   const [touched, setTouched] = useState(false)
   const [busy, setBusy] = useState(false)
 
-  const errors = kind === "cloud" ? validateCloudForm(cloud, true) : {}
+  const errors =
+    kind !== "cloud" ? {} : cloudProvider === "kapso" ? validateKapsoForm(kapso) : validateCloudForm(cloud, true)
   const hasErrors = Object.keys(errors).length > 0
 
   function reset() {
-    setLabel(""); setProxy(""); setKind("web"); setCloud(EMPTY_CLOUD); setTouched(false)
+    setLabel(""); setProxy(""); setKind("web"); setCloudProvider("meta")
+    setCloud(EMPTY_CLOUD); setKapso(EMPTY_KAPSO); setTouched(false)
   }
 
   async function create() {
@@ -437,10 +468,14 @@ function CreateDialog({
     if (hasErrors) return
     setBusy(true)
     try {
+      const cloudObj =
+        kind !== "cloud" ? undefined
+          : cloudProvider === "kapso" ? kapsoFormToInput(kapso)
+            : cloudFormToInput(cloud, true)
       const res = await api.createSession({
         label: label.trim() || null,
         proxy: proxy.trim() || null,
-        ...(kind === "cloud" ? { kind, cloud: cloudFormToInput(cloud, true) } : {}),
+        ...(cloudObj ? { kind, cloud: cloudObj } : {}),
       })
       onCreated(res.api_key ?? "", kind)
       reset()
@@ -457,9 +492,11 @@ function CreateDialog({
         <DialogHeader>
           <DialogTitle>Create instance</DialogTitle>
           <DialogDescription>
-            {kind === "cloud"
-              ? "Connects a Meta WhatsApp Cloud API number. No QR — inbound arrives via webhook. The API key is shown once."
-              : "Spins up a new WhatsApp session. The API key is shown once."}
+            {kind !== "cloud"
+              ? "Spins up a new WhatsApp session. The API key is shown once."
+              : cloudProvider === "kapso"
+                ? "Onboards a customer's number through the Kapso Business Platform. You get a setup link to send them; no Meta credentials here. The API key is shown once."
+                : "Connects a Meta WhatsApp Cloud API number. No QR — inbound arrives via webhook. The API key is shown once."}
           </DialogDescription>
         </DialogHeader>
         <div className="max-h-[70vh] space-y-3.5 overflow-y-auto py-1 pr-0.5">
@@ -476,7 +513,13 @@ function CreateDialog({
             )}
           </div>
           {kind === "cloud" && (
-            <CloudFields c={cloud} onChange={setCloud} errors={touched ? errors : {}} forCreate />
+            <CloudProviderToggle provider={cloudProvider} onChange={setCloudProvider} />
+          )}
+          {kind === "cloud" && cloudProvider === "meta" && (
+            <CloudFields c={cloud} onChange={setCloud} errors={touched ? (errors as CloudFormErrors) : {}} forCreate />
+          )}
+          {kind === "cloud" && cloudProvider === "kapso" && (
+            <KapsoFields k={kapso} onChange={setKapso} errors={touched ? (errors as KapsoFormErrors) : {}} />
           )}
         </div>
         <DialogFooter>

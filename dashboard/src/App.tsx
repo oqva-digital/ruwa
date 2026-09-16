@@ -7,6 +7,7 @@ import { PairingPage } from "@/pages/pairing"
 import { LogsPage } from "@/pages/logs"
 import { DiagnosticsPage } from "@/pages/diagnostics"
 import { MessagingPage } from "@/pages/messaging"
+import { CallsPage } from "@/pages/calls"
 import { ContactsPage } from "@/pages/contacts"
 import { ProfilePage } from "@/pages/profile"
 import { WebhooksPage } from "@/pages/webhooks"
@@ -18,6 +19,7 @@ import {
   type GlobalPage, type InstancePage,
 } from "@/components/shell"
 import { api, clearAuth, streamEvents } from "@/lib/api"
+import { toast } from "sonner"
 
 function ls(key: string, fallback: string) {
   return localStorage.getItem(key) || fallback
@@ -74,6 +76,14 @@ function App() {
       ) {
         qc.invalidateQueries({ queryKey: ["messages", id] })
         qc.invalidateQueries({ queryKey: ["chats", id] })
+      } else if (t.startsWith("call_")) {
+        qc.invalidateQueries({ queryKey: ["calls", id] })
+        if (t === "call_offer") {
+          const from = String(ev?.from ?? "").split("@")[0]
+          toast.info(`Incoming call from +${from}`, {
+            action: { label: "Open", onClick: () => { setLevel("instance"); setIpage("calls") } },
+          })
+        }
       } else {
         // connection lifecycle: connected / disconnected / paired / qr / …
         qc.invalidateQueries({ queryKey: ["health", id] })
@@ -135,6 +145,7 @@ function App() {
   if (ipage === "overview") body = <OverviewPage inst={current} onNav={setIpage} readonly={readonly} />
   else if (ipage === "pairing") body = <PairingPage inst={current} readonly={readonly} />
   else if (ipage === "messaging") body = <MessagingPage inst={current} />
+  else if (ipage === "calls") body = <CallsPage inst={current} readonly={readonly} />
   else if (ipage === "contacts") body = <ContactsPage inst={current} readonly={readonly} />
   else if (ipage === "logs") body = <LogsPage scope="instance" instances={[current]} label={current.label ?? current.id} />
   else if (ipage === "metrics") body = <MetricsPage scope="instance" inst={current} />

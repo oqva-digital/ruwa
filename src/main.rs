@@ -31,6 +31,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use crate::session::SessionManager;
 use crate::store::Store;
 
+/// mimalloc as the global allocator. glibc malloc keeps the arenas a big
+/// history-sync ingest (hundreds of MB inflated + decoded) fragmented and
+/// never hands them back — prod RSS sat at ~1.7 GB for hours after a
+/// reconnect storm until the next restart. mimalloc returns freed pages to
+/// the OS, so RSS tracks live data instead of the historical peak.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

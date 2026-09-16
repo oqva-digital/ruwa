@@ -85,8 +85,10 @@ src/
                           #   in-house SigV4 + S3/R2/MinIO client
   egress.rs               # event fan-out: SSE serializer, webhook delivery
                           #   (HMAC, retry, metrics), in-house Redis (RESP) client
-  cloud.rs                # Meta WhatsApp Cloud API (Graph) backend: client,
-                          #   payload builders, webhook parsing/signature verify
+  cloud.rs                # official Cloud API backend: Meta Graph AND Kapso
+                          #   Business Platform (BSP) providers — client, payload
+                          #   builders, webhook parsing/signature verify, Kapso
+                          #   Platform API + setup-link onboarding (RUWA_KAPSO_*)
 
 migrations/0001_initial.sql   # full schema
 proto/                         # vendored .proto files

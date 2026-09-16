@@ -14,6 +14,7 @@ import {
   Database,
   UserCircle,
   Wifi,
+  Phone,
   Lock,
   Sun,
   Moon,
@@ -36,7 +37,7 @@ import type { SessionMeta, SessionKind } from "@/lib/types"
 
 export type GlobalPage = "instances" | "metrics" | "logs" | "diagnostics" | "settings"
 export type InstancePage =
-  | "overview" | "pairing" | "messaging" | "contacts"
+  | "overview" | "pairing" | "messaging" | "calls" | "contacts"
   | "logs" | "metrics" | "webhooks" | "integrations" | "profile"
 
 export const GLOBAL_NAV: { key: GlobalPage; label: string; icon: LucideIcon }[] = [
@@ -50,6 +51,7 @@ export const INSTANCE_NAV: { key: InstancePage; label: string; icon: LucideIcon 
   { key: "overview", label: "Overview", icon: Activity },
   { key: "pairing", label: "Pairing", icon: QrCode },
   { key: "messaging", label: "Messaging", icon: MessageSquare },
+  { key: "calls", label: "Calls", icon: Phone },
   { key: "contacts", label: "Contacts", icon: Users },
   { key: "logs", label: "Logs", icon: ScrollText },
   { key: "metrics", label: "Metrics", icon: BarChart3 },
@@ -245,10 +247,10 @@ export function InstanceSidebar({
   onMobileClose: () => void
   kind?: SessionKind
 }) {
-  // Cloud API sessions have no device to pair (the page becomes "Connection")
-  // and no WA-Web profile to edit.
+  // Cloud API sessions have no device to pair (the page becomes "Connection"),
+  // no WA-Web profile to edit, and no voice calls (web-only media plane).
   const nav = kind === "cloud"
-    ? INSTANCE_NAV.filter((n) => n.key !== "profile").map((n) => (n.key === "pairing" ? { ...n, label: "Connection", icon: Cloud } : n))
+    ? INSTANCE_NAV.filter((n) => n.key !== "profile" && n.key !== "calls").map((n) => (n.key === "pairing" ? { ...n, label: "Connection", icon: Cloud } : n))
     : INSTANCE_NAV
   return (
     <>
